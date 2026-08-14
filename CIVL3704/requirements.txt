@@ -1,0 +1,6 @@
+flask
+gunicorn
+requests
+python-dotenv
+gtfs-realtime-bindings
+tzdata
