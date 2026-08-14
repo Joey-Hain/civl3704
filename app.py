@@ -39,7 +39,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
 AGENCY_CACHE_FILE = DATA_DIR / "agency_names.json"
 AGENCY_CACHE_MAX_AGE = timedelta(hours=24)
-ANOMALY_ABS_SEC = 1800  # readings beyond this magnitude are flagged as likely stale/broken
+ANOMALY_ABS_SEC = 3600  # readings beyond this magnitude are flagged as likely stale/broken
 ON_TIME_EARLY_SEC = -60   # 1 min early
 ON_TIME_LATE_SEC = 300    # 5 min late — standard industry on-time window
 
@@ -209,6 +209,7 @@ PAGE = """
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
 <title>TfNSW Delay Board</title>
 <style>
   :root {
