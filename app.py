@@ -50,6 +50,7 @@ DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
 AGENCY_CACHE_FILE = DATA_DIR / "agency_names.json"
+SHAPES_CACHE_FILE = DATA_DIR / "shapes.txt"  # raw combined shapes.txt across all contract regions, refreshed alongside AGENCY_CACHE_FILE
 AGENCY_CACHE_MAX_AGE = timedelta(hours=24)
 ANOMALY_ABS_SEC = 3600  # readings beyond this magnitude are flagged as likely stale/broken
 ON_TIME_EARLY_SEC = -60   # 1 min early
@@ -94,31 +95,40 @@ def haversine_km(lat1, lon1, lat2, lon2):
 app = Flask(__name__)
 
 
-def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]:
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error_message_or_None).
+def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], dict[str, str], str | None]:
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, {trip_id: shape_id}, error_message_or_None).
 
     Tries the static GTFS schedule bundle, which may come back either as a
-    flat GTFS zip (agency.txt/trips.txt at top level) or a zip-of-zips (one
-    nested zip per contract region, each with its own agency.txt/trips.txt)
-    — TfNSW has changed this shape before, so we handle both. Caches
-    successful results for 24h. If the fetch fails, we surface why (e.g.
-    401/403 usually means the API key isn't subscribed to the "Timetables
-    Complete GTFS" / bus schedule product separately from the realtime
-    product) instead of silently falling back to numeric IDs.
+    flat GTFS zip (agency.txt/trips.txt/shapes.txt at top level) or a
+    zip-of-zips (one nested zip per contract region, each with its own
+    copies) — TfNSW has changed this shape before, so we handle both.
+    Caches successful results for 24h. If the fetch fails, we surface why
+    (e.g. 401/403 usually means the API key isn't subscribed to the
+    "Timetables Complete GTFS" / bus schedule product separately from the
+    realtime product) instead of silently falling back to numeric IDs.
 
     trip_headsign (from trips.txt) is what's physically shown on the bus's
     destination sign — e.g. "Bondi Beach" — and is direction-specific,
     unlike routes.txt's route_long_name which is usually a fixed "A to B"
     description that doesn't tell you which way a given trip is currently
-    headed. Both files are parsed in the same download/unzip pass since
-    they live in the same bundle as agency.txt.
+    headed.
+
+    shape_id (also from trips.txt) points into shapes.txt, which holds the
+    actual physical polyline each trip follows (ordered lat/lon points) —
+    used to draw a trip's route on the map when its bus is clicked. Since
+    shapes.txt is large (state-wide) it isn't kept in memory or in the JSON
+    cache; instead the combined raw file is written to SHAPES_CACHE_FILE
+    and scanned on demand per trip_id via get_shape_points().
+
+    All three files are parsed in the same download/unzip pass so there's
+    only ever one schedule-bundle download per 24h refresh.
     """
     if AGENCY_CACHE_FILE.exists():
         try:
             cached = json.loads(AGENCY_CACHE_FILE.read_text())
             fetched_at = datetime.fromisoformat(cached["fetched_at"])
             if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
-                return cached["agencies"], cached.get("trip_headsigns", {}), None
+                return cached["agencies"], cached.get("trip_headsigns", {}), cached.get("trip_shapes", {}), None
         except Exception:
             pass  # corrupt cache, refetch below
 
@@ -138,6 +148,7 @@ def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]
                 result[row[key_idx].strip()] = row[val_idx].strip()
         return result
 
+    shapes_tmp_path = SHAPES_CACHE_FILE.with_suffix(".tmp")
     try:
         resp = requests.get(SCHEDULE_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=30)
         if resp.status_code != 200:
@@ -151,40 +162,93 @@ def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]
 
         agencies: dict[str, str] = {}
         trip_headsigns: dict[str, str] = {}
+        trip_shapes: dict[str, str] = {}
 
-        def parse_bundle(zf: zipfile.ZipFile) -> None:
-            if "agency.txt" in zf.namelist():
-                agencies.update(parse_csv_txt(zf.read("agency.txt").decode("utf-8-sig"), "agency_id", "agency_name"))
-            if "trips.txt" in zf.namelist():
-                trip_headsigns.update(parse_csv_txt(zf.read("trips.txt").decode("utf-8-sig"), "trip_id", "trip_headsign"))
+        with shapes_tmp_path.open("w", encoding="utf-8", newline="") as shapes_out:
+            shapes_writer = csv.writer(shapes_out)
+            shapes_header_written = False
 
-        if "agency.txt" in names or "trips.txt" in names:
-            # flat bundle
-            parse_bundle(outer)
-        else:
-            # zip-of-zips, one per contract region
-            for name in names:
-                if name.endswith(".zip"):
-                    inner = zipfile.ZipFile(io.BytesIO(outer.read(name)))
-                    parse_bundle(inner)
+            def parse_bundle(zf: zipfile.ZipFile) -> None:
+                nonlocal shapes_header_written
+                if "agency.txt" in zf.namelist():
+                    agencies.update(parse_csv_txt(zf.read("agency.txt").decode("utf-8-sig"), "agency_id", "agency_name"))
+                if "trips.txt" in zf.namelist():
+                    trips_text = zf.read("trips.txt").decode("utf-8-sig")
+                    trip_headsigns.update(parse_csv_txt(trips_text, "trip_id", "trip_headsign"))
+                    trip_shapes.update(parse_csv_txt(trips_text, "trip_id", "shape_id"))
+                if "shapes.txt" in zf.namelist():
+                    shapes_text = zf.read("shapes.txt").decode("utf-8-sig")
+                    shapes_rows = list(csv.reader(io.StringIO(shapes_text)))
+                    if shapes_rows:
+                        if not shapes_header_written:
+                            shapes_writer.writerow(shapes_rows[0])
+                            shapes_header_written = True
+                        shapes_writer.writerows(shapes_rows[1:])
+
+            if "agency.txt" in names or "trips.txt" in names:
+                # flat bundle
+                parse_bundle(outer)
+            else:
+                # zip-of-zips, one per contract region
+                for name in names:
+                    if name.endswith(".zip"):
+                        inner = zipfile.ZipFile(io.BytesIO(outer.read(name)))
+                        parse_bundle(inner)
 
         if not agencies:
             raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
+
+        shapes_tmp_path.replace(SHAPES_CACHE_FILE)  # atomic swap — only replace the old shapes cache on full success
 
         AGENCY_CACHE_FILE.write_text(json.dumps({
             "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
             "agencies": agencies,
             "trip_headsigns": trip_headsigns,
+            "trip_shapes": trip_shapes,
         }))
-        return agencies, trip_headsigns, None
+        return agencies, trip_headsigns, trip_shapes, None
     except Exception as e:
+        shapes_tmp_path.unlink(missing_ok=True)  # discard partial write; keep the last good SHAPES_CACHE_FILE
         if AGENCY_CACHE_FILE.exists():
             try:
                 cached = json.loads(AGENCY_CACHE_FILE.read_text())
-                return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
+                return cached["agencies"], cached.get("trip_headsigns", {}), cached.get("trip_shapes", {}), f"Using stale cached names ({e})"
             except Exception:
                 pass
-        return {}, {}, str(e)
+        return {}, {}, {}, str(e)
+
+
+def get_shape_points(shape_id: str) -> list[list[float]]:
+    """Scan the cached combined shapes.txt for one shape_id's ordered
+    lat/lon points. Done on demand (only when a bus is clicked) rather than
+    keeping the whole state-wide shapes table in memory."""
+    if not shape_id or not SHAPES_CACHE_FILE.exists():
+        return []
+
+    points = []  # (sequence, lat, lon)
+    with SHAPES_CACHE_FILE.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if not header:
+            return []
+        header = [h.strip() for h in header]
+        try:
+            id_idx = header.index("shape_id")
+            lat_idx = header.index("shape_pt_lat")
+            lon_idx = header.index("shape_pt_lon")
+            seq_idx = header.index("shape_pt_sequence")
+        except ValueError:
+            return []
+        for row in reader:
+            if len(row) <= max(id_idx, lat_idx, lon_idx, seq_idx) or row[id_idx].strip() != shape_id:
+                continue
+            try:
+                points.append((int(row[seq_idx]), float(row[lat_idx]), float(row[lon_idx])))
+            except ValueError:
+                continue
+
+    points.sort(key=lambda p: p[0])
+    return [[lat, lon] for _, lat, lon in points]
 
 
 def fetch_feed() -> gtfs_realtime_pb2.FeedMessage:
@@ -360,7 +424,7 @@ def get_all_rows_cached():
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
         return _rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"], _rows_cache["agency_error"]
 
-    agency_names, trip_headsigns, agency_error = load_schedule_lookups()
+    agency_names, trip_headsigns, _trip_shapes, agency_error = load_schedule_lookups()
     feed = fetch_feed()
     all_rows = extract_rows(feed, agency_names)
     append_to_log(all_rows)  # only on an actual fetch, not every poll
@@ -576,6 +640,23 @@ PAGE = """
     padding: 7px 11px;
   }
   .glass-tooltip::before { display: none; } /* hide Leaflet's default solid-colour pointer arrow */
+
+  /* Frosted-glass click popup (info panel), same treatment as the hover tooltip */
+  .glass-popup .leaflet-popup-content-wrapper {
+    background: rgba(255, 255, 255, 0.55) !important;
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    backdrop-filter: blur(16px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    border-radius: 14px !important;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.2);
+    color: #111;
+  }
+  .glass-popup .leaflet-popup-tip {
+    background: rgba(255, 255, 255, 0.55) !important;
+    box-shadow: none;
+  }
+  .glass-popup .leaflet-popup-content { margin: 10px 13px; }
+  .glass-popup a.leaflet-popup-close-button { color: #333 !important; }
 </style>
 </head>
 <body>
@@ -664,6 +745,38 @@ PAGE = """
     }).addTo(map);
 
     const markers = new Map(); // trip_id/vehicle_id -> Leaflet marker
+    let routeLine = null;       // currently drawn route polyline, if any
+    let routeLineTripId = null; // which trip it belongs to, so re-clicking the same bus doesn't re-fetch
+
+    async function showRouteForTrip(tripId) {
+      if (routeLine && routeLineTripId === tripId) return; // already showing this trip's route
+
+      if (routeLine) {
+        map.removeLayer(routeLine);
+        routeLine = null;
+        routeLineTripId = null;
+      }
+      if (!tripId) return;
+
+      try {
+        const res = await fetch('/api/trip_shape?trip_id=' + encodeURIComponent(tripId));
+        const data = await res.json();
+        if (!data.points || data.points.length === 0) {
+          console.warn('No route shape available for trip', tripId, data.error);
+          return;
+        }
+        routeLine = L.polyline(data.points, {
+          color: '#00B5EF',
+          weight: 5,
+          opacity: 0.85,
+          lineJoin: 'round'
+        }).addTo(map);
+        routeLineTripId = tripId;
+        routeLine.bringToBack();
+      } catch (e) {
+        console.warn('Route shape fetch failed', e);
+      }
+    }
 
     function makeIcon(routeLabel, bearing, color) {
       const rot = (bearing != null ? bearing : 0) - 90; // glyph points right by default; GTFS bearing is clockwise from north
@@ -682,6 +795,8 @@ PAGE = """
         `
       });
     }
+
+    map.on('click', () => showRouteForTrip(null));
 
     function tooltipContent(v) {
       const routeLabel = v.route_num || v.route_id || '?';
@@ -726,8 +841,9 @@ PAGE = """
         } else {
           const m = L.marker([v.lat, v.lon], { icon })
             .addTo(map)
-            .bindPopup(popup)
-            .bindTooltip(tooltip, { direction: 'top', offset: [0, -20], className: 'glass-tooltip' });
+            .bindPopup(popup, { className: 'glass-popup' })
+            .bindTooltip(tooltip, { direction: 'top', offset: [0, -20], className: 'glass-tooltip' })
+            .on('click', () => showRouteForTrip(v.trip_id));
           markers.set(key, m);
         }
       });
@@ -825,6 +941,28 @@ def api_vehicles():
     data = compute_delay_data(request.args)
     vehicles, map_error = compute_vehicles(data)
     return jsonify({"vehicles": vehicles, "error": map_error})
+
+
+@app.route("/api/trip_shape")
+def api_trip_shape():
+    """Return the ordered [[lat, lon], ...] polyline for a trip's route,
+    used to draw the route path when a bus marker is clicked."""
+    if not API_KEY:
+        return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
+    trip_id = request.args.get("trip_id", "").strip()
+    if not trip_id:
+        return jsonify({"error": "trip_id required"}), 400
+
+    _, _, trip_shapes, schedule_error = load_schedule_lookups()
+    shape_id = trip_shapes.get(trip_id)
+    if not shape_id:
+        return jsonify({"points": [], "error": schedule_error or "No shape_id found for this trip"})
+
+    points = get_shape_points(shape_id)
+    if not points:
+        return jsonify({"points": [], "error": f"No shape points found for shape_id {shape_id}"})
+
+    return jsonify({"points": points, "shape_id": shape_id, "error": None})
 
 
 if __name__ == "__main__":
