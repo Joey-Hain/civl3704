@@ -9,7 +9,7 @@ As at 21/8/26 the app.py is structured:
 load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
-SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses") # this does not get used but it's in here just in case. you don't need this part in other scripts.
+SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses") # this is only used for agency names and trip destinations.
 
 # Deliberately hardcoded — NOT sourced from .env's TFNSW_GTFS_RT_URL, which
 # is the trip-update feed above. Vehicle positions are a separate GTFS-RT
