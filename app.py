@@ -94,41 +94,48 @@ def haversine_km(lat1, lon1, lat2, lon2):
 app = Flask(__name__)
 
 
-def load_agency_names() -> tuple[dict[str, str], str | None]:
-    """Return ({agency_id: agency_name}, error_message_or_None).
+def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]:
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error_message_or_None).
 
     Tries the static GTFS schedule bundle, which may come back either as a
-    flat GTFS zip (agency.txt at top level) or a zip-of-zips (one nested
-    zip per contract region, each with its own agency.txt) — TfNSW has
-    changed this shape before, so we handle both. Caches successful results
-    for 24h. If the fetch fails, we surface why (e.g. 401/403 usually means
-    the API key isn't subscribed to the "Timetables Complete GTFS" / bus
-    schedule product separately from the realtime product) instead of
-    silently falling back to numeric IDs.
+    flat GTFS zip (agency.txt/trips.txt at top level) or a zip-of-zips (one
+    nested zip per contract region, each with its own agency.txt/trips.txt)
+    — TfNSW has changed this shape before, so we handle both. Caches
+    successful results for 24h. If the fetch fails, we surface why (e.g.
+    401/403 usually means the API key isn't subscribed to the "Timetables
+    Complete GTFS" / bus schedule product separately from the realtime
+    product) instead of silently falling back to numeric IDs.
+
+    trip_headsign (from trips.txt) is what's physically shown on the bus's
+    destination sign — e.g. "Bondi Beach" — and is direction-specific,
+    unlike routes.txt's route_long_name which is usually a fixed "A to B"
+    description that doesn't tell you which way a given trip is currently
+    headed. Both files are parsed in the same download/unzip pass since
+    they live in the same bundle as agency.txt.
     """
     if AGENCY_CACHE_FILE.exists():
         try:
             cached = json.loads(AGENCY_CACHE_FILE.read_text())
             fetched_at = datetime.fromisoformat(cached["fetched_at"])
             if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
-                return cached["agencies"], None
+                return cached["agencies"], cached.get("trip_headsigns", {}), None
         except Exception:
             pass  # corrupt cache, refetch below
 
-    def parse_agency_txt(text: str) -> dict[str, str]:
+    def parse_csv_txt(text: str, key_col: str, value_col: str) -> dict[str, str]:
         result = {}
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
         if not rows:
             return result
         header = [h.strip() for h in rows[0]]
-        if "agency_id" not in header or "agency_name" not in header:
+        if key_col not in header or value_col not in header:
             return result
-        id_idx = header.index("agency_id")
-        name_idx = header.index("agency_name")
+        key_idx = header.index(key_col)
+        val_idx = header.index(value_col)
         for row in rows[1:]:
-            if len(row) > max(id_idx, name_idx):
-                result[row[id_idx].strip()] = row[name_idx].strip()
+            if len(row) > max(key_idx, val_idx) and row[val_idx].strip():
+                result[row[key_idx].strip()] = row[val_idx].strip()
         return result
 
     try:
@@ -142,17 +149,24 @@ def load_agency_names() -> tuple[dict[str, str], str | None]:
         outer = zipfile.ZipFile(io.BytesIO(resp.content))
         names = outer.namelist()
 
-        agencies = {}
-        if "agency.txt" in names:
+        agencies: dict[str, str] = {}
+        trip_headsigns: dict[str, str] = {}
+
+        def parse_bundle(zf: zipfile.ZipFile) -> None:
+            if "agency.txt" in zf.namelist():
+                agencies.update(parse_csv_txt(zf.read("agency.txt").decode("utf-8-sig"), "agency_id", "agency_name"))
+            if "trips.txt" in zf.namelist():
+                trip_headsigns.update(parse_csv_txt(zf.read("trips.txt").decode("utf-8-sig"), "trip_id", "trip_headsign"))
+
+        if "agency.txt" in names or "trips.txt" in names:
             # flat bundle
-            agencies = parse_agency_txt(outer.read("agency.txt").decode("utf-8-sig"))
+            parse_bundle(outer)
         else:
             # zip-of-zips, one per contract region
             for name in names:
                 if name.endswith(".zip"):
                     inner = zipfile.ZipFile(io.BytesIO(outer.read(name)))
-                    if "agency.txt" in inner.namelist():
-                        agencies.update(parse_agency_txt(inner.read("agency.txt").decode("utf-8-sig")))
+                    parse_bundle(inner)
 
         if not agencies:
             raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
@@ -160,15 +174,17 @@ def load_agency_names() -> tuple[dict[str, str], str | None]:
         AGENCY_CACHE_FILE.write_text(json.dumps({
             "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
             "agencies": agencies,
+            "trip_headsigns": trip_headsigns,
         }))
-        return agencies, None
+        return agencies, trip_headsigns, None
     except Exception as e:
         if AGENCY_CACHE_FILE.exists():
             try:
-                return json.loads(AGENCY_CACHE_FILE.read_text())["agencies"], f"Using stale cached names ({e})"
+                cached = json.loads(AGENCY_CACHE_FILE.read_text())
+                return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
             except Exception:
                 pass
-        return {}, str(e)
+        return {}, {}, str(e)
 
 
 def fetch_feed() -> gtfs_realtime_pb2.FeedMessage:
@@ -231,7 +247,9 @@ def latest_reading_per_trip(rows: list[dict]) -> dict[str, dict]:
     return latest
 
 
-def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict[str, str]) -> list[dict]:
+def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict[str, str],
+                      trip_headsigns: dict[str, str] | None = None) -> list[dict]:
+    trip_headsigns = trip_headsigns or {}
     vehicles = []
     for entity in feed.entity:
         if not entity.HasField("vehicle"):
@@ -240,13 +258,15 @@ def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict[str
         if not v.HasField("position"):
             continue
         route_id = v.trip.route_id if v.HasField("trip") else ""
+        trip_id = v.trip.trip_id if v.HasField("trip") else None
         route_num, route_operator = split_route(route_id, agency_names) if route_id else ("", "")
         vehicles.append({
-            "trip_id": v.trip.trip_id if v.HasField("trip") else None,
+            "trip_id": trip_id,
             "vehicle_id": v.vehicle.id if v.HasField("vehicle") else entity.id,
             "route_id": route_id,
             "route_num": route_num,
             "route_operator": route_operator,
+            "headsign": trip_headsigns.get(trip_id),  # e.g. "Bondi Beach" — None if not in the schedule bundle
             "lat": v.position.latitude,
             "lon": v.position.longitude,
             "bearing": v.position.bearing if v.HasField("position") else None,
@@ -318,10 +338,57 @@ def split_route(route_id: str, agency_names: dict[str, str]) -> tuple[str, str]:
     return route_num, operator
 
 
+# Short-TTL in-memory caches, shared between the dashboard page load and the
+# /api/vehicles poll. Without this, every 15s poll (from every open tab) was
+# independently re-fetching BOTH TfNSW feeds and re-appending the full
+# trip-update pull to delay_log.csv — the log growing unbounded on every
+# poll (not just page loads) was the main driver of the slowdown/timeouts.
+# TTL is kept just under the client's 15s poll interval so data still feels
+# live while bursts of concurrent requests (multiple tabs, page load +
+# poll landing close together) reuse one fetch instead of triggering their own.
+CACHE_TTL_SECONDS = 12
+_rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None, "agency_error": None, "fetched_at": None}
+_vehicles_cache = {"vehicles": None, "fetched_at": None}
+
+
+def get_all_rows_cached():
+    """Fetch+parse the trip-update feed, reusing a recent result if within
+    CACHE_TTL_SECONDS. Only logs to delay_log.csv when an actual fetch
+    happens, not on cache hits."""
+    now = datetime.now(tz=SYDNEY_TZ)
+    cached_at = _rows_cache["fetched_at"]
+    if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
+        return _rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"], _rows_cache["agency_error"]
+
+    agency_names, trip_headsigns, agency_error = load_schedule_lookups()
+    feed = fetch_feed()
+    all_rows = extract_rows(feed, agency_names)
+    append_to_log(all_rows)  # only on an actual fetch, not every poll
+
+    _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
+                        agency_error=agency_error, fetched_at=now)
+    return all_rows, agency_names, trip_headsigns, agency_error
+
+
+def get_vehicles_cached(agency_names, trip_headsigns):
+    """Fetch+parse the vehicle-position feed, reusing a recent result if
+    within CACHE_TTL_SECONDS. Returns a fresh copy of dicts each call so
+    per-request delay-merging/filtering never mutates the cached objects."""
+    now = datetime.now(tz=SYDNEY_TZ)
+    cached_at = _vehicles_cache["fetched_at"]
+    if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
+        return [dict(v) for v in _vehicles_cache["vehicles"]]
+
+    vfeed = fetch_vehicle_feed()
+    vehicles = extract_vehicles(vfeed, agency_names, trip_headsigns)
+    _vehicles_cache.update(vehicles=vehicles, fetched_at=now)
+    return [dict(v) for v in vehicles]
+
+
 def compute_delay_data(args):
     """Shared by the dashboard page and /api/vehicles: fetches the trip-update
-    feed, applies the route/stop/operator/hide_anomalies filters from the
-    request, and returns everything both need."""
+    feed (via the short-TTL cache above), applies the route/stop/operator/
+    hide_anomalies filters from the request, and returns everything both need."""
     hide_anomalies = args.get("hide_anomalies", "1") == "1"
     sort_key = args.get("sort", "stdev_min")
     ascending = args.get("asc") == "1"
@@ -330,10 +397,7 @@ def compute_delay_data(args):
     q_operator = args.get("operator", "").strip().lower()
     apply_bounds = args.get("bounds", "1") == "1"
 
-    agency_names, agency_error = load_agency_names()
-    feed = fetch_feed()
-    all_rows = extract_rows(feed, agency_names)
-    append_to_log(all_rows)
+    all_rows, agency_names, trip_headsigns, agency_error = get_all_rows_cached()
 
     rows = [r for r in all_rows if not (hide_anomalies and r["anomaly"])]
 
@@ -364,6 +428,7 @@ def compute_delay_data(args):
         "q_stop": q_stop,
         "q_operator": q_operator,
         "agency_names": agency_names,
+        "trip_headsigns": trip_headsigns,
         "agency_error": agency_error,
         "all_rows": all_rows,
         "latest_by_trip": latest_by_trip,
@@ -375,15 +440,15 @@ def compute_delay_data(args):
 
 
 def compute_vehicles(data):
-    """Fetch vehicle positions, join delays by trip_id, apply the same
-    route/stop/operator filters already resolved in `data` (via
-    latest_by_trip's trip_id set) so the map matches the tables below it."""
+    """Fetch vehicle positions (via the short-TTL cache above), join delays
+    by trip_id, apply the same route/stop/operator filters already resolved
+    in `data` (via latest_by_trip's trip_id set) so the map matches the
+    tables below it."""
     try:
-        vfeed = fetch_vehicle_feed()
+        vehicles = get_vehicles_cached(data["agency_names"], data["trip_headsigns"])
     except requests.RequestException as e:
         return [], str(e)
 
-    vehicles = extract_vehicles(vfeed, data["agency_names"])
     merge_vehicle_delays(vehicles, data["delay_by_trip_all"])
 
     if data["filters_active"]:
@@ -497,6 +562,20 @@ PAGE = """
     color: #fff;
   }
   .leaflet-popup-content { font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
+
+  /* Frosted-glass hover tooltip, shown on marker hover (Leaflet's bindTooltip) */
+  .glass-tooltip {
+    background: rgba(255, 255, 255, 0.55) !important;
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
+    backdrop-filter: blur(14px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.45) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.18);
+    color: #111;
+    font: 600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif;
+    padding: 7px 11px;
+  }
+  .glass-tooltip::before { display: none; } /* hide Leaflet's default solid-colour pointer arrow */
 </style>
 </head>
 <body>
@@ -529,7 +608,7 @@ PAGE = """
     <span><span class="swatch" style="background:{{ color_late }}"></span>Late</span>
     <span><span class="swatch" style="background:{{ color_early }}"></span>Early</span>
     <span><span class="swatch" style="background:{{ color_no_data }}"></span>No delay data / anomalous</span>
-    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show entire Opal network</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
+    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
@@ -604,13 +683,21 @@ PAGE = """
       });
     }
 
+    function tooltipContent(v) {
+      const routeLabel = v.route_num || v.route_id || '?';
+      return v.headsign ? `${routeLabel} to ${v.headsign}` : `Route ${routeLabel}`;
+    }
+
     function popupContent(v) {
       const delayText = (v.delay_min != null)
         ? (v.anomaly ? `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min (flagged as anomalous)` : `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min`)
         : 'No current delay data';
       const speedKmh = (v.speed != null) ? Math.round(v.speed * 3.6) + ' km/h' : 'Speed unavailable';
+      const routeLine = v.headsign
+        ? `Route ${v.route_num || v.route_id || '?'} to ${v.headsign}`
+        : `Route ${v.route_num || v.route_id || '?'}`;
       return `
-        <strong>Route ${v.route_num || v.route_id || '?'}</strong><br>
+        <strong>${routeLine}</strong><br>
         ${v.route_operator || 'Unknown operator'}<br>
         Trip ${v.trip_id ?? '?'}<br>
         ${delayText}<br>
@@ -628,14 +715,19 @@ PAGE = """
         const routeLabel = v.route_num || v.route_id || '?';
         const icon = makeIcon(routeLabel, v.bearing, v.color);
         const popup = popupContent(v);
+        const tooltip = tooltipContent(v);
 
         if (markers.has(key)) {
           const m = markers.get(key);
           m.setLatLng([v.lat, v.lon]);
           m.setIcon(icon);
           m.getPopup().setContent(popup);
+          m.getTooltip().setContent(tooltip);
         } else {
-          const m = L.marker([v.lat, v.lon], { icon }).addTo(map).bindPopup(popup);
+          const m = L.marker([v.lat, v.lon], { icon })
+            .addTo(map)
+            .bindPopup(popup)
+            .bindTooltip(tooltip, { direction: 'top', offset: [0, -20], className: 'glass-tooltip' });
           markers.set(key, m);
         }
       });
