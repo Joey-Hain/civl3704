@@ -72,6 +72,25 @@ COLOR_LATE = "#b3261e"
 COLOR_EARLY = "#1e6b3c"
 COLOR_NO_DATA = "#888888"
 
+# Default radius filter for the map/API — the vehiclepos/buses feed is
+# STATEWIDE (thousands of vehicles across all NSW bus contract regions),
+# and shipping all of them as JSON on every request/poll produces
+# multi-hundred-KB payloads that are slow on weak connections and heavy
+# to render as markers. Restrict to within SYDNEY_RADIUS_KM of the CBD by
+# default; pass ?bounds=0 to disable and see the full unfiltered feed.
+SYDNEY_CBD = (-33.8688, 151.2093)  # lat, lon
+SYDNEY_RADIUS_KM = 10
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, asin, sqrt
+    r = 6371.0  # Earth radius, km
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return 2 * r * asin(sqrt(a))
+
+
 app = Flask(__name__)
 
 
@@ -309,6 +328,7 @@ def compute_delay_data(args):
     q_route = args.get("route", "").strip().lower()
     q_stop = args.get("stop", "").strip().lower()
     q_operator = args.get("operator", "").strip().lower()
+    apply_bounds = args.get("bounds", "1") == "1"
 
     agency_names, agency_error = load_agency_names()
     feed = fetch_feed()
@@ -350,6 +370,7 @@ def compute_delay_data(args):
         "latest_rows": latest_rows,
         "delay_by_trip_all": delay_by_trip_all,
         "filters_active": bool(q_route or q_stop or q_operator),
+        "apply_bounds": apply_bounds,
     }
 
 
@@ -368,6 +389,14 @@ def compute_vehicles(data):
     if data["filters_active"]:
         allowed_trip_ids = set(data["latest_by_trip"].keys())
         vehicles = [v for v in vehicles if v["trip_id"] in allowed_trip_ids]
+
+    if data["apply_bounds"]:
+        lat0, lon0 = SYDNEY_CBD
+        vehicles = [
+            v for v in vehicles
+            if v["lat"] is not None and v["lon"] is not None
+            and haversine_km(lat0, lon0, v["lat"], v["lon"]) <= SYDNEY_RADIUS_KM
+        ]
 
     return vehicles, None
 
@@ -500,7 +529,7 @@ PAGE = """
     <span><span class="swatch" style="background:{{ color_late }}"></span>Late</span>
     <span><span class="swatch" style="background:{{ color_early }}"></span>Early</span>
     <span><span class="swatch" style="background:{{ color_no_data }}"></span>No delay data / anomalous</span>
-    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}</span>
+    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
@@ -688,6 +717,7 @@ def dashboard():
         vehicles=vehicles,
         vehicles_json=json.dumps(vehicles),
         filters_active=data["filters_active"],
+        apply_bounds=data["apply_bounds"],
         map_error=map_error,
         color_on_time=COLOR_ON_TIME,
         color_late=COLOR_LATE,
