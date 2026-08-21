@@ -1,9 +1,21 @@
 """
 Web dashboard for TfNSW GTFS-realtime delay/variance data.
 
-Fetches the live feed on each page load, computes delay stats per operator,
-route and trip, and renders a sortable HTML table. Also appends every pull
-to delay_log.csv (same as timetable_variance.py) so you build up history.
+Fetches the live trip-update feed on each page load, computes delay stats
+per operator, route and trip, and renders a sortable HTML table. Also
+appends every pull to delay_log.csv (same as timetable_variance.py) so you
+build up history.
+
+A live map sits at the top of the page, fed by the separate GTFS-realtime
+VEHICLE POSITION feed (hardcoded to the vehiclepos endpoint below — this is
+intentionally NOT read from TFNSW_GTFS_RT_URL in .env, since that variable
+is dedicated to the trip-update feed the delay board depends on, and the
+two products are subscribed to separately on the TfNSW developer portal).
+Vehicle positions are joined to trip-update delay readings by trip_id, so
+each bus marker's colour and popup reflect its current delay. The map
+polls /api/vehicles every 15s independently of the (page-load-only) tables
+below, and respects whatever route/stop/operator/hide_anomalies filters are
+currently set.
 
 Setup:
     pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
@@ -30,7 +42,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request
 from google.transit import gtfs_realtime_pb2
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
@@ -47,6 +59,18 @@ load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
+
+# Deliberately hardcoded — NOT sourced from .env's TFNSW_GTFS_RT_URL, which
+# is the trip-update feed above. Vehicle positions are a separate GTFS-RT
+# product on the TfNSW developer portal with their own subscription.
+VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
+
+# Marker colours for the map, reusing the same on-time thresholds as the
+# rest of the dashboard.
+COLOR_ON_TIME = "#00B5EF"
+COLOR_LATE = "#b3261e"
+COLOR_EARLY = "#1e6b3c"
+COLOR_NO_DATA = "#888888"
 
 app = Flask(__name__)
 
@@ -137,6 +161,15 @@ def fetch_feed() -> gtfs_realtime_pb2.FeedMessage:
     return feed
 
 
+def fetch_vehicle_feed() -> gtfs_realtime_pb2.FeedMessage:
+    headers = {"Authorization": f"apikey {API_KEY}"}
+    response = requests.get(VEHICLE_POS_URL, headers=headers, timeout=15)
+    response.raise_for_status()
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(response.content)
+    return feed
+
+
 def extract_rows(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict[str, str]) -> list[dict]:
     pulled_at = datetime.now(tz=SYDNEY_TZ).isoformat()
     rows = []
@@ -165,6 +198,68 @@ def extract_rows(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict[str, st
                 "anomaly": abs(delay) > ANOMALY_ABS_SEC,
             })
     return rows
+
+
+def latest_reading_per_trip(rows: list[dict]) -> dict[str, dict]:
+    """Collapse to one reading per trip — the freshest, i.e. the stop with the
+    lowest stop_sequence still in the feed (TfNSW drops stops once a bus
+    passes them, so the lowest remaining sequence is the newest data point)."""
+    latest: dict[str, dict] = {}
+    for r in rows:
+        existing = latest.get(r["trip_id"])
+        if existing is None or r["stop_sequence"] < existing["stop_sequence"]:
+            latest[r["trip_id"]] = r
+    return latest
+
+
+def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict[str, str]) -> list[dict]:
+    vehicles = []
+    for entity in feed.entity:
+        if not entity.HasField("vehicle"):
+            continue
+        v = entity.vehicle
+        if not v.HasField("position"):
+            continue
+        route_id = v.trip.route_id if v.HasField("trip") else ""
+        route_num, route_operator = split_route(route_id, agency_names) if route_id else ("", "")
+        vehicles.append({
+            "trip_id": v.trip.trip_id if v.HasField("trip") else None,
+            "vehicle_id": v.vehicle.id if v.HasField("vehicle") else entity.id,
+            "route_id": route_id,
+            "route_num": route_num,
+            "route_operator": route_operator,
+            "lat": v.position.latitude,
+            "lon": v.position.longitude,
+            "bearing": v.position.bearing if v.HasField("position") else None,
+            "speed": v.position.speed if v.HasField("position") else None,
+        })
+    return vehicles
+
+
+def merge_vehicle_delays(vehicles: list[dict], delay_by_trip: dict[str, dict]) -> None:
+    """Attach delay info to each vehicle dict in place, joined by trip_id."""
+    for veh in vehicles:
+        d = delay_by_trip.get(veh["trip_id"])
+        if d is None:
+            veh["delay_sec"] = None
+            veh["delay_min"] = None
+            veh["anomaly"] = False
+            veh["on_time"] = None
+            veh["color"] = COLOR_NO_DATA
+            continue
+        veh["delay_sec"] = d["delay"]
+        veh["delay_min"] = round(d["delay"] / 60, 1)
+        veh["anomaly"] = d["anomaly"]
+        on_time = ON_TIME_EARLY_SEC <= d["delay"] <= ON_TIME_LATE_SEC
+        veh["on_time"] = on_time
+        if d["anomaly"]:
+            veh["color"] = COLOR_NO_DATA
+        elif on_time:
+            veh["color"] = COLOR_ON_TIME
+        elif d["delay"] > 0:
+            veh["color"] = COLOR_LATE
+        else:
+            veh["color"] = COLOR_EARLY
 
 
 def append_to_log(rows: list[dict]) -> None:
@@ -204,6 +299,79 @@ def split_route(route_id: str, agency_names: dict[str, str]) -> tuple[str, str]:
     return route_num, operator
 
 
+def compute_delay_data(args):
+    """Shared by the dashboard page and /api/vehicles: fetches the trip-update
+    feed, applies the route/stop/operator/hide_anomalies filters from the
+    request, and returns everything both need."""
+    hide_anomalies = args.get("hide_anomalies", "1") == "1"
+    sort_key = args.get("sort", "stdev_min")
+    ascending = args.get("asc") == "1"
+    q_route = args.get("route", "").strip().lower()
+    q_stop = args.get("stop", "").strip().lower()
+    q_operator = args.get("operator", "").strip().lower()
+
+    agency_names, agency_error = load_agency_names()
+    feed = fetch_feed()
+    all_rows = extract_rows(feed, agency_names)
+    append_to_log(all_rows)
+
+    rows = [r for r in all_rows if not (hide_anomalies and r["anomaly"])]
+
+    if q_route:
+        rows = [r for r in rows if q_route in r["route_id"].lower()]
+    if q_operator:
+        rows = [r for r in rows if q_operator in r["operator"].lower()]
+    if q_stop:
+        # match against ALL stops each trip touches (past+upcoming in the feed),
+        # not just its most recent reading, then keep every row for those trips
+        # so the latest-per-trip dedupe below still finds their current status
+        matching_trip_ids = {r["trip_id"] for r in rows if q_stop in r["stop_id"].lower()}
+        rows = [r for r in rows if r["trip_id"] in matching_trip_ids]
+
+    latest_by_trip = latest_reading_per_trip(rows)
+    latest_rows = list(latest_by_trip.values())
+
+    # Unfiltered, freshest-per-trip delay lookup — used to colour/annotate
+    # every vehicle on the map, independent of which trips currently pass
+    # the route/stop/operator/hide_anomalies filters above.
+    delay_by_trip_all = latest_reading_per_trip(all_rows)
+
+    return {
+        "hide_anomalies": hide_anomalies,
+        "sort_key": sort_key,
+        "ascending": ascending,
+        "q_route": q_route,
+        "q_stop": q_stop,
+        "q_operator": q_operator,
+        "agency_names": agency_names,
+        "agency_error": agency_error,
+        "all_rows": all_rows,
+        "latest_by_trip": latest_by_trip,
+        "latest_rows": latest_rows,
+        "delay_by_trip_all": delay_by_trip_all,
+        "filters_active": bool(q_route or q_stop or q_operator),
+    }
+
+
+def compute_vehicles(data):
+    """Fetch vehicle positions, join delays by trip_id, apply the same
+    route/stop/operator filters already resolved in `data` (via
+    latest_by_trip's trip_id set) so the map matches the tables below it."""
+    try:
+        vfeed = fetch_vehicle_feed()
+    except requests.RequestException as e:
+        return [], str(e)
+
+    vehicles = extract_vehicles(vfeed, data["agency_names"])
+    merge_vehicle_delays(vehicles, data["delay_by_trip_all"])
+
+    if data["filters_active"]:
+        allowed_trip_ids = set(data["latest_by_trip"].keys())
+        vehicles = [v for v in vehicles if v["trip_id"] in allowed_trip_ids]
+
+    return vehicles, None
+
+
 PAGE = """
 <!doctype html>
 <html>
@@ -211,6 +379,8 @@ PAGE = """
 <meta charset="utf-8">
 <meta name="robots" content="noindex, nofollow">
 <title>TfNSW Delay Board</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   :root {
     --bg: #f7f6f2;
@@ -261,6 +431,43 @@ PAGE = """
   td.early { color: var(--early); }
   .flag { color: var(--muted); font-size: 0.75rem; }
   .toggle { color: var(--text); text-decoration: underline; font-size: 0.85rem; }
+
+  #dashmap { height: 440px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
+  .map-legend {
+    display: flex; gap: 16px; align-items: center;
+    font-size: 0.8rem; color: var(--muted); margin-top: 8px; flex-wrap: wrap;
+  }
+  .map-legend .swatch {
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    margin-right: 4px; vertical-align: middle;
+  }
+  .map-error { color: var(--late); font-size: 0.85rem; margin-top: 8px; }
+
+  /* Bus marker: flat pill, arrow sits inline next to the route number */
+  .bus-marker { position: relative; width: 56px; height: 24px; }
+  .bus-pill {
+    position: absolute;
+    top: 0; left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: #fff;
+    font: 600 11px/1 -apple-system, Helvetica, Arial, sans-serif;
+    padding: 5px 7px;
+    border-radius: 7px;
+    border: 2px solid #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    white-space: nowrap;
+  }
+  .bus-arrow {
+    flex: 0 0 auto;
+    font-size: 12px;
+    line-height: 1;
+    display: inline-block;
+    color: #fff;
+  }
+  .leaflet-popup-content { font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
 </style>
 </head>
 <body>
@@ -285,6 +492,17 @@ PAGE = """
     <button type="submit" style="font-family:inherit;">Filter</button>
     {% if q_route or q_stop or q_operator %}<a class="toggle" href="?hide_anomalies={{ 1 if hide_anomalies else 0 }}">clear filters</a>{% endif %}
   </form>
+
+  <h2>Live map</h2>
+  <div id="dashmap"></div>
+  <div class="map-legend">
+    <span><span class="swatch" style="background:{{ color_on_time }}"></span>On time</span>
+    <span><span class="swatch" style="background:{{ color_late }}"></span>Late</span>
+    <span><span class="swatch" style="background:{{ color_early }}"></span>Early</span>
+    <span><span class="swatch" style="background:{{ color_no_data }}"></span>No delay data / anomalous</span>
+    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}</span>
+  </div>
+  {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
   <h2>By operator</h2>
   <table>
@@ -330,6 +548,93 @@ PAGE = """
     </tr>
     {% endfor %}
   </table>
+
+  <script>
+    const map = L.map('dashmap').setView([-33.8688, 151.2093], 11); // Sydney
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const markers = new Map(); // trip_id/vehicle_id -> Leaflet marker
+
+    function makeIcon(routeLabel, bearing, color) {
+      const rot = (bearing != null ? bearing : 0) - 90; // glyph points right by default; GTFS bearing is clockwise from north
+      return L.divIcon({
+        className: '',
+        iconSize: [56, 24],
+        iconAnchor: [28, 12],
+        popupAnchor: [0, -12],
+        html: `
+          <div class="bus-marker">
+            <div class="bus-pill" style="background:${color};">
+              <div class="bus-arrow" style="transform: rotate(${rot}deg);">&#10148;</div>
+              <span>${routeLabel}</span>
+            </div>
+          </div>
+        `
+      });
+    }
+
+    function popupContent(v) {
+      const delayText = (v.delay_min != null)
+        ? (v.anomaly ? `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min (flagged as anomalous)` : `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min`)
+        : 'No current delay data';
+      const speedKmh = (v.speed != null) ? Math.round(v.speed * 3.6) + ' km/h' : 'Speed unavailable';
+      return `
+        <strong>Route ${v.route_num || v.route_id || '?'}</strong><br>
+        ${v.route_operator || 'Unknown operator'}<br>
+        Trip ${v.trip_id ?? '?'}<br>
+        ${delayText}<br>
+        ${speedKmh}
+      `;
+    }
+
+    function renderVehicles(vehicles) {
+      const seen = new Set();
+      vehicles.forEach(v => {
+        if (v.lat == null || v.lon == null) return;
+        const key = v.vehicle_id || v.trip_id;
+        seen.add(key);
+
+        const routeLabel = v.route_num || v.route_id || '?';
+        const icon = makeIcon(routeLabel, v.bearing, v.color);
+        const popup = popupContent(v);
+
+        if (markers.has(key)) {
+          const m = markers.get(key);
+          m.setLatLng([v.lat, v.lon]);
+          m.setIcon(icon);
+          m.getPopup().setContent(popup);
+        } else {
+          const m = L.marker([v.lat, v.lon], { icon }).addTo(map).bindPopup(popup);
+          markers.set(key, m);
+        }
+      });
+
+      for (const [key, m] of markers) {
+        if (!seen.has(key)) {
+          map.removeLayer(m);
+          markers.delete(key);
+        }
+      }
+    }
+
+    async function pollVehicles() {
+      try {
+        const res = await fetch('/api/vehicles' + window.location.search);
+        const data = await res.json();
+        renderVehicles(data.vehicles || []);
+      } catch (e) {
+        console.warn('Vehicle poll failed', e);
+      }
+    }
+
+    // Initial paint uses the vehicles fetched at page-load (server-rendered),
+    // then polls independently every 15s so the map stays live without
+    // reloading the tables below.
+    renderVehicles({{ vehicles_json|safe }});
+    setInterval(pollVehicles, 15000);
+  </script>
 </body>
 </html>
 """
@@ -340,43 +645,14 @@ def dashboard():
     if not API_KEY:
         return "TFNSW_API_KEY not set in .env", 500
 
-    hide_anomalies = request.args.get("hide_anomalies", "1") == "1"
-    sort_key = request.args.get("sort", "stdev_min")
-    ascending = request.args.get("asc") == "1"
-    q_route = request.args.get("route", "").strip().lower()
-    q_stop = request.args.get("stop", "").strip().lower()
-    q_operator = request.args.get("operator", "").strip().lower()
+    data = compute_delay_data(request.args)
+    vehicles, map_error = compute_vehicles(data)
 
-    agency_names, agency_error = load_agency_names()
-    feed = fetch_feed()
-    all_rows = extract_rows(feed, agency_names)
-    append_to_log(all_rows)
+    all_rows = data["all_rows"]
+    latest_rows = data["latest_rows"]
+    agency_names = data["agency_names"]
 
-    rows = [r for r in all_rows if not (hide_anomalies and r["anomaly"])]
-
-    if q_route:
-        rows = [r for r in rows if q_route in r["route_id"].lower()]
-    if q_operator:
-        rows = [r for r in rows if q_operator in r["operator"].lower()]
-    if q_stop:
-        # match against ALL stops each trip touches (past+upcoming in the feed),
-        # not just its most recent reading, then keep every row for those trips
-        # so the latest-per-trip dedupe below still finds their current status
-        matching_trip_ids = {r["trip_id"] for r in rows if q_stop in r["stop_id"].lower()}
-        rows = [r for r in rows if r["trip_id"] in matching_trip_ids]
-
-    # Collapse to one reading per trip — the most recent, i.e. the stop with
-    # the lowest stop_sequence still in the feed (TfNSW drops stops once a
-    # bus passes them, so the lowest remaining sequence is the freshest data
-    # point for that trip, not just whichever stop happened to be listed last).
-    latest_by_trip: dict[str, dict] = {}
-    for r in rows:
-        existing = latest_by_trip.get(r["trip_id"])
-        if existing is None or r["stop_sequence"] < existing["stop_sequence"]:
-            latest_by_trip[r["trip_id"]] = r
-    latest_rows = list(latest_by_trip.values())
-
-    observed_prefixes = sorted({r["route_id"].split("_")[0] for r in rows if r["route_id"]})[:10]
+    observed_prefixes = sorted({r["route_id"].split("_")[0] for r in all_rows if r["route_id"]})[:10]
     agency_debug = (
         f"Loaded {len(agency_names)} operator names. "
         f"Sample loaded IDs: {list(agency_names.keys())[:10]}. "
@@ -386,7 +662,7 @@ def dashboard():
     operators = sorted(summarise(latest_rows, "operator"), key=lambda r: -abs(r["mean_min"]))
     routes = sorted(
         summarise(latest_rows, "route_id"),
-        key=lambda r: r[sort_key] if ascending else -abs(r[sort_key]),
+        key=lambda r: r[data["sort_key"]] if data["ascending"] else -abs(r[data["sort_key"]]),
     )
     for r in routes:
         r["route_num"], r["route_operator"] = split_route(r["route_id"], agency_names)
@@ -400,16 +676,33 @@ def dashboard():
         pulled_at=all_rows[0]["pulled_at"] if all_rows else "-",
         n_total=len(all_rows),
         n_flagged=sum(1 for r in all_rows if r["anomaly"]),
-        hide_anomalies=hide_anomalies,
-        q_route=q_route,
-        q_stop=q_stop,
-        q_operator=q_operator,
-        agency_error=agency_error,
+        hide_anomalies=data["hide_anomalies"],
+        q_route=data["q_route"],
+        q_stop=data["q_stop"],
+        q_operator=data["q_operator"],
+        agency_error=data["agency_error"],
         agency_debug=agency_debug,
         operators=operators,
         routes=routes,
         worst_trips=worst_trips,
+        vehicles=vehicles,
+        vehicles_json=json.dumps(vehicles),
+        filters_active=data["filters_active"],
+        map_error=map_error,
+        color_on_time=COLOR_ON_TIME,
+        color_late=COLOR_LATE,
+        color_early=COLOR_EARLY,
+        color_no_data=COLOR_NO_DATA,
     )
+
+
+@app.route("/api/vehicles")
+def api_vehicles():
+    if not API_KEY:
+        return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
+    data = compute_delay_data(request.args)
+    vehicles, map_error = compute_vehicles(data)
+    return jsonify({"vehicles": vehicles, "error": map_error})
 
 
 if __name__ == "__main__":
