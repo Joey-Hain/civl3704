@@ -168,22 +168,55 @@ def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], dict[str, s
             shapes_writer = csv.writer(shapes_out)
             shapes_header_written = False
 
-            def parse_bundle(zf: zipfile.ZipFile) -> None:
+            def stream_trips(zf: zipfile.ZipFile) -> None:
+                # Stream trips.txt row-by-row rather than reading it fully into
+                # memory — state-wide it can be a large file, and doing this in
+                # one pass (not two separate parse_csv_txt calls over the full
+                # text) also avoids decoding/parsing it twice.
+                with zf.open("trips.txt") as raw, io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if not header:
+                        return
+                    header = [h.strip() for h in header]
+                    if "trip_id" not in header:
+                        return
+                    id_idx = header.index("trip_id")
+                    hs_idx = header.index("trip_headsign") if "trip_headsign" in header else None
+                    sh_idx = header.index("shape_id") if "shape_id" in header else None
+                    for row in reader:
+                        if len(row) <= id_idx:
+                            continue
+                        trip_id = row[id_idx].strip()
+                        if hs_idx is not None and len(row) > hs_idx and row[hs_idx].strip():
+                            trip_headsigns[trip_id] = row[hs_idx].strip()
+                        if sh_idx is not None and len(row) > sh_idx and row[sh_idx].strip():
+                            trip_shapes[trip_id] = row[sh_idx].strip()
+
+            def stream_shapes(zf: zipfile.ZipFile) -> None:
+                # Stream shapes.txt row-by-row straight through to the output
+                # file — never materialising the full file (text or parsed
+                # rows) in memory. This is the file most likely to be large
+                # state-wide (one row per polyline point, across every shape).
                 nonlocal shapes_header_written
+                with zf.open("shapes.txt") as raw, io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as f:
+                    reader = csv.reader(f)
+                    header = next(reader, None)
+                    if not header:
+                        return
+                    if not shapes_header_written:
+                        shapes_writer.writerow(header)
+                        shapes_header_written = True
+                    for row in reader:
+                        shapes_writer.writerow(row)
+
+            def parse_bundle(zf: zipfile.ZipFile) -> None:
                 if "agency.txt" in zf.namelist():
                     agencies.update(parse_csv_txt(zf.read("agency.txt").decode("utf-8-sig"), "agency_id", "agency_name"))
                 if "trips.txt" in zf.namelist():
-                    trips_text = zf.read("trips.txt").decode("utf-8-sig")
-                    trip_headsigns.update(parse_csv_txt(trips_text, "trip_id", "trip_headsign"))
-                    trip_shapes.update(parse_csv_txt(trips_text, "trip_id", "shape_id"))
+                    stream_trips(zf)
                 if "shapes.txt" in zf.namelist():
-                    shapes_text = zf.read("shapes.txt").decode("utf-8-sig")
-                    shapes_rows = list(csv.reader(io.StringIO(shapes_text)))
-                    if shapes_rows:
-                        if not shapes_header_written:
-                            shapes_writer.writerow(shapes_rows[0])
-                            shapes_header_written = True
-                        shapes_writer.writerows(shapes_rows[1:])
+                    stream_shapes(zf)
 
             if "agency.txt" in names or "trips.txt" in names:
                 # flat bundle
