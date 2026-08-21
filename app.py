@@ -877,6 +877,17 @@ PAGE = """
 """
 
 
+@app.route("/healthz")
+def healthz():
+    """Instant, dependency-free liveness check — does NOT touch the
+    schedule/trip-update/vehicle feeds. Point Render's Health Check Path
+    setting at this instead of '/', otherwise Render's readiness probe
+    hits the heaviest route in the app (which on a cold container has to
+    download+parse the full schedule bundle before responding) and can
+    time out and restart the container before that fetch ever completes."""
+    return "ok", 200
+
+
 @app.route("/")
 def dashboard():
     if not API_KEY:
