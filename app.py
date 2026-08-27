@@ -273,6 +273,28 @@ def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], dict[str, s
 # --- Shape cache: LRU dict capped at MAX_CACHED_SHAPES, see module docstring ---
 _shape_cache: "OrderedDict[str, list[list[float]]]" = OrderedDict()
  
+# --- Short-TTL cache of the raw schedule zip bytes, used only by the shape
+# lookup path (see SCHEDULE_ZIP_CACHE_TTL above for why). Distinct from the
+# agency/trip-headsign disk cache in load_schedule_lookups, which parses
+# and discards the zip immediately rather than keeping bytes around. ---
+_schedule_zip_cache = {"content": None, "fetched_at": None}
+ 
+ 
+def _get_schedule_zip_bytes() -> bytes:
+    """Return the schedule zip's raw bytes, reusing a recent download if
+    within SCHEDULE_ZIP_CACHE_TTL. Raises requests.RequestException or
+    RuntimeError (non-200) on failure, same as a direct requests.get would."""
+    now = datetime.now(tz=SYDNEY_TZ)
+    fetched_at = _schedule_zip_cache["fetched_at"]
+    if fetched_at is not None and (now - fetched_at) < SCHEDULE_ZIP_CACHE_TTL:
+        return _schedule_zip_cache["content"]
+ 
+    resp = requests.get(SCHEDULE_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Schedule endpoint returned HTTP {resp.status_code}")
+    _schedule_zip_cache.update(content=resp.content, fetched_at=now)
+    return resp.content
+ 
  
 def _shape_cache_get(shape_id: str):
     if shape_id in _shape_cache:
@@ -329,17 +351,14 @@ def stream_shapes_for_ids(zf: zipfile.ZipFile, shape_ids_needed: set[str]) -> di
     return out
  
  
-def get_shapes_for_trip_ids(trip_ids: set[str], trip_shapes: dict[str, str]) -> dict[str, list[list[float]]]:
+def get_shapes_for_trip_ids(trip_ids: set[str], trip_shapes: dict[str, str]) -> tuple[dict[str, list[list[float]]], str | None]:
     """Resolve trip_ids -> shape geometry, serving from the capped cache
-    where possible and only re-fetching the schedule bundle for whatever's
-    missing. This is the only place shapes.txt gets touched, and only for
-    the shape_ids actually needed right now (typically the handful of
-    routes currently visible on the CBD-bounded map) — never the network-
-    wide file. On a cache miss we re-download the schedule zip (it's
-    already cached on disk-adjacent logic for agency/trip lookups, but
-    we deliberately don't keep the raw zip bytes resident between calls —
-    that's what caused the original memory blowup — so a miss costs one
-    HTTP fetch, not standing memory)."""
+    where possible and reusing the short-TTL cached schedule zip (see
+    _get_schedule_zip_bytes) for whatever's missing, instead of hitting
+    TfNSW fresh on every single miss — that repeated-download pattern is
+    what caused page-load timeouts under continuous polling (see
+    SCHEDULE_ZIP_CACHE_TTL above). This is the only place shapes.txt gets
+    touched, and only for the shape_ids actually needed right now."""
     wanted_shape_ids = {trip_shapes[t] for t in trip_ids if t in trip_shapes and trip_shapes[t]}
     if not wanted_shape_ids:
         # Common cause: trips.txt has no shape_id column at all, or it's
@@ -363,10 +382,8 @@ def get_shapes_for_trip_ids(trip_ids: set[str], trip_shapes: dict[str, str]) -> 
         return result, None
  
     try:
-        resp = requests.get(SCHEDULE_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=30)
-        if resp.status_code != 200:
-            return result, f"Schedule endpoint returned HTTP {resp.status_code} while fetching shapes."
-        outer = zipfile.ZipFile(io.BytesIO(resp.content))
+        zip_bytes = _get_schedule_zip_bytes()
+        outer = zipfile.ZipFile(io.BytesIO(zip_bytes))
         names = outer.namelist()
  
         found: dict[str, list[list[float]]] = {}
@@ -994,8 +1011,9 @@ PAGE = """
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ trip_ids: tripIds }),
         })
-          .then(res => res.json())
-          .then(data => {
+          .then(res => res.json().then(data => ({ ok: res.ok, status: res.status, data })))
+          .then(({ ok, status, data }) => {
+            if (!ok) console.warn(`[shapes] HTTP ${status}:`, data.error);
             if (data.error) console.warn('[shapes] server reported:', data.error);
             const entries = Object.entries(data.shapes || {});
             console.log(`[shapes] got ${entries.length} shape(s) for ${tripIds.length} trip_id(s)`);
@@ -1116,18 +1134,32 @@ def api_shapes():
     strings, which is exactly what was happening here (the 400s were
     Gunicorn rejecting the request before Flask ever saw it, hence the HTML
     error page instead of JSON). A POST body has no such limit.
-    Usage: POST /api/shapes  body: {"trip_ids": ["id1", "id2", ...]}"""
+    Usage: POST /api/shapes  body: {"trip_ids": ["id1", "id2", ...]}
+ 
+    The whole body is wrapped in try/except: get_shapes_for_trip_ids already
+    catches its own failures, but get_all_rows_cached() below does a live
+    fetch to the trip-update feed and can genuinely raise (network hiccup,
+    TfNSW rate limit, etc). Without this wrapper that turns into Flask's
+    generic HTML 500 page, which is why the client saw "Unexpected token
+    '<'" instead of a JSON error — this makes any future failure visible
+    as JSON with a real message and a traceback in the server logs,
+    instead of a silent opaque 500."""
     if not API_KEY:
         return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
-    body = request.get_json(silent=True) or {}
-    trip_ids = {t for t in body.get("trip_ids", []) if t}
-    if not trip_ids:
-        return jsonify({"shapes": {}, "error": None})
-    _, _, _, trip_shapes, _ = get_all_rows_cached()
-    shapes, error = get_shapes_for_trip_ids(trip_ids, trip_shapes)
-    if error:
-        print(f"[/api/shapes] {error}")  # visible in Render logs
-    return jsonify({"shapes": shapes, "error": error})
+    try:
+        body = request.get_json(silent=True) or {}
+        trip_ids = {t for t in body.get("trip_ids", []) if t}
+        if not trip_ids:
+            return jsonify({"shapes": {}, "error": None})
+        _, _, _, trip_shapes, _ = get_all_rows_cached()
+        shapes, error = get_shapes_for_trip_ids(trip_ids, trip_shapes)
+        if error:
+            print(f"[/api/shapes] {error}")  # visible in Render logs
+        return jsonify({"shapes": shapes, "error": error})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()  # full traceback in Render logs
+        return jsonify({"shapes": {}, "error": f"{type(e).__name__}: {e}"}), 500
  
  
 if __name__ == "__main__":
