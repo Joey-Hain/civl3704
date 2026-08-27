@@ -69,11 +69,33 @@ ANOMALY_ABS_SEC = 3600  # readings beyond this magnitude are flagged as likely s
 ON_TIME_EARLY_SEC = -60   # 1 min early
 ON_TIME_LATE_SEC = 300    # 5 min late — standard industry on-time window
 
+import psycopg2
+from psycopg2.extras import execute_values
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def get_db_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+def append_to_db(rows: list[dict]) -> None:
+    if not rows:
+        return
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """INSERT INTO raw_delay_readings
+                   (pulled_at, operator, route_id, trip_id, stop_id, stop_sequence, delay, anomaly)
+                   VALUES %s""",
+                [(r["pulled_at"], r["operator"], r["route_id"], r["trip_id"],
+                  r["stop_id"], r["stop_sequence"], r["delay"], r["anomaly"]) for r in rows]
+            )
+
 load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 # Deliberately hardcoded — NOT sourced from .env's TFNSW_GTFS_RT_URL, which
 # is the trip-update feed above. Vehicle positions are a separate GTFS-RT
 # product on the TfNSW developer portal with their own subscription.
@@ -82,8 +104,8 @@ VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 # --- Colour scheme: single blue fill, delay status carried by outline ---
 COLOR_FILL = "#00B3F0"          # every marker's pill background, regardless of status
 OUTLINE_ON_TIME = "#ffffff"
-OUTLINE_LATE = "#B3261E"
-OUTLINE_EARLY = "#1E6B3C"
+OUTLINE_LATE = "#D21F15"
+OUTLINE_EARLY = "#0E7E39"
 OUTLINE_NO_DATA = "#888888"
 
 # Default radius filter for the map/API — the vehiclepos/buses feed is
@@ -316,16 +338,6 @@ def merge_vehicle_delays(vehicles: list[dict], delay_by_trip: dict[str, dict]) -
             veh["outline_color"] = OUTLINE_LATE
         else:
             veh["outline_color"] = OUTLINE_EARLY
-
-
-def append_to_log(rows: list[dict]) -> None:
-    file_exists = LOG_FILE.exists()
-    with LOG_FILE.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["pulled_at", "operator", "route_id", "trip_id", "stop_id", "stop_sequence", "delay", "anomaly"])
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(rows)
-
 
 def summarise(rows: list[dict], key: str) -> list[dict]:
     grouped = defaultdict(list)
@@ -650,7 +662,7 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_late }}"></span>Late</span>
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
-    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
+    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show Opal area</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">Opal area, restrict to 10km of CBD</a>{% endif %}</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
