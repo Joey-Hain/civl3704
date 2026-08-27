@@ -113,8 +113,9 @@ SYDNEY_RADIUS_KM = 10
  
 # --- Shape cache bounds — see module docstring ---
 MAX_CACHED_SHAPES = 300          # hard cap on distinct shape_ids held in memory at once
-SHAPE_SIMPLIFY_TOLERANCE_DEG = 0.00006  # ~6-7m at Sydney's latitude; tune if polylines look too coarse/dense
- 
+SHAPE_SIMPLIFY_TOLERANCE_DEG = 0.00006
+
+SCHEDULE_ZIP_CACHE_TTL = timedelta(minutes=15)
  
 def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
