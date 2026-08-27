@@ -745,7 +745,7 @@ PAGE = """
   .flag { color: var(--muted); font-size: 0.75rem; }
   .toggle { color: var(--text); text-decoration: underline; font-size: 0.85rem; }
  
-  #dashmap { height: 440px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
+  #dashmap { height: 600px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
   .map-legend {
     display: flex; gap: 16px; align-items: center;
     font-size: 0.8rem; color: var(--muted); margin-top: 8px; flex-wrap: wrap;
@@ -984,16 +984,21 @@ PAGE = """
  
       // Route shapes: fetch only for trip_ids currently on screen, skip any
       // shape_id we've already drawn this session (geometry doesn't change).
-      // See get_shapes_for_trip_ids in app.py for why this stays cheap.
+      // POST with a JSON body (not GET+querystring) — see api_shapes() for
+      // why: a few hundred trip_ids blows past the ~4KB GET request-line
+      // limit most WSGI servers enforce, which was the original bug here.
       const tripIds = [...new Set(vehicles.map(v => v.trip_id).filter(Boolean))];
-      const unfetchedTripIds = tripIds; // server dedupes by shape_id internally
-      if (unfetchedTripIds.length) {
-        fetch('/api/shapes?trip_ids=' + encodeURIComponent(unfetchedTripIds.join(',')))
+      if (tripIds.length) {
+        fetch('/api/shapes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ trip_ids: tripIds }),
+        })
           .then(res => res.json())
           .then(data => {
             if (data.error) console.warn('[shapes] server reported:', data.error);
             const entries = Object.entries(data.shapes || {});
-            console.log(`[shapes] got ${entries.length} shape(s) for ${unfetchedTripIds.length} trip_id(s)`);
+            console.log(`[shapes] got ${entries.length} shape(s) for ${tripIds.length} trip_id(s)`);
             for (const [shapeId, points] of entries) {
               if (shapePolylines.has(shapeId) || !points.length) continue;
               const pl = L.polyline(points, {
@@ -1099,14 +1104,23 @@ def api_vehicles():
     return jsonify({"vehicles": vehicles, "error": map_error})
  
  
-@app.route("/api/shapes")
+@app.route("/api/shapes", methods=["POST"])
 def api_shapes():
     """Return simplified route-shape polylines for the given trip_ids only —
     see get_shapes_for_trip_ids and the module docstring for why this never
-    loads shapes.txt in full. Usage: /api/shapes?trip_ids=id1,id2,id3"""
+    loads shapes.txt in full.
+ 
+    POST (not GET) deliberately: with a few hundred vehicles on screen, the
+    trip_id list is easily 4-8KB — comfortably over the ~4KB request-line
+    limit most WSGI servers (Gunicorn included) enforce on GET query
+    strings, which is exactly what was happening here (the 400s were
+    Gunicorn rejecting the request before Flask ever saw it, hence the HTML
+    error page instead of JSON). A POST body has no such limit.
+    Usage: POST /api/shapes  body: {"trip_ids": ["id1", "id2", ...]}"""
     if not API_KEY:
         return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
-    trip_ids = {t for t in request.args.get("trip_ids", "").split(",") if t}
+    body = request.get_json(silent=True) or {}
+    trip_ids = {t for t in body.get("trip_ids", []) if t}
     if not trip_ids:
         return jsonify({"shapes": {}, "error": None})
     _, _, _, trip_shapes, _ = get_all_rows_cached()
