@@ -17,6 +17,35 @@ polls /api/vehicles every 15s independently of the (page-load-only) tables
 below, and respects whatever route/stop/operator/hide_anomalies filters are
 currently set.
 
+ROUTE SHAPES (new): drawn as thin blue polylines under the bus markers.
+The previous attempt at this loaded shapes.txt for the *whole* static GTFS
+bundle into memory (via csv.reader(list(...)) over a fully-decoded string)
+and blew through Render.com's 512MB free-tier cap - shapes.txt for the
+whole NSW bus network is tens of MB of rows, almost all of which are never
+displayed. This version instead:
+  1. only ever fetches shapes for the *specific* shape_ids belonging to
+     trip_ids currently visible on the map (typically well under a
+     hundred), never the whole file's contents;
+  2. streams shapes.txt row-by-row via io.TextIOWrapper directly over the
+     open zip member, so the full decoded CSV text is never held in memory
+     at once - only the (small) set of matched points survives each pass;
+  3. simplifies each shape with a lightweight Douglas-Peucker pass before
+     caching it, since raw GTFS shapes are far denser than a ~500px-wide
+     Leaflet pane needs;
+  4. caches results in a hard-capped, LRU-evicted in-memory dict
+     (MAX_CACHED_SHAPES) so the cache itself can't grow unbounded across a
+     long-running process even if lots of different routes get viewed.
+
+LIQUID-GLASS POPUPS: purely a frontend CSS concern (backdrop-filter blur on
+the Leaflet popup/tooltip chrome) - this costs nothing server-side. It was
+rolled back together with the shapes work last time, so it's reinstated
+here for both the hover tooltip and the click popup.
+
+COLOUR SCHEME (changed): every bus marker now has the same blue fill
+(brand colour), with delay status shown via the marker's OUTLINE colour
+instead of swapping the fill. This keeps the map visually calm (one colour
+family) while still making outliers scannable by ring colour.
+
 Setup:
     pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
 
@@ -35,7 +64,7 @@ import json
 import os
 import statistics
 import zipfile
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -65,12 +94,13 @@ SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.g
 # product on the TfNSW developer portal with their own subscription.
 VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 
-# Marker colours for the map, reusing the same on-time thresholds as the
-# rest of the dashboard.
-COLOR_ON_TIME = "#00B5EF"
-COLOR_LATE = "#b3261e"
-COLOR_EARLY = "#1e6b3c"
-COLOR_NO_DATA = "#888888"
+# --- Colour scheme: single blue fill, delay status carried by outline ---
+COLOR_FILL = "#1668E3"          # every marker's pill background, regardless of status
+OUTLINE_ON_TIME = "#BFD7FF"     # pale blue ring — reads as "normal" against the blue fill
+OUTLINE_LATE = "#B3261E"
+OUTLINE_EARLY = "#1E6B3C"
+OUTLINE_NO_DATA = "#888888"
+SHAPE_LINE_COLOR = "#1668E3"    # route polylines reuse the same blue, at low opacity
 
 # Default radius filter for the map/API — the vehiclepos/buses feed is
 # STATEWIDE (thousands of vehicles across all NSW bus contract regions),
@@ -80,6 +110,10 @@ COLOR_NO_DATA = "#888888"
 # default; pass ?bounds=0 to disable and see the full unfiltered feed.
 SYDNEY_CBD = (-33.8688, 151.2093)  # lat, lon
 SYDNEY_RADIUS_KM = 10
+
+# --- Shape cache bounds — see module docstring ---
+MAX_CACHED_SHAPES = 300          # hard cap on distinct shape_ids held in memory at once
+SHAPE_SIMPLIFY_TOLERANCE_DEG = 0.00006  # ~6-7m at Sydney's latitude; tune if polylines look too coarse/dense
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -91,11 +125,50 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * asin(sqrt(a))
 
 
+def simplify_polyline(points: list[tuple[float, float]], tolerance: float) -> list[tuple[float, float]]:
+    """Ramer-Douglas-Peucker simplification, iterative (no recursion limit
+    risk on long shapes). points/return are [(lat, lon), ...]. Cuts point
+    count substantially for typical GTFS shapes without visibly changing
+    the drawn route, which is most of what keeps the shape cache small."""
+    if len(points) < 3:
+        return points
+
+    def perp_dist(pt, a, b):
+        (x, y), (x1, y1), (x2, y2) = pt, a, b
+        dx, dy = x2 - x1, y2 - y1
+        if dx == dy == 0:
+            return ((x - x1) ** 2 + (y - y1) ** 2) ** 0.5
+        t = ((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy)
+        t = max(0.0, min(1.0, t))
+        proj_x, proj_y = x1 + t * dx, y1 + t * dy
+        return ((x - proj_x) ** 2 + (y - proj_y) ** 2) ** 0.5
+
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end - start < 2:
+            continue
+        a, b = points[start], points[end]
+        max_dist, max_idx = -1.0, -1
+        for i in range(start + 1, end):
+            d = perp_dist(points[i], a, b)
+            if d > max_dist:
+                max_dist, max_idx = d, i
+        if max_dist > tolerance:
+            keep[max_idx] = True
+            stack.append((start, max_idx))
+            stack.append((max_idx, end))
+    return [p for p, k in zip(points, keep) if k]
+
+
 app = Flask(__name__)
 
 
-def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]:
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error_message_or_None).
+def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], dict[str, str], str | None]:
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign},
+    {trip_id: shape_id}, error_message_or_None).
 
     Tries the static GTFS schedule bundle, which may come back either as a
     flat GTFS zip (agency.txt/trips.txt at top level) or a zip-of-zips (one
@@ -110,15 +183,20 @@ def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]
     destination sign — e.g. "Bondi Beach" — and is direction-specific,
     unlike routes.txt's route_long_name which is usually a fixed "A to B"
     description that doesn't tell you which way a given trip is currently
-    headed. Both files are parsed in the same download/unzip pass since
-    they live in the same bundle as agency.txt.
+    headed. shape_id (also from trips.txt) is what lets /api/shapes later
+    find the right polyline for a trip without re-parsing trips.txt.
+
+    NOTE: unlike shapes.txt (see get_shapes_for_trip_ids below), agency.txt
+    and trips.txt are both small enough system-wide to read in full and
+    cache — it's specifically shapes.txt that's too big to ever load whole.
     """
     if AGENCY_CACHE_FILE.exists():
         try:
             cached = json.loads(AGENCY_CACHE_FILE.read_text())
             fetched_at = datetime.fromisoformat(cached["fetched_at"])
             if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
-                return cached["agencies"], cached.get("trip_headsigns", {}), None
+                return (cached["agencies"], cached.get("trip_headsigns", {}),
+                        cached.get("trip_shapes", {}), None)
         except Exception:
             pass  # corrupt cache, refetch below
 
@@ -151,12 +229,15 @@ def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]
 
         agencies: dict[str, str] = {}
         trip_headsigns: dict[str, str] = {}
+        trip_shapes: dict[str, str] = {}
 
         def parse_bundle(zf: zipfile.ZipFile) -> None:
             if "agency.txt" in zf.namelist():
                 agencies.update(parse_csv_txt(zf.read("agency.txt").decode("utf-8-sig"), "agency_id", "agency_name"))
             if "trips.txt" in zf.namelist():
-                trip_headsigns.update(parse_csv_txt(zf.read("trips.txt").decode("utf-8-sig"), "trip_id", "trip_headsign"))
+                trips_text = zf.read("trips.txt").decode("utf-8-sig")
+                trip_headsigns.update(parse_csv_txt(trips_text, "trip_id", "trip_headsign"))
+                trip_shapes.update(parse_csv_txt(trips_text, "trip_id", "shape_id"))
 
         if "agency.txt" in names or "trips.txt" in names:
             # flat bundle
@@ -175,16 +256,132 @@ def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]
             "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
             "agencies": agencies,
             "trip_headsigns": trip_headsigns,
+            "trip_shapes": trip_shapes,
         }))
-        return agencies, trip_headsigns, None
+        return agencies, trip_headsigns, trip_shapes, None
     except Exception as e:
         if AGENCY_CACHE_FILE.exists():
             try:
                 cached = json.loads(AGENCY_CACHE_FILE.read_text())
-                return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
+                return (cached["agencies"], cached.get("trip_headsigns", {}),
+                        cached.get("trip_shapes", {}), f"Using stale cached names ({e})")
             except Exception:
                 pass
-        return {}, {}, str(e)
+        return {}, {}, {}, str(e)
+
+
+# --- Shape cache: LRU dict capped at MAX_CACHED_SHAPES, see module docstring ---
+_shape_cache: "OrderedDict[str, list[list[float]]]" = OrderedDict()
+
+
+def _shape_cache_get(shape_id: str):
+    if shape_id in _shape_cache:
+        _shape_cache.move_to_end(shape_id)  # mark as recently used
+        return _shape_cache[shape_id]
+    return None
+
+
+def _shape_cache_put(shape_id: str, points: list[list[float]]) -> None:
+    _shape_cache[shape_id] = points
+    _shape_cache.move_to_end(shape_id)
+    while len(_shape_cache) > MAX_CACHED_SHAPES:
+        _shape_cache.popitem(last=False)  # evict least-recently-used
+
+
+def stream_shapes_for_ids(zf: zipfile.ZipFile, shape_ids_needed: set[str]) -> dict[str, list[list[float]]]:
+    """Stream shapes.txt from an already-open zip member, keeping only rows
+    whose shape_id is in shape_ids_needed. Never materialises the full file
+    as a string or a list of rows — io.TextIOWrapper + csv.reader iterate
+    the member's bytes on demand, so peak memory is roughly "one row" plus
+    the (small) accumulated points for the requested shapes only.
+    Returns {shape_id: [[lat, lon], ...]} in shape_pt_sequence order,
+    already simplified."""
+    raw_points: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
+    with zf.open("shapes.txt") as raw:
+        text_stream = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+        reader = csv.reader(text_stream)
+        header = next(reader, None)
+        if header is None:
+            return {}
+        idx = {h.strip(): i for i, h in enumerate(header)}
+        required = ("shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence")
+        if not all(c in idx for c in required):
+            return {}
+        sid_i, lat_i, lon_i, seq_i = (idx[c] for c in required)
+        max_col = max(sid_i, lat_i, lon_i, seq_i)
+        for row in reader:
+            if len(row) <= max_col:
+                continue
+            sid = row[sid_i]
+            if sid not in shape_ids_needed:
+                continue
+            try:
+                raw_points[sid].append((int(row[seq_i]), float(row[lat_i]), float(row[lon_i])))
+            except ValueError:
+                continue  # malformed row — skip rather than fail the whole pass
+
+    out: dict[str, list[list[float]]] = {}
+    for sid, pts in raw_points.items():
+        pts.sort(key=lambda p: p[0])
+        latlon = [(lat, lon) for _, lat, lon in pts]
+        simplified = simplify_polyline(latlon, SHAPE_SIMPLIFY_TOLERANCE_DEG)
+        out[sid] = [[lat, lon] for lat, lon in simplified]
+    return out
+
+
+def get_shapes_for_trip_ids(trip_ids: set[str], trip_shapes: dict[str, str]) -> dict[str, list[list[float]]]:
+    """Resolve trip_ids -> shape geometry, serving from the capped cache
+    where possible and only re-fetching the schedule bundle for whatever's
+    missing. This is the only place shapes.txt gets touched, and only for
+    the shape_ids actually needed right now (typically the handful of
+    routes currently visible on the CBD-bounded map) — never the network-
+    wide file. On a cache miss we re-download the schedule zip (it's
+    already cached on disk-adjacent logic for agency/trip lookups, but
+    we deliberately don't keep the raw zip bytes resident between calls —
+    that's what caused the original memory blowup — so a miss costs one
+    HTTP fetch, not standing memory)."""
+    wanted_shape_ids = {trip_shapes[t] for t in trip_ids if t in trip_shapes and trip_shapes[t]}
+    if not wanted_shape_ids:
+        return {}
+
+    result: dict[str, list[list[float]]] = {}
+    missing: set[str] = set()
+    for sid in wanted_shape_ids:
+        cached = _shape_cache_get(sid)
+        if cached is not None:
+            result[sid] = cached
+        else:
+            missing.add(sid)
+
+    if not missing:
+        return result
+
+    try:
+        resp = requests.get(SCHEDULE_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=30)
+        resp.raise_for_status()
+        outer = zipfile.ZipFile(io.BytesIO(resp.content))
+        names = outer.namelist()
+
+        found: dict[str, list[list[float]]] = {}
+        if "shapes.txt" in names:
+            found.update(stream_shapes_for_ids(outer, missing))
+        else:
+            # zip-of-zips: check each region, stop early once everything's found
+            for name in names:
+                if not missing - found.keys():
+                    break
+                if name.endswith(".zip"):
+                    inner = zipfile.ZipFile(io.BytesIO(outer.read(name)))
+                    if "shapes.txt" in inner.namelist():
+                        found.update(stream_shapes_for_ids(inner, missing - found.keys()))
+
+        for sid, pts in found.items():
+            _shape_cache_put(sid, pts)
+            result[sid] = pts
+    except Exception:
+        pass  # shapes are a visual nicety, not core to the delay board — fail quietly
+
+    return result
 
 
 def fetch_feed() -> gtfs_realtime_pb2.FeedMessage:
@@ -276,15 +473,18 @@ def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict[str
 
 
 def merge_vehicle_delays(vehicles: list[dict], delay_by_trip: dict[str, dict]) -> None:
-    """Attach delay info to each vehicle dict in place, joined by trip_id."""
+    """Attach delay info to each vehicle dict in place, joined by trip_id.
+    Fill colour is always COLOR_FILL now — only outline_color varies with
+    status — see module docstring on the colour scheme change."""
     for veh in vehicles:
+        veh["fill_color"] = COLOR_FILL
         d = delay_by_trip.get(veh["trip_id"])
         if d is None:
             veh["delay_sec"] = None
             veh["delay_min"] = None
             veh["anomaly"] = False
             veh["on_time"] = None
-            veh["color"] = COLOR_NO_DATA
+            veh["outline_color"] = OUTLINE_NO_DATA
             continue
         veh["delay_sec"] = d["delay"]
         veh["delay_min"] = round(d["delay"] / 60, 1)
@@ -292,13 +492,13 @@ def merge_vehicle_delays(vehicles: list[dict], delay_by_trip: dict[str, dict]) -
         on_time = ON_TIME_EARLY_SEC <= d["delay"] <= ON_TIME_LATE_SEC
         veh["on_time"] = on_time
         if d["anomaly"]:
-            veh["color"] = COLOR_NO_DATA
+            veh["outline_color"] = OUTLINE_NO_DATA
         elif on_time:
-            veh["color"] = COLOR_ON_TIME
+            veh["outline_color"] = OUTLINE_ON_TIME
         elif d["delay"] > 0:
-            veh["color"] = COLOR_LATE
+            veh["outline_color"] = OUTLINE_LATE
         else:
-            veh["color"] = COLOR_EARLY
+            veh["outline_color"] = OUTLINE_EARLY
 
 
 def append_to_log(rows: list[dict]) -> None:
@@ -347,7 +547,8 @@ def split_route(route_id: str, agency_names: dict[str, str]) -> tuple[str, str]:
 # live while bursts of concurrent requests (multiple tabs, page load +
 # poll landing close together) reuse one fetch instead of triggering their own.
 CACHE_TTL_SECONDS = 12
-_rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None, "agency_error": None, "fetched_at": None}
+_rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None, "trip_shapes": None,
+               "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
 
 
@@ -358,16 +559,17 @@ def get_all_rows_cached():
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _rows_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
-        return _rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"], _rows_cache["agency_error"]
+        return (_rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"],
+                _rows_cache["trip_shapes"], _rows_cache["agency_error"])
 
-    agency_names, trip_headsigns, agency_error = load_schedule_lookups()
+    agency_names, trip_headsigns, trip_shapes, agency_error = load_schedule_lookups()
     feed = fetch_feed()
     all_rows = extract_rows(feed, agency_names)
     append_to_log(all_rows)  # only on an actual fetch, not every poll
 
     _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
-                        agency_error=agency_error, fetched_at=now)
-    return all_rows, agency_names, trip_headsigns, agency_error
+                        trip_shapes=trip_shapes, agency_error=agency_error, fetched_at=now)
+    return all_rows, agency_names, trip_headsigns, trip_shapes, agency_error
 
 
 def get_vehicles_cached(agency_names, trip_headsigns):
@@ -397,7 +599,7 @@ def compute_delay_data(args):
     q_operator = args.get("operator", "").strip().lower()
     apply_bounds = args.get("bounds", "1") == "1"
 
-    all_rows, agency_names, trip_headsigns, agency_error = get_all_rows_cached()
+    all_rows, agency_names, trip_headsigns, trip_shapes, agency_error = get_all_rows_cached()
 
     rows = [r for r in all_rows if not (hide_anomalies and r["anomaly"])]
 
@@ -429,6 +631,7 @@ def compute_delay_data(args):
         "q_operator": q_operator,
         "agency_names": agency_names,
         "trip_headsigns": trip_headsigns,
+        "trip_shapes": trip_shapes,
         "agency_error": agency_error,
         "all_rows": all_rows,
         "latest_by_trip": latest_by_trip,
@@ -483,6 +686,7 @@ PAGE = """
     --line: #cccccc;
     --late: #b3261e;
     --early: #1e6b3c;
+    --fill-blue: {{ color_fill }};
     --sans: Helvetica, Arial, sans-serif;
   }
   * { box-sizing: border-box; }
@@ -526,18 +730,22 @@ PAGE = """
   .flag { color: var(--muted); font-size: 0.75rem; }
   .toggle { color: var(--text); text-decoration: underline; font-size: 0.85rem; }
 
-  #dashmap { height: 440px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
+  #dashmap { height: 600px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
   .map-legend {
     display: flex; gap: 16px; align-items: center;
     font-size: 0.8rem; color: var(--muted); margin-top: 8px; flex-wrap: wrap;
   }
   .map-legend .swatch {
-    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
     margin-right: 4px; vertical-align: middle;
+    background: var(--fill-blue);
+    border: 2px solid #999; /* overridden inline per-swatch to show its ring colour */
   }
   .map-error { color: var(--late); font-size: 0.85rem; margin-top: 8px; }
 
-  /* Bus marker: flat pill, arrow sits inline next to the route number */
+  /* Bus marker: flat pill, arrow sits inline next to the route number.
+     Fill is always the brand blue; the ring (border-color) carries delay
+     status — see COLOUR SCHEME note in app.py. */
   .bus-marker { position: relative; width: 56px; height: 24px; }
   .bus-pill {
     position: absolute;
@@ -546,11 +754,12 @@ PAGE = """
     display: flex;
     align-items: center;
     gap: 4px;
+    background: var(--fill-blue);
     color: #fff;
     font: 600 11px/1 -apple-system, Helvetica, Arial, sans-serif;
     padding: 5px 7px;
     border-radius: 7px;
-    border: 2px solid #fff;
+    border: 2.5px solid #888; /* replaced inline with the status outline colour */
     box-shadow: 0 1px 3px rgba(0,0,0,0.4);
     white-space: nowrap;
   }
@@ -563,7 +772,10 @@ PAGE = """
   }
   .leaflet-popup-content { font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
 
-  /* Frosted-glass hover tooltip, shown on marker hover (Leaflet's bindTooltip) */
+  /* Frosted-glass chrome, shared by the hover tooltip and the click popup.
+     Leaflet's `className` option puts this class on .leaflet-tooltip for
+     tooltips but on the outer .leaflet-popup for popups, so both selector
+     forms below are needed. */
   .glass-tooltip {
     background: rgba(255, 255, 255, 0.55) !important;
     -webkit-backdrop-filter: blur(14px) saturate(180%);
@@ -576,6 +788,20 @@ PAGE = """
     padding: 7px 11px;
   }
   .glass-tooltip::before { display: none; } /* hide Leaflet's default solid-colour pointer arrow */
+
+  .leaflet-popup.glass-popup .leaflet-popup-content-wrapper {
+    background: rgba(255, 255, 255, 0.55);
+    -webkit-backdrop-filter: blur(14px) saturate(180%);
+    backdrop-filter: blur(14px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.18);
+    color: #111;
+  }
+  .leaflet-popup.glass-popup .leaflet-popup-tip {
+    background: rgba(255, 255, 255, 0.55);
+    box-shadow: none;
+  }
 </style>
 </head>
 <body>
@@ -604,10 +830,10 @@ PAGE = """
   <h2>Live map</h2>
   <div id="dashmap"></div>
   <div class="map-legend">
-    <span><span class="swatch" style="background:{{ color_on_time }}"></span>On time</span>
-    <span><span class="swatch" style="background:{{ color_late }}"></span>Late</span>
-    <span><span class="swatch" style="background:{{ color_early }}"></span>Early</span>
-    <span><span class="swatch" style="background:{{ color_no_data }}"></span>No delay data / anomalous</span>
+    <span><span class="swatch" style="border-color:{{ outline_on_time }}"></span>On time</span>
+    <span><span class="swatch" style="border-color:{{ outline_late }}"></span>Late</span>
+    <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
+    <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
     <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
@@ -663,9 +889,11 @@ PAGE = """
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
-    const markers = new Map(); // trip_id/vehicle_id -> Leaflet marker
+    const markers = new Map();       // trip_id/vehicle_id -> Leaflet marker
+    const shapePolylines = new Map(); // shape_id -> Leaflet polyline
+    const SHAPE_LINE_COLOR = "{{ shape_line_color }}";
 
-    function makeIcon(routeLabel, bearing, color) {
+    function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90; // glyph points right by default; GTFS bearing is clockwise from north
       return L.divIcon({
         className: '',
@@ -674,7 +902,7 @@ PAGE = """
         popupAnchor: [0, -12],
         html: `
           <div class="bus-marker">
-            <div class="bus-pill" style="background:${color};">
+            <div class="bus-pill" style="border-color:${outlineColor};">
               <div class="bus-arrow" style="transform: rotate(${rot}deg);">&#10148;</div>
               <span>${routeLabel}</span>
             </div>
@@ -713,7 +941,7 @@ PAGE = """
         seen.add(key);
 
         const routeLabel = v.route_num || v.route_id || '?';
-        const icon = makeIcon(routeLabel, v.bearing, v.color);
+        const icon = makeIcon(routeLabel, v.bearing, v.outline_color || '#888');
         const popup = popupContent(v);
         const tooltip = tooltipContent(v);
 
@@ -726,7 +954,7 @@ PAGE = """
         } else {
           const m = L.marker([v.lat, v.lon], { icon })
             .addTo(map)
-            .bindPopup(popup)
+            .bindPopup(popup, { className: 'glass-popup' })
             .bindTooltip(tooltip, { direction: 'top', offset: [0, -20], className: 'glass-tooltip' });
           markers.set(key, m);
         }
@@ -737,6 +965,30 @@ PAGE = """
           map.removeLayer(m);
           markers.delete(key);
         }
+      }
+
+      // Route shapes: fetch only for trip_ids currently on screen, skip any
+      // shape_id we've already drawn this session (geometry doesn't change).
+      // See get_shapes_for_trip_ids in app.py for why this stays cheap.
+      const tripIds = [...new Set(vehicles.map(v => v.trip_id).filter(Boolean))];
+      const unfetchedTripIds = tripIds; // server dedupes by shape_id internally
+      if (unfetchedTripIds.length) {
+        fetch('/api/shapes?trip_ids=' + encodeURIComponent(unfetchedTripIds.join(',')))
+          .then(res => res.json())
+          .then(data => {
+            for (const [shapeId, points] of Object.entries(data.shapes || {})) {
+              if (shapePolylines.has(shapeId) || !points.length) continue;
+              const pl = L.polyline(points, {
+                color: SHAPE_LINE_COLOR,
+                weight: 3,
+                opacity: 0.35,
+                interactive: false,
+              }).addTo(map);
+              pl.bringToBack();
+              shapePolylines.set(shapeId, pl);
+            }
+          })
+          .catch(e => console.warn('Shape fetch failed', e));
       }
     }
 
@@ -811,10 +1063,12 @@ def dashboard():
         filters_active=data["filters_active"],
         apply_bounds=data["apply_bounds"],
         map_error=map_error,
-        color_on_time=COLOR_ON_TIME,
-        color_late=COLOR_LATE,
-        color_early=COLOR_EARLY,
-        color_no_data=COLOR_NO_DATA,
+        color_fill=COLOR_FILL,
+        outline_on_time=OUTLINE_ON_TIME,
+        outline_late=OUTLINE_LATE,
+        outline_early=OUTLINE_EARLY,
+        outline_no_data=OUTLINE_NO_DATA,
+        shape_line_color=SHAPE_LINE_COLOR,
     )
 
 
@@ -825,6 +1079,21 @@ def api_vehicles():
     data = compute_delay_data(request.args)
     vehicles, map_error = compute_vehicles(data)
     return jsonify({"vehicles": vehicles, "error": map_error})
+
+
+@app.route("/api/shapes")
+def api_shapes():
+    """Return simplified route-shape polylines for the given trip_ids only —
+    see get_shapes_for_trip_ids and the module docstring for why this never
+    loads shapes.txt in full. Usage: /api/shapes?trip_ids=id1,id2,id3"""
+    if not API_KEY:
+        return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
+    trip_ids = {t for t in request.args.get("trip_ids", "").split(",") if t}
+    if not trip_ids:
+        return jsonify({"shapes": {}})
+    _, _, _, trip_shapes, _ = get_all_rows_cached()
+    shapes = get_shapes_for_trip_ids(trip_ids, trip_shapes)
+    return jsonify({"shapes": shapes})
 
 
 if __name__ == "__main__":
