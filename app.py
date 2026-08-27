@@ -394,7 +394,7 @@ def get_all_rows_cached():
     agency_names, trip_headsigns, agency_error = load_schedule_lookups()
     feed = fetch_feed()
     all_rows = extract_rows(feed, agency_names)
-    append_to_log(all_rows)  # only on an actual fetch, not every poll
+    append_to_db(all_rows)  # only on an actual fetch, not every poll
 
     _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
                         agency_error=agency_error, fetched_at=now)
