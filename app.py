@@ -3,9 +3,8 @@ Web dashboard for TfNSW GTFS-realtime delay/variance data.
 
 Fetches the live trip-update feed on each page load, computes delay stats
 per operator, route and trip, and renders a sortable HTML table. Also
-appends every pull to Postgres (Supabase) so history persists across
-Render restarts/redeploys (Render's free tier disk is ephemeral, which is
-why this moved off a local CSV — see append_to_db below).
+appends every pull to delay_log.csv (same as timetable_variance.py) so you
+build up history.
 
 A live map sits at the top of the page, fed by the separate GTFS-realtime
 VEHICLE POSITION feed (hardcoded to the vehiclepos endpoint below — this is
@@ -17,16 +16,6 @@ each bus marker's colour and popup reflect its current delay. The map
 polls /api/vehicles every 15s independently of the (page-load-only) tables
 below, and respects whatever route/stop/operator/hide_anomalies filters are
 currently set.
-
-DATABASE CONNECTION (see full note above append_to_db): built from
-individual host/port/user/password/dbname parameters extracted via
-urllib.parse, rather than handing the raw DATABASE_URL string to
-psycopg2.connect() as a single DSN. This sidesteps psycopg2's own DSN-string
-parser (parse_dsn/make_dsn), which is where a UnicodeDecodeError was
-surfacing — connecting via discrete parameters avoids that code path
-entirely regardless of the string's exact byte-level history. DB writes are
-also wrapped so a connection problem degrades to "no historical logging"
-rather than 500ing the whole dashboard.
 
 LIQUID-GLASS POPUPS: purely a frontend CSS concern (backdrop-filter blur on
 the Leaflet popup/tooltip chrome) - costs nothing server-side. Applied to
@@ -43,12 +32,11 @@ lookups now only fetch what's needed for operator names and trip headsigns,
 not shape_id/shapes.txt.
 
 Setup:
-    pip install flask gunicorn requests python-dotenv gtfs-realtime-bindings tzdata psycopg2-binary
+    pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
 
 .env file:
     TFNSW_API_KEY=your_api_key_here
     TFNSW_GTFS_RT_URL=https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses
-    DATABASE_URL=postgresql://user:password@host:5432/dbname
 
 Usage:
     python app.py
@@ -64,27 +52,24 @@ import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse, unquote
 from zoneinfo import ZoneInfo
 
-import psycopg2
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string, request
 from google.transit import gtfs_realtime_pb2
-from psycopg2.extras import execute_values
-
-load_dotenv()
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = DATA_DIR / "delay_log.csv"
 AGENCY_CACHE_FILE = DATA_DIR / "agency_names.json"
 AGENCY_CACHE_MAX_AGE = timedelta(hours=24)
 ANOMALY_ABS_SEC = 3600  # readings beyond this magnitude are flagged as likely stale/broken
 ON_TIME_EARLY_SEC = -60   # 1 min early
 ON_TIME_LATE_SEC = 300    # 5 min late — standard industry on-time window
 
+load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
@@ -94,90 +79,11 @@ SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.g
 # product on the TfNSW developer portal with their own subscription.
 VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 
-
-# --- Database connection ---------------------------------------------------
-#
-# psycopg2.connect() accepts either a single DSN string (which it parses
-# internally via parse_dsn/make_dsn) OR discrete keyword parameters
-# (host=, port=, dbname=, user=, password=). We deliberately use the
-# latter here, built by hand from urlparse() rather than handed to
-# psycopg2's own parser, because a raw-DSN UnicodeDecodeError was
-# surfacing inside parse_dsn on this deployment. Going through
-# urllib.parse first and passing clean, individually-decoded components
-# avoids that code path entirely, whatever its exact original cause was.
-#
-# DB writes (append_to_db) are best-effort: any failure here is caught
-# and logged, never re-raised, so a database problem degrades to "no
-# historical logging" rather than 500ing the live dashboard. The dashboard
-# and /api/vehicles must keep working even with DATABASE_URL missing,
-# misconfigured, or the database temporarily unreachable.
-
-RAW_DATABASE_URL = os.getenv("DATABASE_URL")
-DB_PARAMS: dict | None = None
-
-if RAW_DATABASE_URL:
-    try:
-        parsed = urlparse(RAW_DATABASE_URL)
-        if parsed.scheme not in ("postgres", "postgresql"):
-            raise ValueError(f"unexpected scheme '{parsed.scheme}' (expected postgres/postgresql)")
-        if not parsed.hostname:
-            raise ValueError("no hostname found in DATABASE_URL")
-        DB_PARAMS = {
-            "host": parsed.hostname,
-            "port": parsed.port or 5432,
-            "dbname": (parsed.path or "/postgres").lstrip("/") or "postgres",
-            "user": unquote(parsed.username) if parsed.username else None,
-            "password": unquote(parsed.password) if parsed.password else None,
-            "sslmode": "require",
-        }
-        # Sanity check every component decodes as clean text — if a stray
-        # byte survived urlparse (it shouldn't, since RAW_DATABASE_URL is
-        # already a Python str, but this makes the failure mode explicit
-        # and diagnosable instead of a bare traceback from deep in psycopg2).
-        for k, v in DB_PARAMS.items():
-            if isinstance(v, str):
-                v.encode("utf-8").decode("utf-8")
-    except Exception as e:
-        print(
-            f"[startup] DATABASE_URL is set but could not be parsed cleanly "
-            f"({type(e).__name__}: {e}). Historical DB logging is disabled; "
-            f"the live dashboard will still work normally. "
-            f"Double-check the connection string in Render's env var against "
-            f"Supabase's Project Settings -> Database -> Connection string "
-            f"(session/transaction pooler URI)."
-        )
-        DB_PARAMS = None
-
-
-def get_db_conn():
-    return psycopg2.connect(**DB_PARAMS)
-
-
-def append_to_db(rows: list[dict]) -> None:
-    """Best-effort write to raw_delay_readings. See module-level note above
-    on why this must never raise into the caller."""
-    if not rows or not DB_PARAMS:
-        return
-    try:
-        with get_db_conn() as conn:
-            with conn.cursor() as cur:
-                execute_values(
-                    cur,
-                    """INSERT INTO raw_delay_readings
-                       (pulled_at, operator, route_id, trip_id, stop_id, stop_sequence, delay, anomaly)
-                       VALUES %s""",
-                    [(r["pulled_at"], r["operator"], r["route_id"], r["trip_id"],
-                      r["stop_id"], r["stop_sequence"], r["delay"], r["anomaly"]) for r in rows]
-                )
-    except Exception as e:
-        print(f"[append_to_db] write failed, continuing without it: {type(e).__name__}: {e}")
-
-
 # --- Colour scheme: single blue fill, delay status carried by outline ---
 COLOR_FILL = "#00B3F0"          # every marker's pill background, regardless of status
 OUTLINE_ON_TIME = "#ffffff"
-OUTLINE_LATE = "#D21F15"
-OUTLINE_EARLY = "#0E7E39"
+OUTLINE_LATE = "#B3261E"
+OUTLINE_EARLY = "#1E6B3C"
 OUTLINE_NO_DATA = "#888888"
 
 # Default radius filter for the map/API — the vehiclepos/buses feed is
@@ -412,6 +318,15 @@ def merge_vehicle_delays(vehicles: list[dict], delay_by_trip: dict[str, dict]) -
             veh["outline_color"] = OUTLINE_EARLY
 
 
+def append_to_log(rows: list[dict]) -> None:
+    file_exists = LOG_FILE.exists()
+    with LOG_FILE.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["pulled_at", "operator", "route_id", "trip_id", "stop_id", "stop_sequence", "delay", "anomaly"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 def summarise(rows: list[dict], key: str) -> list[dict]:
     grouped = defaultdict(list)
     for r in rows:
@@ -443,11 +358,11 @@ def split_route(route_id: str, agency_names: dict[str, str]) -> tuple[str, str]:
 # Short-TTL in-memory caches, shared between the dashboard page load and the
 # /api/vehicles poll. Without this, every 15s poll (from every open tab) was
 # independently re-fetching BOTH TfNSW feeds and re-appending the full
-# trip-update pull to the DB — growing it unbounded on every poll (not just
-# page loads) was a driver of slowdown before this cache existed. TTL is
-# kept just under the client's 15s poll interval so data still feels live
-# while bursts of concurrent requests (multiple tabs, page load + poll
-# landing close together) reuse one fetch instead of triggering their own.
+# trip-update pull to delay_log.csv — the log growing unbounded on every
+# poll (not just page loads) was the main driver of the slowdown/timeouts.
+# TTL is kept just under the client's 15s poll interval so data still feels
+# live while bursts of concurrent requests (multiple tabs, page load +
+# poll landing close together) reuse one fetch instead of triggering their own.
 CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
@@ -456,8 +371,8 @@ _vehicles_cache = {"vehicles": None, "fetched_at": None}
 
 def get_all_rows_cached():
     """Fetch+parse the trip-update feed, reusing a recent result if within
-    CACHE_TTL_SECONDS. Only writes to the DB when an actual fetch happens,
-    not on cache hits."""
+    CACHE_TTL_SECONDS. Only logs to delay_log.csv when an actual fetch
+    happens, not on cache hits."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _rows_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -467,7 +382,7 @@ def get_all_rows_cached():
     agency_names, trip_headsigns, agency_error = load_schedule_lookups()
     feed = fetch_feed()
     all_rows = extract_rows(feed, agency_names)
-    append_to_db(all_rows)  # best-effort — see module note; never raises
+    append_to_log(all_rows)  # only on an actual fetch, not every poll
 
     _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
                         agency_error=agency_error, fetched_at=now)
@@ -735,7 +650,7 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_late }}"></span>Late</span>
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
-    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show Opal area</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">Opal area, restrict to 10km of CBD</a>{% endif %}</span>
+    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
