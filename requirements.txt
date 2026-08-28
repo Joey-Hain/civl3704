@@ -5,4 +5,3 @@ python-dotenv
 gtfs-realtime-bindings
 tzdata
 psycopg2-binary
-protobuf
