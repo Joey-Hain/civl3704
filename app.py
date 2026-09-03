@@ -26,6 +26,16 @@ delay status shown via the marker's OUTLINE colour instead of swapping the
 fill. This keeps the map visually calm (one colour family) while still
 making outliers scannable by ring colour.
 
+DENSITY HEATMAP: an additional toggleable layer (via leaflet.heat) showing
+where live buses are currently clustered, built purely from the same
+vehicle-position data already being fetched for the markers — no delay
+weighting, no historical data, just point density right now. Toggle
+between "Bus markers" and "Vehicle density heatmap" via the layer control
+in the map's top-right corner (both can be shown at once). This is
+intentionally scoped to current positions only; a delay-weighted heatmap
+built from accumulated historical readings is a separate, not-yet-built
+feature.
+
 NOTE: an earlier version of this file also drew GTFS route-shape polylines
 under the bus markers. That feature has been removed (scope cut) — schedule
 lookups now only fetch what's needed for operator names and trip headsigns,
@@ -494,6 +504,7 @@ PAGE = """
 <title>TfNSW Delay Board</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <style>
   :root {
     --bg: #f7f6f2;
@@ -618,6 +629,11 @@ PAGE = """
     background: rgba(255, 255, 255, 0.55);
     box-shadow: none;
   }
+
+  /* Layer-switcher control (Bus markers / Vehicle density heatmap) */
+  .leaflet-control-layers {
+    font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important;
+  }
 </style>
 </head>
 <body>
@@ -651,6 +667,7 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
     <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
+    <span>Use the layer switcher (top-right of the map) to toggle the density heatmap.</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
@@ -707,6 +724,17 @@ PAGE = """
 
     const markers = new Map(); // trip_id/vehicle_id -> Leaflet marker
 
+    // --- Density heatmap (real-time, positions only — no delay weighting,
+    // no historical data). Two toggleable layers via the layer control:
+    // the existing bus-marker pills, and a leaflet.heat point-density layer
+    // built from the exact same vehicle positions each poll. ---
+    const markersLayer = L.layerGroup().addTo(map);
+    const heatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.35 });
+    L.control.layers(null, {
+      'Bus markers': markersLayer,
+      'Vehicle density heatmap': heatLayer
+    }, { collapsed: false }).addTo(map);
+
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90; // glyph points right by default; GTFS bearing is clockwise from north
       return L.divIcon({
@@ -749,10 +777,14 @@ PAGE = """
 
     function renderVehicles(vehicles) {
       const seen = new Set();
+      const heatPoints = [];
+
       vehicles.forEach(v => {
         if (v.lat == null || v.lon == null) return;
         const key = v.vehicle_id || v.trip_id;
         seen.add(key);
+
+        heatPoints.push([v.lat, v.lon]); // density only — no delay weighting yet
 
         const routeLabel = v.route_num || v.route_id || '?';
         const icon = makeIcon(routeLabel, v.bearing, v.outline_color || '#888');
@@ -767,7 +799,7 @@ PAGE = """
           m.getTooltip().setContent(tooltip);
         } else {
           const m = L.marker([v.lat, v.lon], { icon })
-            .addTo(map)
+            .addTo(markersLayer)
             .bindPopup(popup, { className: 'glass-popup' })
             .bindTooltip(tooltip, { direction: 'top', offset: [0, -20], className: 'glass-tooltip' });
           markers.set(key, m);
@@ -776,10 +808,12 @@ PAGE = """
 
       for (const [key, m] of markers) {
         if (!seen.has(key)) {
-          map.removeLayer(m);
+          markersLayer.removeLayer(m);
           markers.delete(key);
         }
       }
+
+      heatLayer.setLatLngs(heatPoints);
     }
 
     async function pollVehicles() {
