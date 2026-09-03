@@ -1,5 +1,7 @@
+# Opal Delay Transport Informatics Project
+This project was created for CIVL3704 
+
 Web architecture:
-We push commits to this github repo.
 A render.com instance is linked to this repo and periodically updates (but if you push something and want it checked urgently tell me and I'll manually redeploy it). Procfile and requirements.txt are setup functions for render.com so don't touch these please!
 The URL (civl3704.joeyhain.org) points to the default URL (civl3704.onrender.com). Don't worry about that stuff.
 The render.com instance has a .env that defines TFNSW_API_KEY and TFNSW_GTFS_RT_URL.
