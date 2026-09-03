@@ -58,6 +58,7 @@ import io
 import json
 import os
 import statistics
+import threading
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -116,6 +117,20 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 app = Flask(__name__)
+
+
+def _prewarm_schedule_cache():
+    """Pre-fetch and cache the GTFS schedule bundle in the background at
+    startup, so the first real browser request doesn't block on a 30s+
+    download. Runs in a daemon thread — if it fails, the first request
+    will try again inline as before, just with a cold cache."""
+    try:
+        load_schedule_lookups()
+    except Exception:
+        pass  # non-fatal — first real request will retry inline
+
+
+threading.Thread(target=_prewarm_schedule_cache, daemon=True).start()
 
 
 def load_schedule_lookups() -> tuple[dict[str, str], dict[str, str], str | None]:
