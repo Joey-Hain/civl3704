@@ -106,16 +106,6 @@ OUTLINE_NO_DATA = "#888888"
 SYDNEY_CBD = (-33.8688, 151.2093)  # lat, lon
 SYDNEY_RADIUS_KM = 10
 
-GITHUB_OWNER = "Joey-Hain"
-GITHUB_REPO = "gtfs-r-scrape"
-GITHUB_DATA_PATH = "data"
-
-_historical_heat_cache = {
-    "points": None,
-    "fetched_at": None,
-}
-
-HISTORICAL_HEAT_TTL_SECONDS = 300
 
 def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
@@ -438,67 +428,6 @@ def get_vehicles_cached(agency_names, trip_headsigns):
     _vehicles_cache.update(vehicles=vehicles, fetched_at=now)
     return [dict(v) for v in vehicles]
 
-def load_historical_heat_points():
-    now = datetime.now(tz=SYDNEY_TZ)
-
-    cached_at = _historical_heat_cache["fetched_at"]
-
-    if (
-        cached_at is not None
-        and (now - cached_at).total_seconds() < HISTORICAL_HEAT_TTL_SECONDS
-    ):
-        return _historical_heat_cache["points"]
-
-    points = []
-
-    try:
-        listing_url = (
-            f"https://api.github.com/repos/"
-            f"{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_DATA_PATH}"
-        )
-
-        listing_resp = requests.get(listing_url, timeout=30)
-        listing_resp.raise_for_status()
-
-        files = listing_resp.json()
-
-        for file_info in files:
-
-            if not file_info["name"].endswith(".csv"):
-                continue
-
-            download_url = file_info["download_url"]
-
-            csv_resp = requests.get(download_url, timeout=60)
-            csv_resp.raise_for_status()
-
-            reader = csv.DictReader(io.StringIO(csv_resp.text))
-
-            for row in reader:
-
-                lat = row.get("lat")
-                lon = row.get("lon")
-
-                if not lat or not lon:
-                    continue
-
-                try:
-                    points.append([
-                        float(lat),
-                        float(lon)
-                    ])
-                except ValueError:
-                    pass
-
-    except Exception as e:
-        print(f"Historical heatmap load failed: {e}")
-
-    _historical_heat_cache.update(
-        points=points,
-        fetched_at=now,
-    )
-
-    return points
 
 def compute_delay_data(args):
     """Shared by the dashboard page and /api/vehicles: fetches the trip-update
@@ -863,13 +792,14 @@ PAGE = """
 
     function renderVehicles(vehicles) {
       const seen = new Set();
-      
+      const heatPoints = [];
 
       vehicles.forEach(v => {
         if (v.lat == null || v.lon == null) return;
         const key = v.vehicle_id || v.trip_id;
         seen.add(key);
 
+        heatPoints.push([v.lat, v.lon]); // density only — no delay weighting yet
 
         const routeLabel = v.route_num || v.route_id || '?';
         const icon = makeIcon(routeLabel, v.bearing, v.outline_color || '#888');
@@ -898,22 +828,8 @@ PAGE = """
         }
       }
 
+      heatLayer.setLatLngs(heatPoints);
     }
-
-    async function loadHeatmap() {
-        try {
-
-            const res = await fetch('/api/heatmap' + window.location.search);
-            const data = await res.json();
-
-            heatLayer.setLatLngs(data.heat || []);
-
-            } catch (e) {
-
-             console.warn('Heatmap load failed', e);
-
-  }
-}
 
     async function pollVehicles() {
       try {
@@ -929,11 +845,7 @@ PAGE = """
     // then polls independently every 15s so the map stays live without
     // reloading the tables below.
     renderVehicles({{ vehicles_json|safe }});
-
-    loadHeatmap();
-
     setInterval(pollVehicles, 15000);
-    setInterval(loadHeatmap, 300000);
   </script>
 </body>
 </html>
@@ -1006,39 +918,6 @@ def api_vehicles():
     vehicles, map_error = compute_vehicles(data)
     return jsonify({"vehicles": vehicles, "error": map_error})
 
-
-
-
-@app.route("/api/heatmap")
-def api_heatmap():
-
-    try:
-        data = compute_delay_data(request.args)
-
-        vehicles, _ = compute_vehicles(data)
-
-        heat_points = []
-
-        # Live GTFS-R vehicle positions
-        for v in vehicles:
-            if v["lat"] is not None and v["lon"] is not None:
-                heat_points.append([
-                    v["lat"],
-                    v["lon"]
-                ])
-
-        # Historical scrape positions
-        heat_points.extend(load_historical_heat_points())
-
-        return jsonify({
-            "heat": heat_points
-        })
-
-    except Exception as e:
-        return jsonify({
-            "heat": [],
-            "error": str(e)
-        }), 500
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
