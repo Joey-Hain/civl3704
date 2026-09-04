@@ -743,7 +743,7 @@ PAGE = """
     // the existing bus-marker pills, and a leaflet.heat point-density layer
     // built from the exact same vehicle positions each poll. ---
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.35, gradient: {
+    const heatLayer = L.heatLayer([], { radius: 28, blur: 22, maxZoom: 16, minOpacity: 0.35, gradient: {
                                                                                                             0.10: '#ff9f43',
                                                                                                             0.30: '#ff7b25',
                                                                                                             0.50: '#ff5e00',
