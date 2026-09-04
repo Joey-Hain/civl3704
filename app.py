@@ -744,13 +744,14 @@ PAGE = """
     // built from the exact same vehicle positions each poll. ---
     const markersLayer = L.layerGroup().addTo(map);
     const heatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.35, gradient: {
-                                                                                                            0.00: '#ff9999',
-                                                                                                            0.20: '#ff6666',
-                                                                                                            0.40: '#ff3333',
-                                                                                                            0.60: '#dd0000',
-                                                                                                            0.80: '#990000',
-                                                                                                            1.00: '#330000'
-                                                                                                            }});
+                                                                                                            0.10: '#ff9f43',
+                                                                                                            0.30: '#ff7b25',
+                                                                                                            0.50: '#ff5e00',
+                                                                                                            0.70: '#ffcc33',
+                                                                                                            0.90: '#fff176',
+                                                                                                            1.00: '#ffffff'
+                                                                                                            }
+});
     L.control.layers(null, {
       'Bus markers': markersLayer,
       'Vehicle density heatmap': heatLayer
