@@ -113,9 +113,7 @@ import csv
 import io
 import json
 import os
-import re
 import shutil
-from html import escape as html_escape
 import statistics
 import tempfile
 import threading
@@ -172,11 +170,21 @@ SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
 HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
 
-# /project page: displays TransportLab's smart-city model config, fetched
-# live from GitHub each time the cache goes stale rather than vendored,
-# so it always reflects whatever's currently on that repo's main branch.
-SMART_CITY_PARAMS_URL = "https://raw.githubusercontent.com/TransportLab/smart-city/main/params.json5"
-SMART_CITY_CACHE_TTL_SECONDS = 300
+# /project page: a Leaflet view locked to the exact real-world box
+# TransportLab's smart-city rig projects onto its physical table model, so
+# it can be checked against the physical model for alignment. Hardcoded
+# from that project's params.json5 (model.corners.ne / model.corners.sw:
+# https://github.com/TransportLab/smart-city/blob/main/params.json5) rather
+# than fetched live — Donald only needs these two corners, not the rest of
+# that repo's config, and it's one number pair that only changes if the
+# physical model itself is rebuilt.
+SMART_CITY_CORNER_NE = (-33.83512300658737, 151.27599316594075)
+SMART_CITY_CORNER_SW = (-33.894722633376766, 151.13296645445593)
+# model.width / model.height (mm) from the same params.json5 — used only to
+# give the locked map the physical table's aspect ratio (2:1) so it keeps
+# the same proportions as what actually gets projected onto it.
+SMART_CITY_MODEL_WIDTH_MM = 2400
+SMART_CITY_MODEL_HEIGHT_MM = 1200
 
 COLOR_FILL = "#00B3F0"
 OUTLINE_ON_TIME = "#ffffff"
@@ -546,171 +554,6 @@ _heatmap_cells_cache = {}
 _rows_lock = threading.Lock()
 _vehicles_lock = threading.Lock()
 _heatmap_lock = threading.Lock()
-_smart_city_cache = {"params": None, "error": None, "fetched_at": None}
-_smart_city_lock = threading.Lock()
-
-
-def _json5_lite_to_json(text):
-    """Minimal JSON5 -> JSON rewriter: strips // and /* */ comments, turns
-    single-quoted strings into double-quoted, quotes bare object keys, and
-    drops trailing commas. Not a full JSON5 parser (no hex numbers, no
-    unquoted-string edge cases) but covers everything params.json5 actually
-    uses. Comment-stripping and quote-conversion are both string-aware so a
-    "//" inside a URL value (e.g. 'https://...') is never mistaken for a
-    line comment.
-    """
-
-    def strip_comments(s):
-        out, i, n, in_str = [], 0, len(s), None
-        while i < n:
-            c = s[i]
-            if in_str:
-                out.append(c)
-                if c == "\\" and i + 1 < n:
-                    out.append(s[i + 1]); i += 2; continue
-                if c == in_str:
-                    in_str = None
-                i += 1; continue
-            if c in ("\"", "'"):
-                in_str = c; out.append(c); i += 1; continue
-            if c == "/" and i + 1 < n and s[i + 1] == "/":
-                j = s.find("\n", i); i = n if j == -1 else j; continue
-            if c == "/" and i + 1 < n and s[i + 1] == "*":
-                j = s.find("*/", i + 2); i = n if j == -1 else j + 2; continue
-            out.append(c); i += 1
-        return "".join(out)
-
-    def singlequote_to_double(s):
-        out, i, n, in_str = [], 0, len(s), None
-        while i < n:
-            c = s[i]
-            if in_str:
-                if c == "\\" and i + 1 < n:
-                    out.append(c); out.append(s[i + 1]); i += 2; continue
-                if c == in_str:
-                    out.append('"'); in_str = None; i += 1; continue
-                if in_str == "'" and c == '"':
-                    out.append('\\"'); i += 1; continue
-                out.append(c); i += 1; continue
-            if c in ("\"", "'"):
-                in_str = c; out.append('"'); i += 1; continue
-            out.append(c); i += 1
-        return "".join(out)
-
-    t = strip_comments(text)
-    t = singlequote_to_double(t)
-    t = re.sub(r'([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)\s*:', r'\1"\2":', t)
-    t = re.sub(r',(\s*[}\]])', r'\1', t)
-    return t
-
-
-def get_smart_city_params_cached():
-    now = datetime.now(tz=SYDNEY_TZ)
-    fetched_at = _smart_city_cache["fetched_at"]
-    if fetched_at is not None and (now - fetched_at).total_seconds() < SMART_CITY_CACHE_TTL_SECONDS:
-        return _smart_city_cache["params"], _smart_city_cache["error"]
-
-    with _smart_city_lock:
-        now = datetime.now(tz=SYDNEY_TZ)
-        fetched_at = _smart_city_cache["fetched_at"]
-        if fetched_at is not None and (now - fetched_at).total_seconds() < SMART_CITY_CACHE_TTL_SECONDS:
-            return _smart_city_cache["params"], _smart_city_cache["error"]
-
-        params, error = None, None
-        try:
-            resp = requests.get(SMART_CITY_PARAMS_URL, timeout=15)
-            resp.raise_for_status()
-            params = json.loads(_json5_lite_to_json(resp.text))
-        except requests.RequestException as e:
-            error = f"Could not fetch params.json5: {e}"
-        except (ValueError, json.JSONDecodeError) as e:
-            error = f"Could not parse params.json5: {e}"
-
-        if params is not None or _smart_city_cache["params"] is None:
-            _smart_city_cache.update(params=params, error=error, fetched_at=now)
-        else:
-            # Fetch failed but we have a previously-good copy — keep serving
-            # it (with the new error noted) rather than blanking the page.
-            _smart_city_cache.update(error=error, fetched_at=now)
-        return _smart_city_cache["params"], _smart_city_cache["error"]
-
-
-PROJECT_SECTION_INFO = {
-    "model": ("Model", "Physical dimensions of the projected table model and the real-world lat/lng corners it maps onto."),
-    "projector": ("Projector", "Projector resolution, aspect ratio and calibration offsets for the overhead projection."),
-    "map": ("Map", "Leaflet map view settings — currently left for the app to calculate from the model properties."),
-    "threejs": ("three.js", "Camera placement for the three.js layer drawn over the map."),
-    "server": ("Server", "The smart-city app's own backend server settings."),
-    "logo": ("Logo", "University logo overlay shown on the model."),
-    "gtfs": ("GTFS (buses, light rail, ferries)", "TfNSW GTFS-realtime v1 feed — buses, light rail and ferries."),
-    "gtfs2": ("GTFS (metro, trains)", "TfNSW GTFS-realtime v2 feed — Sydney Metro and Sydney Trains."),
-    "ais": ("AIS (shipping)", "Live vessel tracking via the aisstream.io AIS feed."),
-    "flights": ("Flights", "Live aircraft tracking via the OpenSky Network API."),
-    "radar": ("Weather radar", "Bureau of Meteorology rain radar overlay."),
-    "hazards": ("Traffic hazards", "TfNSW live hazards feed (roadworks, incidents, closures)."),
-}
-PROJECT_KEY_LABELS = {
-    "ne": "Northeast corner", "sw": "Southwest corner", "lat": "Latitude", "lng": "Longitude",
-    "url": "URL", "id": "ID", "ID": "ID", "loc": "Location", "modes": "Modes",
-    "show": "Enabled", "opacity": "Opacity", "resolution": "Resolution",
-    "aspect_ratio": "Aspect ratio", "vertical_offset": "Vertical offset", "horizontal_scale": "Horizontal scale",
-    "update_interval": "Update interval", "throw_distance": "Throw distance", "pixel_size": "Pixel size",
-    "camera_location": "Camera location", "camera_rotation": "Camera rotation", "bounds": "Bounds",
-}
-
-
-def _project_label(key):
-    return PROJECT_KEY_LABELS.get(key, key.replace("_", " ").replace("-", " ").strip().title())
-
-
-def _project_format_scalar(key, value):
-    if isinstance(value, bool):
-        return '<span class="proj-yes">Yes</span>' if value else '<span class="proj-no">No</span>'
-    if isinstance(value, float):
-        s = f"{value:.6f}".rstrip("0").rstrip(".")
-        text = s if s not in ("", "-") else "0"
-    else:
-        text = str(value)
-    if key in ("update_interval",) and isinstance(value, (int, float)):
-        return html_escape(f"{text} ms ({value / 1000:g}s)")
-    if isinstance(value, str) and re.match(r"^(https?|wss?|ftp)://", value):
-        safe = html_escape(value)
-        return f'<a href="{safe}" target="_blank" rel="noopener noreferrer">{safe}</a>'
-    return html_escape(text)
-
-
-def render_project_node(value, depth=0):
-    if isinstance(value, dict):
-        if not value:
-            return '<span class="proj-muted">(none)</span>'
-        rows = "".join(
-            f"<tr><th>{html_escape(_project_label(k))}</th><td>{render_project_node(v, depth + 1)}</td></tr>"
-            for k, v in value.items()
-        )
-        return f'<table class="proj-subtable">{rows}</table>'
-    if isinstance(value, list):
-        if not value:
-            return '<span class="proj-muted">(none)</span>'
-        if all(isinstance(x, (int, float, str, bool)) for x in value):
-            return ", ".join(_project_format_scalar(None, x) for x in value)
-        return "".join(f'<div class="proj-list-item">{render_project_node(x, depth + 1)}</div>' for x in value)
-    return _project_format_scalar(None, value)
-
-
-def render_project_sections(params):
-    order = list(PROJECT_SECTION_INFO.keys())
-    keys = order + [k for k in params if k not in order]
-    cards = []
-    for key in keys:
-        if key not in params:
-            continue
-        title, desc = PROJECT_SECTION_INFO.get(key, (_project_label(key), ""))
-        body = render_project_node(params[key], depth=0)
-        desc_html = f'<div class="proj-card-desc">{html_escape(desc)}</div>' if desc else ""
-        cards.append(
-            f'<div class="proj-card"><h2>{html_escape(title)}</h2>{desc_html}{body}</div>'
-        )
-    return "".join(cards)
 
 
 def get_all_rows_cached():
@@ -1510,45 +1353,65 @@ PROJECT_PAGE = """
 <head>
 <meta charset="utf-8">
 <meta name="robots" content="noindex, nofollow">
-<title>smart-city project &mdash; params.json5</title>
+<title>smart-city project &mdash; locked map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  :root { --bg:#f7f6f2; --text:#111; --muted:#666; --line:#ccc; --late:#b3261e; --early:#1e6b3c; --sans: Helvetica, Arial, sans-serif; }
+  :root { --bg:#f7f6f2; --text:#111; --muted:#666; --line:#ccc; --sans: Helvetica, Arial, sans-serif; }
   * { box-sizing: border-box; }
-  body { background:var(--bg); color:var(--text); font-family:var(--sans); margin:0; padding:24px 32px 60px; }
-  h1 { font-size:1.4rem; font-weight:bold; border-bottom:2px solid var(--text); padding-bottom:10px; margin-bottom:4px; }
-  .meta { color:var(--muted); font-size:0.85rem; margin-bottom:24px; }
-  .meta a, .toggle { color:var(--text); }
-  .proj-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(340px, 1fr)); gap:18px; }
-  .proj-card { border:1px solid var(--line); background:#fff; padding:14px 16px 16px; }
-  .proj-card h2 { font-size:0.95rem; font-weight:bold; margin:0 0 4px; }
-  .proj-card-desc { color:var(--muted); font-size:0.78rem; margin-bottom:10px; line-height:1.35; }
-  .proj-subtable { width:100%; border-collapse:collapse; font-size:0.85rem; }
-  .proj-subtable th, .proj-subtable td { text-align:left; padding:3px 8px 3px 0; vertical-align:top; }
-  .proj-subtable th { color:var(--muted); font-weight:normal; white-space:nowrap; width:1%; }
-  .proj-subtable .proj-subtable { margin:2px 0; }
-  .proj-list-item { border-top:1px solid var(--line); padding-top:4px; margin-top:4px; }
-  .proj-list-item:first-child { border-top:none; margin-top:0; padding-top:0; }
-  .proj-yes { color:var(--early); }
-  .proj-no { color:var(--muted); }
-  .proj-muted { color:var(--muted); }
-  .proj-error { color:var(--late); border:1px solid var(--late); padding:10px 14px; margin-bottom:20px; font-size:0.85rem; }
-  a { color:inherit; }
+  html, body { height:100%; }
+  body { background:var(--bg); color:var(--text); font-family:var(--sans); margin:0; padding:16px; display:flex; flex-direction:column; }
+  h1 { font-size:1.1rem; font-weight:bold; margin:0 0 4px; }
+  .meta { color:var(--muted); font-size:0.8rem; margin-bottom:12px; }
+  .meta a { color:var(--text); }
+  /* Locked to the smart-city model's physical aspect ratio (width:height,
+     see MODEL_WIDTH_MM/MODEL_HEIGHT_MM below) so the projected view keeps
+     the same proportions as the physical table it's projected onto,
+     regardless of browser window shape. */
+  #projectMapWrap { position:relative; width:100%; max-width:calc((100vh - 140px) * {{ model_aspect }}); aspect-ratio:{{ model_aspect }}; margin:0 auto; border:1px solid var(--line); background:#e5e3dc; flex:0 1 auto; }
+  #projectMap { position:absolute; inset:0; }
+  .corner-readout { position:absolute; z-index:1000; background:rgba(17,17,17,0.78); color:#fff; font:600 11px/1.5 -apple-system, Helvetica, Arial, sans-serif; padding:6px 10px; border-radius:4px; pointer-events:none; }
+  .corner-readout.ne { top:8px; right:8px; text-align:right; }
+  .corner-readout.sw { bottom:8px; left:8px; }
 </style>
 </head>
 <body>
-  <h1>smart-city project <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/">&larr; Delay Board</a></h1>
+  <h1>smart-city project <a style="float:right; font-size:0.8rem; font-weight:normal;" href="/">&larr; Delay Board</a></h1>
   <div class="meta">
-    Live config from <a href="https://github.com/TransportLab/smart-city/blob/main/params.json5" target="_blank" rel="noopener noreferrer">TransportLab/smart-city&nbsp;&middot;&nbsp;params.json5</a>
-    &middot; fetched {{ fetched_at }}{% if stale %} (showing last good copy){% endif %}
+    Map locked to the real-world box TransportLab's smart-city rig projects onto its physical table model &middot;
+    corners hardcoded from <a href="https://github.com/TransportLab/smart-city/blob/main/params.json5" target="_blank" rel="noopener noreferrer">params.json5</a>'s <code>model.corners</code> &middot;
+    update the two constants in <code>app.py</code> if the physical model is ever rebuilt.
   </div>
-  {% if error %}<div class="proj-error">{{ error }}</div>{% endif %}
-  {% if sections_html %}
-  <div class="proj-grid">
-    {{ sections_html|safe }}
+  <div id="projectMapWrap">
+    <div id="projectMap"></div>
+    <div class="corner-readout ne">NE {{ ne_lat }}, {{ ne_lng }}</div>
+    <div class="corner-readout sw">SW {{ sw_lat }}, {{ sw_lng }}</div>
   </div>
-  {% elif not error %}
-  <p class="proj-muted">No config data available.</p>
-  {% endif %}
+  <script>
+    const NE = [{{ ne_lat }}, {{ ne_lng }}];
+    const SW = [{{ sw_lat }}, {{ sw_lng }}];
+    const bounds = L.latLngBounds(SW, NE);
+
+    const map = L.map('projectMap', {
+      // Fully non-interactive and locked — this view exists to be
+      // projected onto the physical model, not browsed, so it should
+      // never be able to drift off the calibrated box.
+      zoomControl: false, dragging: false, touchZoom: false, doubleClickZoom: false,
+      scrollWheelZoom: false, boxZoom: false, keyboard: false, tap: false,
+      attributionControl: true,
+    });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+    map.fitBounds(bounds);
+    // Hard-lock: pin min/max zoom to whatever fitBounds landed on, and pin
+    // maxBounds to the same box, so nothing (a stray API call, a future
+    // code change re-enabling interaction) can pan or zoom this away from
+    // the calibrated view.
+    const lockedZoom = map.getZoom();
+    map.setMinZoom(lockedZoom);
+    map.setMaxZoom(lockedZoom);
+    map.setMaxBounds(bounds);
+    window.addEventListener('resize', () => map.invalidateSize());
+  </script>
 </body>
 </html>
 """
@@ -1556,16 +1419,12 @@ PROJECT_PAGE = """
 
 @app.route("/project")
 def project():
-    params, error = get_smart_city_params_cached()
-    fetched_at = _smart_city_cache["fetched_at"]
-    fetched_str = fetched_at.strftime("%Y-%m-%d %H:%M:%S %Z") if fetched_at else "never"
-    sections_html = render_project_sections(params) if params else ""
+    ne_lat, ne_lng = SMART_CITY_CORNER_NE
+    sw_lat, sw_lng = SMART_CITY_CORNER_SW
     return render_template_string(
         PROJECT_PAGE,
-        error=error,
-        stale=bool(error and params),
-        fetched_at=fetched_str,
-        sections_html=sections_html,
+        ne_lat=ne_lat, ne_lng=ne_lng, sw_lat=sw_lat, sw_lng=sw_lng,
+        model_aspect=round(SMART_CITY_MODEL_WIDTH_MM / SMART_CITY_MODEL_HEIGHT_MM, 6),
     )
 
 
