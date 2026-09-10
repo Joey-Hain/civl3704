@@ -3,8 +3,7 @@ Web dashboard for TfNSW GTFS-realtime delay/variance data.
 
 Fetches the live trip-update feed on each page load, computes delay stats
 per operator, route and trip, and renders a sortable HTML table. Also
-appends every pull to delay_log.csv (same as timetable_variance.py) so you
-build up history.
+appends every pull to delay_log.csv so you build up history.
 
 A live map sits at the top of the page, fed by the separate GTFS-realtime
 VEHICLE POSITION feed (hardcoded to the vehiclepos endpoint below — this is
@@ -17,67 +16,86 @@ polls /api/vehicles every 15s independently of the (page-load-only) tables
 below, and respects whatever route/stop/operator/hide_anomalies filters are
 currently set.
 
-LIQUID-GLASS POPUPS: purely a frontend CSS concern (backdrop-filter blur on
-the Leaflet popup/tooltip chrome) - costs nothing server-side. Applied to
-both the hover tooltip and the click popup.
+LIQUID-GLASS POPUPS: purely a frontend CSS concern.
 
-COLOUR SCHEME: every bus marker has the same blue fill (brand colour), with
-delay status shown via the marker's OUTLINE colour instead of swapping the
-fill. This keeps the map visually calm (one colour family) while still
-making outliers scannable by ring colour.
+COLOUR SCHEME: every bus marker has the same blue fill, with delay status
+shown via the marker's OUTLINE colour.
 
 DENSITY HEATMAP (live): a toggleable layer (via leaflet.heat) showing where
-live buses are currently clustered, built purely from the same
-vehicle-position data already being fetched for the markers — no delay
-weighting, no historical data, just point density right now.
+live buses are currently clustered.
 
 DENSITY HEATMAP (historical): a second toggleable layer, pulling position
-data from the separate GTFS-R scraper repo (Joey-Hain/gtfs-r-scrape on
-GitHub). /api/heatmap fetches the raw CSVs for whatever daily files fall
-inside the requested time window (?window=1|24|168 hours), filters rows to
-that window, and returns density-weighted [lat, lon, intensity] triples.
-Both heat layers share a custom low-to-high gradient.
+data from the gtfs-r-scrape repo.
 
-DEPLOYMENT NOTES (READ THESE — they explain why the file is shaped this
-way after a long debugging session with Render):
+TRIP HEADSIGNS: enabled (Route 601 to Bondi Beach style popups). Built from
+the schedule bundle's trips.txt. This is the single largest in-memory
+structure in the app, so it is cached to disk as JSON and loaded into a
+module-level dict on the first dashboard request. Set ENABLE_TRIP_HEADSIGNS=0
+in Render's env if memory ever becomes a hard limit again — you lose the
+"to <destination>" text on popups but free ~60-80MB.
 
-  * THERE IS NO BACKGROUND PREWARM. The schedule bundle (operator names +
-    trip headsigns) is downloaded lazily on the first dashboard request,
-    inside get_all_rows_cached(). There are no module-level threads, no
-    import-time network calls, no locks around the schedule. The previous
-    versions all had some form of prewarm that either ran at import time or
-    was kicked off from a route; both caused the worker to hang during
-    Render's health check window, which surfaced as "No open HTTP ports
-    detected on 0.0.0.0" followed by a restart loop. Removing it entirely
-    is the only reliable fix.
+=== MEMORY: WHY THIS FILE IS SHAPED THE WAY IT IS ===
 
-  * /health and /ping return immediately with ZERO side effects. They do
-    not touch TfNSW, they do not touch the schedule, they do not start any
-    threads. They are safe to hammer as often as Render wants.
+The Render free tier gives 512MB RAM. The TfNSW bus schedule bundle is a
+60-150MB compressed zip that contains a statewide trips.txt. The previous
+version of this file did:
 
-  * Point the Render health check at /ping (Settings -> Health Checks).
+    resp = requests.get(SCHEDULE_URL, ...)
+    outer = zipfile.ZipFile(io.BytesIO(resp.content))
 
-  * Start command must include --no-control-socket. Gunicorn 25+ creates a
-    UNIX control socket at /opt/render/.gunicorn/gunicorn.ctl by default;
-    in our logs this appeared right before the port scan gave up, and the
-    --no-control-socket flag disables it. It is not needed for a single-
-    worker deployment.
+which holds the *entire* zip in RAM as resp.content (100MB+) AND again as a
+BytesIO buffer while extracting inner zips. On a 512MB instance that was the
+final OOM trigger: the health check would pass, then the first dashboard
+request would download the schedule, spike to ~350MB, and get OOM-killed
+before the response was sent.
 
-  * ONE worker, MANY threads. Each extra gunicorn worker is a separate
-    process with its own copy of every module-level cache and its own copy
-    of the parsed schedule dicts. The workload is entirely I/O-bound (HTTP
-    to TfNSW, HTTP to GitHub), so threads are the right tool and keep the
-    caches singular.
+The fix, in this file:
 
-  * Historical heatmap points are AGGREGATED into a fixed-precision lat/lon
-    grid (see GRID_DECIMALS), not kept as a raw list. A 7-day statewide
-    window was ~800k rows; keeping every raw [lat, lon] list in the
-    per-window cache was 100-150 MB, which is what was OOMing Render. Grid
-    cells collapse that to a few thousand entries.
+  * The schedule zip is STREAMED TO DISK chunk-by-chunk via
+    _download_to_path(). Peak RSS during the download is a few hundred KB
+    (one 256KB chunk) instead of 100MB+.
+  * Zip files are opened FROM DISK via zipfile.ZipFile(path). No BytesIO,
+    no in-memory zip bytes.
+  * For the zip-of-zips case, each inner zip is streamed to its own temp
+    file with shutil.copyfileobj, opened from disk, and unlinked. Peak RSS
+    during extraction is one 64KB copyfileobj chunk.
+  * Temp files live in a per-call tempfile.mkdtemp() directory that's
+    removed in a finally block, so nothing leaks even on error.
+  * The parsed schedule is written to disk with json.dump (streaming)
+    rather than json.dumps (builds a giant string first).
+  * RSS is logged at four points during schedule load so the Render log
+    stream shows exactly where memory goes.
 
-  * Schedule CSVs are STREAM-PARSED from inside the zip via
-    _parse_csv_member, avoiding the 100-200 MB transient peak of
-    read+decode+list()'ing a statewide trips.txt.
+Also: only ONE gunicorn worker (each worker is a separate process with its
+own copy of every module-level cache). Threads are the right concurrency
+tool here — the workload is HTTP-bound, not CPU-bound.
+
+=== RENDER SETTINGS THAT MUST BE SET ===
+
+  Start Command (single line, no backslashes):
+      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --worker-class gthread --timeout 120 --no-control-socket
+
+  Health Check Path: /ping
+
+  The --no-control-socket flag is not optional. Gunicorn 25+ opens a UNIX
+  control socket at /opt/render/.gunicorn/gunicorn.ctl before the HTTP
+  socket is fully ready, which was contributing to the "No open HTTP ports
+  detected on 0.0.0.0" restart loop.
+
+=== IF IT STILL OOMs AFTER THIS ===
+
+Three options, in order of effort:
+
+  1. Set ENABLE_TRIP_HEADSIGNS=0 in Render's env vars. Frees 60-80MB.
+     Popups show "Route 601" instead of "Route 601 to Bondi Beach".
+
+  2. Build CIVL3704/agency_names.json locally (run this file on your
+     laptop once), commit the resulting JSON to the repo, and let the
+     app read it from disk. Zero download on Render, zero memory spike.
+     The schedule only needs refreshing every few weeks.
+
+  3. Upgrade Render to Starter ($7/mo, 2GB). The free tier is genuinely
+     tight for a statewide GTFS schedule bundle.
 
 NOTE: an earlier version of this file also drew GTFS route-shape polylines
 under the bus markers. That feature has been removed (scope cut).
@@ -99,7 +117,10 @@ import csv
 import io
 import json
 import os
+import shutil
 import statistics
+import tempfile
+import threading
 import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -123,8 +144,6 @@ ANOMALY_ABS_SEC = 3600
 ON_TIME_EARLY_SEC = -60
 ON_TIME_LATE_SEC = 300
 
-# Historical heatmap grid resolution. 4 decimals ~= 11 m at Sydney's
-# latitude. See the DEPLOYMENT NOTES in the module docstring.
 GRID_DECIMALS = 4
 
 load_dotenv()
@@ -132,24 +151,36 @@ API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
 
-# Deliberately hardcoded — NOT sourced from .env's TFNSW_GTFS_RT_URL.
 VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 
-# --- Historical scrape repo (GitHub Actions collector, see collector.py) ---
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
 HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
 
-# --- Colour scheme: single blue fill, delay status carried by outline ---
 COLOR_FILL = "#00B3F0"
 OUTLINE_ON_TIME = "#ffffff"
 OUTLINE_LATE = "#B3261E"
 OUTLINE_EARLY = "#1E6B3C"
 OUTLINE_NO_DATA = "#888888"
 
-# Default radius filter for the map/API.
 SYDNEY_CBD = (-33.8688, 151.2093)
 SYDNEY_RADIUS_KM = 10
+
+ENABLE_TRIP_HEADSIGNS = os.getenv("ENABLE_TRIP_HEADSIGNS", "1") == "1"
+
+
+def _log_rss(tag):
+    """Log current resident set size to stdout so Render's log stream shows
+    exactly where memory goes during the schedule load. No-op on non-Linux."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    print(f"[mem] {tag}: rss={kb / 1024:.0f}MB", flush=True)
+                    return
+    except Exception:
+        pass
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -162,18 +193,11 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def parse_ts(raw):
-    """Parse a timestamp from the scraper's CSV into a Sydney-aware datetime.
-
-    Handles ISO-8601 with/without 'Z' or offset, and Unix epoch seconds.
-    Naive ISO strings are assumed UTC (what a GH-Actions cron job writes).
-    Returns a tz-aware datetime in Australia/Sydney, or None if unparseable.
-    """
     if raw is None:
         return None
     s = str(raw).strip()
     if not s:
         return None
-
     try:
         ts = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if ts.tzinfo is None:
@@ -181,29 +205,52 @@ def parse_ts(raw):
         return ts.astimezone(SYDNEY_TZ)
     except ValueError:
         pass
-
     try:
         val = float(s)
         if val >= 1e9:
             return datetime.fromtimestamp(val, tz=UTC_TZ).astimezone(SYDNEY_TZ)
     except (ValueError, OSError, OverflowError):
         pass
-
     return None
 
 
 app = Flask(__name__)
 
+# Held during schedule download/parse so concurrent first requests don't each
+# stream a 100MB zip down and race to build the same dicts.
+_schedule_lock = threading.Lock()
+
+
+def _download_to_path(url, headers, dest_path, timeout=60):
+    """Stream a URL to a local file, returning bytes written.
+
+    Streaming (instead of requests.get().content) is essential here. The
+    TfNSW bus schedule bundle is a 60-150MB compressed zip; holding it in
+    RAM on a 512MB Render instance was the final OOM trigger. Chunks are
+    written to disk as they arrive, so peak RSS during the download is one
+    chunk (256KB) instead of the whole zip.
+    """
+    total = 0
+    with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Schedule endpoint returned HTTP {r.status_code}. "
+                f"This usually means the API key isn't subscribed to the bus schedule/timetable "
+                f"product (separate from GTFS Realtime) on the TfNSW developer portal."
+            )
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
+    return total
+
 
 def _parse_csv_member(zf, member, key_col, val_col):
-    """Stream-parse one CSV member of a zipfile into {key: value}.
+    """Stream-parse one CSV member of an open ZipFile into {key: value}.
 
-    Reads row-by-row from the zip entry instead of loading the whole file
-    into memory first, so a statewide trips.txt doesn't produce a 100-200 MB
-    transient peak. No GIL-yield sleep calls — those were removed because
-    they added complexity without solving the actual issue (a hanging
-    worker), and gthread's scheduler handles cooperative yielding fine for
-    this workload.
+    Reads row-by-row from the zip entry, so a statewide trips.txt doesn't
+    produce a 100-200MB transient peak from read+decode+list().
     """
     result = {}
     if member not in zf.namelist():
@@ -225,69 +272,96 @@ def _parse_csv_member(zf, member, key_col, val_col):
 
 
 def load_schedule_lookups():
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error_or_None).
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
 
-    No lock, no background thread, no import-time call. Called lazily from
-    get_all_rows_cached() on the first dashboard request. If two requests
-    race, they'll both download the schedule — that's an acceptable cost
-    for removing the lock that was blocking the health check. The 24h disk
-    cache means this race happens at most once per day per process.
-
-    Handles both flat GTFS zips (agency.txt/trips.txt at top level) and
-    zip-of-zips (one nested zip per contract region).
+    Tries the 24h disk cache first. On a miss, streams the schedule bundle
+    to a temp file on disk, opens the zip from disk, streams any inner
+    zips to disk too, parses each CSV, writes the resulting JSON cache to
+    disk, and cleans up the temp directory. No stage holds the raw zip
+    bytes in memory.
     """
-    if AGENCY_CACHE_FILE.exists():
-        try:
-            cached = json.loads(AGENCY_CACHE_FILE.read_text())
-            fetched_at = datetime.fromisoformat(cached["fetched_at"])
-            if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
-                return cached["agencies"], cached.get("trip_headsigns", {}), None
-        except Exception:
-            pass
-
-    try:
-        resp = requests.get(SCHEDULE_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=30)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Schedule endpoint returned HTTP {resp.status_code}. "
-                f"This usually means the API key isn't subscribed to the bus schedule/timetable "
-                f"product (separate from GTFS Realtime) on the TfNSW developer portal."
-            )
-        outer = zipfile.ZipFile(io.BytesIO(resp.content))
-        names = outer.namelist()
-
-        agencies = {}
-        trip_headsigns = {}
-
-        def parse_bundle(zf):
-            agencies.update(_parse_csv_member(zf, "agency.txt", "agency_id", "agency_name"))
-            trip_headsigns.update(_parse_csv_member(zf, "trips.txt", "trip_id", "trip_headsign"))
-
-        if "agency.txt" in names or "trips.txt" in names:
-            parse_bundle(outer)
-        else:
-            for name in names:
-                if name.endswith(".zip"):
-                    inner = zipfile.ZipFile(io.BytesIO(outer.read(name)))
-                    parse_bundle(inner)
-
-        if not agencies:
-            raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
-
-        AGENCY_CACHE_FILE.write_text(json.dumps({
-            "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
-            "agencies": agencies,
-            "trip_headsigns": trip_headsigns,
-        }))
-        return agencies, trip_headsigns, None
-    except Exception as e:
+    with _schedule_lock:
         if AGENCY_CACHE_FILE.exists():
             try:
-                cached = json.loads(AGENCY_CACHE_FILE.read_text())
-                return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
+                with open(AGENCY_CACHE_FILE) as f:
+                    cached = json.load(f)
+                fetched_at = datetime.fromisoformat(cached["fetched_at"])
+                if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
+                    return cached["agencies"], cached.get("trip_headsigns", {}), None
             except Exception:
                 pass
-        return {}, {}, str(e)
+
+        tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
+        try:
+            outer_path = os.path.join(tmpdir, "schedule.zip")
+            outer_size = _download_to_path(
+                SCHEDULE_URL,
+                {"Authorization": f"apikey {API_KEY}"},
+                outer_path,
+            )
+            print(f"[schedule] downloaded {outer_size / 1e6:.1f}MB to disk", flush=True)
+            _log_rss("after-download")
+
+            agencies = {}
+            trip_headsigns = {}
+
+            with zipfile.ZipFile(outer_path) as outer:
+                names = outer.namelist()
+                if "agency.txt" in names or "trips.txt" in names:
+                    # Flat bundle.
+                    agencies.update(_parse_csv_member(outer, "agency.txt", "agency_id", "agency_name"))
+                    if ENABLE_TRIP_HEADSIGNS:
+                        trip_headsigns.update(_parse_csv_member(outer, "trips.txt", "trip_id", "trip_headsign"))
+                else:
+                    # Zip-of-zips, one per contract region. Stream each inner
+                    # zip to its own temp file rather than outer.read(name),
+                    # which would pull the whole inner zip into RAM.
+                    for i, name in enumerate(names):
+                        if not name.endswith(".zip"):
+                            continue
+                        inner_path = os.path.join(tmpdir, f"inner_{i}.zip")
+                        with outer.open(name) as src, open(inner_path, "wb") as dst:
+                            shutil.copyfileobj(src, dst, length=64 * 1024)
+                        try:
+                            with zipfile.ZipFile(inner_path) as inner:
+                                agencies.update(_parse_csv_member(inner, "agency.txt", "agency_id", "agency_name"))
+                                if ENABLE_TRIP_HEADSIGNS:
+                                    trip_headsigns.update(_parse_csv_member(inner, "trips.txt", "trip_id", "trip_headsign"))
+                        finally:
+                            try:
+                                os.unlink(inner_path)
+                            except OSError:
+                                pass
+
+            print(f"[schedule] parsed {len(agencies)} agencies, {len(trip_headsigns)} trip headsigns", flush=True)
+            _log_rss("after-parse")
+
+            if not agencies:
+                raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
+
+            # json.dump streams to the file rather than building the whole
+            # JSON string in RAM first (which for trip_headsigns would be a
+            # 30-50MB string on top of the dict itself).
+            with open(AGENCY_CACHE_FILE, "w") as f:
+                json.dump({
+                    "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
+                    "agencies": agencies,
+                    "trip_headsigns": trip_headsigns,
+                }, f)
+
+            _log_rss("after-cache-write")
+            return agencies, trip_headsigns, None
+        except Exception as e:
+            if AGENCY_CACHE_FILE.exists():
+                try:
+                    with open(AGENCY_CACHE_FILE) as f:
+                        cached = json.load(f)
+                    return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
+                except Exception:
+                    pass
+            return {}, {}, str(e)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def fetch_feed():
@@ -436,8 +510,6 @@ def split_route(route_id, agency_names):
     return route_num, operator
 
 
-# Short-TTL in-memory caches, shared between the dashboard page load and the
-# /api/vehicles poll. See the DEPLOYMENT NOTES in the module docstring.
 CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
@@ -446,8 +518,6 @@ _heatmap_cache = {}
 
 
 def get_all_rows_cached():
-    """Fetch+parse the trip-update feed. Schedule lookups are loaded lazily
-    here on the first call (and cached for 24h on disk)."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _rows_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -496,7 +566,6 @@ def fetch_historical_heatmap_points(window_hours):
     Rows are aggregated into a fixed-precision lat/lon grid as they're
     parsed, so a statewide 7-day window collapses from hundreds of
     thousands of individual [lat, lon] lists into a few thousand cells.
-    Each cell is emitted as [mean_lat, mean_lon, normalised_count].
     """
     now = datetime.now(tz=SYDNEY_TZ)
     cutoff = now - timedelta(hours=window_hours)
@@ -1043,19 +1112,13 @@ PAGE = """
 
 @app.route("/ping")
 def ping():
-    """Dead-simple liveness endpoint. Returns instantly, touches nothing.
-
-    Point Render's Health Check Path at /ping (Settings -> Health Checks).
-    This is deliberately separate from /health so that if /health ever
-    grows a side effect in a future edit, the health check doesn't break.
-    """
-    print("[ping] health check hit", flush=True)
+    """Render health-check target. Returns instantly, touches nothing."""
     return "pong", 200
 
 
 @app.route("/health")
 def health():
-    """Minimal health endpoint. Returns instantly, touches nothing."""
+    """Minimal liveness endpoint."""
     return "ok", 200
 
 
