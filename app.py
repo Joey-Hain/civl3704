@@ -1,35 +1,31 @@
 """
 Web dashboard for TfNSW GTFS-realtime delay/variance data.
 
-Loads everything from live sources — no committed cache files, no SQLite,
-no local JSON dependency:
+=== SCHEDULE LOADING ===
 
-  * Operators + trip headsigns come from the TfNSW schedule bundle
-    (SCHEDULE_URL), downloaded in a BACKGROUND THREAD at import time.
-  * Live vehicle positions come from the TfNSW vehiclepos feed.
-  * Historical vehicle positions come from the gtfs-r-scrape repo on GitHub
-    (data/YYYY-MM-DD.csv).
+Operators and trip headsigns come from the TfNSW schedule bundle, downloaded
+and parsed ON THE FIRST REQUEST that needs them, synchronously, under a lock.
+The first request after a cold start takes ~30 seconds; every subsequent
+request has full data immediately.
 
-Why the background thread: Render's health check hits the app with a
-5-second timeout during deploy. If / blocks on a ~30-second schedule
-download + parse of 94,000 trip headsigns, Render marks the port closed
-and enters a restart loop. The background thread does the fetch off the
-request path, so /ping returns instantly and the container stays up. Once
-the thread finishes (about 30s after boot), operators and headsigns appear
-in every subsequent request.
+Why not a background thread: with gunicorn's worker model, a thread started
+at module import time doesn't reliably share state with the process that
+handles requests. The logs showed the thread finishing (35 agencies, 93,947
+headsigns) while /status simultaneously showed empty dicts — they were
+running in different processes. Loading synchronously in the request handler
+eliminates the whole class of problem.
 
-The CSV parse yields the CPU every 500 rows via time.sleep(0.001). This is
-essential on a 0.1-CPU instance: without it, the parse thread starves
-gunicorn's acceptor thread and the health check times out anyway. The
-1ms sleep × ~190 yields = ~0.2s total added cost for the whole parse.
+Render's health check hits /ping, which never touches the schedule, so it
+always returns "pong" in microseconds and never times out.
 
-/api/heatmap is non-blocking: returns whatever is cached (or empty), and
-kicks off a background fetch to refresh. This keeps the request path
-under Render's 5s timeout no matter what GitHub is doing.
+=== HISTORICAL HEATMAP ===
+
+/api/heatmap fetches daily CSVs from the gtfs-r-scrape repo synchronously
+with a 20-second deadline. The frontend auto-loads it on page view.
 
 === RENDER SETTINGS ===
 
-  Start Command (single line):
+  Start Command (single line, no backslashes):
       gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65
 
   Health Check Path: /ping
@@ -77,8 +73,6 @@ GRID_DECIMALS = 4
 HEATMAP_FETCH_CONCURRENCY = 1
 HEATMAP_DEADLINE_SEC = 20
 
-# CSV parse yield rate. Every 500 rows we sleep 1ms to give the OS scheduler
-# a chance to run gunicorn's acceptor thread on the single-CPU free tier.
 PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
 
@@ -149,17 +143,12 @@ def parse_ts(raw):
 
 app = Flask(__name__)
 
-# Populated by a background thread at import time. Requests read whatever
-# is there; empty dicts until the thread finishes.
-_schedule_cache = {"agency_names": {}, "trip_headsigns": {}, "error": None}
-_schedule_ready = threading.Event()
-
-# Non-blocking historical heatmap state.
-_heatmap_bg_lock = threading.Lock()
-_heatmap_bg = {"running": False, "window": None}
+_schedule_lock = threading.Lock()
+_schedule_cache = {"agency_names": None, "trip_headsigns": None, "error": None}
+_heatmap_cache = {}
 
 
-def _download_to_path(url, headers, dest_path, timeout=120):
+def _download_to_path(url, headers, dest_path, timeout=90):
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
@@ -199,8 +188,6 @@ def _parse_csv_member(zf, member, key_col, val_col):
 
 
 def _do_schedule_download():
-    """Download the schedule bundle to disk, parse it, return (agencies,
-    trip_headsigns, error). Nothing is held in memory beyond the final dicts."""
     tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
     try:
         outer_path = os.path.join(tmpdir, "schedule.zip")
@@ -218,7 +205,6 @@ def _do_schedule_download():
                 if ENABLE_TRIP_HEADSIGNS:
                     trip_headsigns.update(_parse_csv_member(outer, "trips.txt", "trip_id", "trip_headsign"))
             else:
-                # zip-of-zips, one per contract region
                 for i, name in enumerate(names):
                     if not name.endswith(".zip"):
                         continue
@@ -246,33 +232,47 @@ def _do_schedule_download():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _background_schedule_load():
-    try:
-        print("[schedule] background load starting", flush=True)
-        agencies, trip_headsigns, err = _do_schedule_download()
+def get_schedule_lookups():
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
+
+    Downloads and parses the TfNSW schedule bundle on the first call,
+    blocking until done. Subsequent calls return the cached dicts
+    immediately. A lock ensures only one download happens even if
+    multiple requests arrive concurrently.
+
+    The first request after a cold start takes ~30 seconds. Render's
+    health check hits /ping, not /, so the container doesn't get killed
+    during the download.
+    """
+    if _schedule_cache["agency_names"] is not None:
+        return (_schedule_cache["agency_names"],
+                _schedule_cache["trip_headsigns"],
+                _schedule_cache["error"])
+
+    with _schedule_lock:
+        if _schedule_cache["agency_names"] is not None:
+            return (_schedule_cache["agency_names"],
+                    _schedule_cache["trip_headsigns"],
+                    _schedule_cache["error"])
+
+        print("[schedule] first request — downloading + parsing, this takes ~30s", flush=True)
+        t0 = time.monotonic()
+        try:
+            agencies, trip_headsigns, err = _do_schedule_download()
+        except Exception as e:
+            print(f"[schedule] load failed: {e}", flush=True)
+            _schedule_cache["agency_names"] = {}
+            _schedule_cache["trip_headsigns"] = {}
+            _schedule_cache["error"] = str(e)
+            return {}, {}, str(e)
+
         _schedule_cache["agency_names"] = agencies
         _schedule_cache["trip_headsigns"] = trip_headsigns
         _schedule_cache["error"] = err
-        print("[schedule] background load complete", flush=True)
+        print(f"[schedule] loaded in {time.monotonic() - t0:.1f}s — "
+              f"{len(agencies)} agencies, {len(trip_headsigns)} headsigns", flush=True)
         _log_rss("schedule-ready")
-    except Exception as e:
-        print(f"[schedule] background load failed: {e}", flush=True)
-        _schedule_cache["error"] = str(e)
-    finally:
-        _schedule_ready.set()
-
-
-# Start at import time, before gunicorn binds the port. The thread is a
-# daemon so it doesn't block shutdown. Requests never wait for it.
-threading.Thread(target=_background_schedule_load, daemon=True).start()
-
-
-def get_schedule_lookups():
-    """Returns ({agencies}, {headsigns}, error). Empty dicts until the
-    background thread finishes loading from TfNSW."""
-    return (_schedule_cache["agency_names"],
-            _schedule_cache["trip_headsigns"],
-            _schedule_cache["error"])
+        return agencies, trip_headsigns, err
 
 
 def fetch_feed():
@@ -422,7 +422,6 @@ CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
-_heatmap_cache = {}
 
 
 def get_all_rows_cached():
@@ -567,44 +566,14 @@ def fetch_historical_heatmap_points(window_hours):
     return points, note
 
 
-def _background_heatmap_fetch(window_hours):
-    try:
-        points, error = fetch_historical_heatmap_points(window_hours)
-        _heatmap_cache[window_hours] = {"points": points, "error": error,
-                                        "fetched_at": datetime.now(tz=SYDNEY_TZ)}
-    except Exception as e:
-        print(f"[heatmap] bg fetch failed: {e}", flush=True)
-        _heatmap_cache[window_hours] = {"points": [], "error": str(e),
-                                        "fetched_at": datetime.now(tz=SYDNEY_TZ)}
-    finally:
-        with _heatmap_bg_lock:
-            _heatmap_bg["running"] = False
-            _heatmap_bg["window"] = None
-
-
-def _kick_heatmap_fetch(window_hours):
-    with _heatmap_bg_lock:
-        if _heatmap_bg["running"] and _heatmap_bg["window"] == window_hours:
-            return False
-        _heatmap_bg["running"] = True
-        _heatmap_bg["window"] = window_hours
-    threading.Thread(target=_background_heatmap_fetch, args=(window_hours,), daemon=True).start()
-    return True
-
-
 def get_heatmap_points_cached(window_hours):
-    """Non-blocking. Returns whatever's cached, kicks off background refresh
-    if stale. Request handler is never held for more than a few ms."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached = _heatmap_cache.get(window_hours)
-    if cached is not None:
-        age = (now - cached["fetched_at"]).total_seconds()
-        if age < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
-            return cached["points"], cached["error"]
-        _kick_heatmap_fetch(window_hours)
-        return cached["points"], (cached["error"] or "Refreshing in background — reload in ~15s")
-    _kick_heatmap_fetch(window_hours)
-    return [], "Fetching in background — reload in ~15 seconds"
+    if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
+        return cached["points"], cached["error"]
+    points, error = fetch_historical_heatmap_points(window_hours)
+    _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
+    return points, error
 
 
 def compute_delay_data(args):
@@ -738,7 +707,7 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
     <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
-    <span>Historical heatmap loads when you change the window dropdown.</span>
+    <span>Use the layer switcher (top-right) to toggle the heatmaps.</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
@@ -835,6 +804,7 @@ PAGE = """
       } catch (e) { statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e'; }
     }
     document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
+    loadHistoricalHeatmap();
 
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
@@ -883,6 +853,7 @@ PAGE = """
     }
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
+    setInterval(loadHistoricalHeatmap, 300000);
   </script>
 </body>
 </html>
@@ -908,13 +879,13 @@ def status():
             "error": entry["error"],
             "age_seconds": (datetime.now(tz=SYDNEY_TZ) - entry["fetched_at"]).total_seconds(),
         }
+    agencies = _schedule_cache["agency_names"]
+    headsigns = _schedule_cache["trip_headsigns"]
     return jsonify({
-        "schedule_ready": _schedule_ready.is_set(),
-        "schedule_agencies": len(_schedule_cache["agency_names"]),
-        "schedule_headsigns": len(_schedule_cache["trip_headsigns"]),
+        "schedule_loaded": agencies is not None,
+        "schedule_agencies": len(agencies) if agencies else 0,
+        "schedule_headsigns": len(headsigns) if headsigns else 0,
         "schedule_error": _schedule_cache["error"],
-        "heatmap_bg_running": _heatmap_bg["running"],
-        "heatmap_bg_window": _heatmap_bg["window"],
         "heatmap_cache": heatmap_state,
     })
 
@@ -931,8 +902,8 @@ def dashboard():
     latest_rows = data["latest_rows"]
     agency_names = data["agency_names"]
 
-    if not _schedule_ready.is_set():
-        agency_debug = "Loading operator names and trip headsigns from TfNSW in the background — reload in ~30 seconds."
+    if not agency_names:
+        agency_debug = "Operator names unavailable — check the /status endpoint and Render logs."
     else:
         observed_prefixes = sorted({r["route_id"].split("_")[0] for r in all_rows if r["route_id"]})[:10]
         agency_debug = (f"Loaded {len(agency_names)} operator names. "
