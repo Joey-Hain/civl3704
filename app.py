@@ -940,10 +940,8 @@ PAGE = """
   <div class="meta">
     Pulled {{ pulled_at }} &middot; {{ n_total }} readings ({{ n_flagged }} flagged as anomalous, {{ 'hidden' if hide_anomalies else 'shown' }})
     &middot; <a class="toggle" href="?hide_anomalies={{ 0 if hide_anomalies else 1 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">{{ 'show anomalies' if hide_anomalies else 'hide anomalies' }}</a>
-    <br>"On time" = arrived no more than 1 min early or 5 min late (standard transit industry window).
-    <br>n = number of distinct buses (trips) currently reporting, non-anomalous, taken from each bus's most recent stop.
+    <br>"On time" = 1 min early to 5 min late &middot; n = distinct non-anomalous buses reporting (latest stop each)
     {% if agency_error %}<br><span style="color:#b3261e">Operator names unavailable: {{ agency_error }}</span>{% endif %}
-    <br><span style="color:#666">{{ agency_debug }}</span>
   </div>
 
   <form method="get" style="margin:20px 0; padding:14px; border:1px solid var(--line);">
@@ -1014,31 +1012,39 @@ PAGE = """
     // still gets its own live/historical colour-family pair — same idea as
     // the original delay-only scheme — so the two active layers read as
     // distinct from each other, but only one metric's pair is ever visible
-    // at a time. All gradients are ColorBrewer sequential, colorblind-safe
-    // ramps (not a shared rainbow scale, which made "how much" hard to
-    // read at a glance and gave no visual cue for which layer/metric you
-    // were looking at).
+    // at a time.
+    //
+    // Every hue anchor below (the 0.75 stop of each ramp) is one of
+    // Anthropic's documented categorical colours, and each live/hist PAIR
+    // was run through that palette's colourblind-safety checker (adjacent
+    // CVD ΔE + normal-vision ΔE, both comfortably over the pass floor) —
+    // red/violet, blue/orange, green/magenta. The first-generation ramps
+    // here used pale ColorBrewer stops that read as washed-out/grey against
+    // the map background at low weight, which is what made metric switches
+    // hard to see; these ramps stay visibly tinted even at the light end
+    // and hit a real saturated colour by the middle of the ramp, not just
+    // at the very top.
     const METRICS = {
       delay: {
         label: 'Delay',
-        liveGradient:  { 0.0:'#ffffb2', 0.25:'#fecc5c', 0.5:'#fd8d3c', 0.75:'#f03b20', 1.0:'#bd0026' }, // YlOrRd
-        histGradient:  { 0.0:'#edf8fb', 0.25:'#b3cde3', 0.5:'#8c96c6', 0.75:'#8856a7', 1.0:'#810f7c' }, // BuPu
+        liveGradient:  { 0.0:'#f5e5e5', 0.25:'#eea7a6', 0.5:'#e87574', 0.75:'#e34948', 1.0:'#a61413' }, // red
+        histGradient:  { 0.0:'#e9e8f2', 0.25:'#a9a2d4', 0.5:'#776bbc', 0.75:'#4a3aa7', 1.0:'#2c216a' }, // violet
         liveTitle: 'Live snapshot — current lateness',
         histTitle: 'Historical window — mean lateness',
         ticks: ['0 min late', 'SEVERITY_CAP+ min late'],
       },
       density: {
         label: 'Density',
-        liveGradient:  { 0.0:'#f7fbff', 0.25:'#c6dbef', 0.5:'#6baed6', 0.75:'#3182bd', 1.0:'#08519c' }, // Blues
-        histGradient:  { 0.0:'#fcfbfd', 0.25:'#dadaeb', 0.5:'#9e9ac8', 0.75:'#807dba', 1.0:'#54278f' }, // Purples
+        liveGradient:  { 0.0:'#cde2fb', 0.25:'#86b6ef', 0.5:'#2a78d6', 0.75:'#184f95', 1.0:'#0d366b' }, // blue
+        histGradient:  { 0.0:'#f6e9e4', 0.25:'#f2b59e', 0.5:'#ee8c65', 0.75:'#eb6834', 1.0:'#a8370a' }, // orange
         liveTitle: 'Live snapshot — vehicle density',
         histTitle: 'Historical window — vehicle density',
         ticks: ['fewer pings', 'more pings'],
       },
       speed: {
         label: 'Speed',
-        liveGradient:  { 0.0:'#ffffe5', 0.25:'#c7e9b4', 0.5:'#78c679', 0.75:'#31a354', 1.0:'#006837' }, // YlGn
-        histGradient:  { 0.0:'#feedde', 0.25:'#fdbe85', 0.5:'#fd8d3c', 0.75:'#e6550d', 1.0:'#a63603' }, // Oranges
+        liveGradient:  { 0.0:'#e2f8e2', 0.25:'#88c988', 0.5:'#3fa43f', 0.75:'#008300', 1.0:'#005100' }, // green
+        histGradient:  { 0.0:'#f5e6eb', 0.25:'#f0bbcf', 0.5:'#ec99b8', 0.75:'#e87ba4', 1.0:'#c21a59' }, // magenta
         liveTitle: 'Live snapshot — current speed',
         histTitle: 'Historical window — mean speed',
         ticks: ['0 km/h', 'SPEED_CAP+ km/h'],
@@ -1064,8 +1070,13 @@ PAGE = """
       return metres / mpp;
     }
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:15, minOpacity:0.12, gradient:METRICS[DEFAULT_METRIC].liveGradient });
-    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:14, minOpacity:0.12, gradient:METRICS[DEFAULT_METRIC].histGradient });
+    // minOpacity nudged up from the original 0.12 — combined with the old
+    // pale gradient stops, low-weight points were nearly invisible against
+    // the map background, which was the other half of "switching metric
+    // doesn't seem to do anything".
+    const HEAT_MIN_OPACITY = 0.22;
+    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:15, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].liveGradient });
+    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:14, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].histGradient });
 
     function updateHeatRadii() {
       const zoom = map.getZoom();
@@ -1310,13 +1321,12 @@ def dashboard():
     latest_rows = data["latest_rows"]
     agency_names = data["agency_names"]
 
-    if not agency_names:
-        agency_debug = "Operator names unavailable — check the /status endpoint and Render logs."
-    else:
-        observed_prefixes = sorted({r["route_id"].split("_")[0] for r in all_rows if r["route_id"]})[:10]
-        agency_debug = (f"Loaded {len(agency_names)} operator names. "
-                        f"Sample IDs: {list(agency_names.keys())[:10]}. "
-                        f"Feed route prefixes: {observed_prefixes}.")
+    # Operator/route-prefix diagnostics used to be dumped straight into the
+    # page header for every viewer (schedule-loading was flaky enough during
+    # development to want it always visible). That debugging is done now —
+    # the same numbers are still available on demand at /status, so the
+    # header just shows the one thing a viewer actually needs: whether
+    # operator names failed to load at all (agency_error, below).
 
     operators = sorted(summarise(latest_rows, "operator"), key=lambda r: -abs(r["mean_min"]))
     routes = sorted(summarise(latest_rows, "route_id"),
@@ -1334,7 +1344,7 @@ def dashboard():
         n_flagged=sum(1 for r in all_rows if r["anomaly"]),
         hide_anomalies=data["hide_anomalies"],
         q_route=data["q_route"], q_stop=data["q_stop"], q_operator=data["q_operator"],
-        agency_error=data["agency_error"], agency_debug=agency_debug,
+        agency_error=data["agency_error"],
         operators=operators, routes=routes, worst_trips=worst_trips,
         vehicles=vehicles, vehicles_json=json.dumps(vehicles),
         filters_active=data["filters_active"], apply_bounds=data["apply_bounds"],
