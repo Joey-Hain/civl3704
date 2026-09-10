@@ -1,7 +1,6 @@
 flask
-gunicorn
+gunicorn==23.0.0
 requests
 python-dotenv
 gtfs-realtime-bindings
 tzdata
-psycopg2-binary
