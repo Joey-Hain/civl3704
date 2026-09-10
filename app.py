@@ -99,7 +99,7 @@ DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
 AGENCY_CACHE_FILE = DATA_DIR / "agency_names.json"
-AGENCY_CACHE_MAX_AGE = timedelta(hours=24)
+AGENCY_CACHE_MAX_AGE = timedelta(days=90)
 ANOMALY_ABS_SEC = 3600
 ON_TIME_EARLY_SEC = -60
 ON_TIME_LATE_SEC = 300
