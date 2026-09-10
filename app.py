@@ -34,57 +34,27 @@ sub-pixel dots at low zoom, the pixel radius is FLOORED at a minimum so
 dense corridors stay readable when zoomed out. Both layers share the same
 sizing so live and historical look identical at every zoom level.
 
-TRIP HEADSIGNS: enabled, stored in SQLite (CIVL3704/schedule.db) rather
-than in memory. Nothing statewide is held in RAM.
+=== MEMORY NOTES ===
 
-=== MEMORY / CONCURRENCY NOTES ===
+The Render free tier gives 512MB RAM. This version stays inside that:
 
-Memory: this file's design keeps the process at ~54MB RSS regardless of
-trip count. The two historical memory hogs are fixed:
-
-  * Schedule bundle is STREAMED to disk (never held as resp.content) and
-    each CSV inside is STREAMED straight into SQLite in 5000-row batches
-    (never held as an in-memory statewide dict).
-
+  * Schedule bundle is STREAMED to disk (never held as resp.content).
+  * Each CSV inside the schedule zip is STREAM-PARSED row-by-row into a
+    plain dict (no read+decode+list() of the whole file).
+  * The parsed schedule is cached IN MEMORY for the life of the process,
+    so the download and parse happen at most once per cold start.
   * Historical heatmap CSVs are STREAMED line-by-line and aggregated into
     a grid dict; peak RSS per worker is one line, not one file.
-
-Concurrency: three separate problems, three fixes.
-
-  1. get_all_rows_cached() and get_vehicles_cached() use double-checked
-     locking around their fetch+update block. Without this, N concurrent
-     requests that all arrive just after the 12s cache expires would each
-     independently fire the TfNSW HTTP fetch — a thundering herd that
-     blocks every gunicorn thread for the duration of the slowest request,
-     which is what was making Render's port scanner give up ("No open HTTP
-     ports detected on 0.0.0.0"). With the lock, one request fetches while
-     the rest wait on the lock, then read the freshly-populated cache.
-
-  2. _stream_csv_to_sqlite() yields the GIL every four batches. The SQLite
-     bulk insert of 93,947 trip headsigns is CPU-bound and holds the GIL
-     in chunks; on a 0.1-CPU instance that was enough to starve gunicorn's
-     acceptor thread for the duration of the cold-start parse (~10s), which
-     also surfaced as "No open HTTP ports detected". time.sleep(0)
-     explicitly releases the GIL so the acceptor can keep responding to
-     health checks while the insert proceeds in the background.
-
-  3. A _heatmap_fetch_lock ensures only one historical fetch runs at a
-     time. Without it, quickly switching the window dropdown (1h -> 24h ->
-     168h) could stack up 3 concurrent multi-file fetches.
+  * _heatmap_fetch_lock ensures only one historical fetch runs at a time.
 
 === RENDER SETTINGS THAT MUST BE SET ===
 
-  Start Command (single line, no backslashes; the dashboard field overrides
-  any Procfile or render.yaml in the repo, but you should still update the
-  Procfile to match so the repo isn't lying about how the app runs):
+  Start Command (single line, no backslashes, and importantly NO
+  --no-control-socket because gunicorn 23 does not support it):
 
-      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65 --no-control-socket
+      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65
 
   Health Check Path: /ping
-
-  requirements.txt should pin gunicorn to 23.0.0 (26.x has had Render
-  compatibility problems) and should NOT include psycopg2-binary (this
-  app doesn't use Postgres).
 
 NOTE: an earlier version of this file also drew GTFS route-shape polylines
 under the bus markers. That feature has been removed (scope cut).
@@ -107,7 +77,6 @@ import io
 import json
 import os
 import shutil
-import sqlite3
 import statistics
 import tempfile
 import threading
@@ -129,7 +98,7 @@ UTC_TZ = ZoneInfo("UTC")
 DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
-SCHEDULE_DB_FILE = DATA_DIR / "schedule.db"
+AGENCY_CACHE_FILE = DATA_DIR / "agency_names.json"
 AGENCY_CACHE_MAX_AGE = timedelta(hours=24)
 ANOMALY_ABS_SEC = 3600
 ON_TIME_EARLY_SEC = -60
@@ -139,11 +108,6 @@ GRID_DECIMALS = 4
 
 HEATMAP_FETCH_CONCURRENCY = 2
 HEATMAP_DEADLINE_SEC = 45
-
-SQLITE_INSERT_BATCH = 5000
-# How many batches between GIL yields during the SQLite bulk insert. See
-# _stream_csv_to_sqlite and the module docstring.
-SQLITE_YIELD_EVERY_N_BATCHES = 4
 
 load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
@@ -216,88 +180,17 @@ app = Flask(__name__)
 _schedule_lock = threading.Lock()
 _heatmap_fetch_lock = threading.Lock()
 
-# Double-checked-locking guards around the two feed caches. See the module
-# docstring: without these, a burst of concurrent requests arriving just
-# after the TTL expires would each independently fire the TfNSW fetch and
-# block every gunicorn thread, which is what made Render's port scanner
-# give up during the first few seconds after deploy.
-_rows_fetch_lock = threading.Lock()
-_vehicles_fetch_lock = threading.Lock()
-
-
-class HeadsignStore:
-    """Query-only interface to the trip_headsigns SQLite table. Nothing is
-    held in memory; each get_many() call runs batched IN (...) queries for
-    just the trip_ids the caller cares about."""
-
-    def __init__(self, db_path):
-        self.db_path = str(db_path)
-
-    def get_many(self, trip_ids):
-        if not trip_ids:
-            return {}
-        result = {}
-        ids = list({tid for tid in trip_ids if tid})
-        if not ids:
-            return result
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=5)
-            try:
-                for i in range(0, len(ids), 500):
-                    batch = ids[i:i + 500]
-                    placeholders = ",".join("?" * len(batch))
-                    cur = conn.execute(
-                        f"SELECT trip_id, headsign FROM headsigns WHERE trip_id IN ({placeholders})",
-                        batch,
-                    )
-                    for tid, hs in cur:
-                        result[tid] = hs
-            finally:
-                conn.close()
-        except sqlite3.Error as e:
-            print(f"[schedule] sqlite headsign lookup failed: {e}", flush=True)
-        return result
-
-
-def _init_schedule_db(path):
-    conn = sqlite3.connect(str(path))
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute("CREATE TABLE IF NOT EXISTS agencies (agency_id TEXT PRIMARY KEY, agency_name TEXT)")
-        conn.execute("CREATE TABLE IF NOT EXISTS headsigns (trip_id TEXT PRIMARY KEY, headsign TEXT)")
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _schedule_db_is_fresh(path):
-    if not os.path.exists(path):
-        return False
-    try:
-        conn = sqlite3.connect(str(path), timeout=5)
-        try:
-            cur = conn.execute("SELECT value FROM meta WHERE key='fetched_at'")
-            row = cur.fetchone()
-            if not row:
-                return False
-            fetched_at = datetime.fromisoformat(row[0])
-            return datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE
-        finally:
-            conn.close()
-    except Exception:
-        return False
-
-
-def _load_agencies_from_db(path):
-    conn = sqlite3.connect(str(path), timeout=5)
-    try:
-        return {aid: name for aid, name in conn.execute("SELECT agency_id, agency_name FROM agencies")}
-    finally:
-        conn.close()
+# In-memory cache of the parsed schedule. Loaded at most once per process.
+_schedule_cache = {
+    "agency_names": None,
+    "trip_headsigns": None,
+    "error": None,
+}
 
 
 def _download_to_path(url, headers, dest_path, timeout=60):
+    """Stream a URL to a local file, returning bytes written. Never holds
+    the whole file in memory — peak RSS during the download is one chunk."""
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
@@ -314,66 +207,60 @@ def _download_to_path(url, headers, dest_path, timeout=60):
     return total
 
 
-def _stream_csv_to_sqlite(zf, member, conn, key_col, val_col, table):
-    """Stream a CSV member of an open ZipFile into a SQLite table.
+def _parse_csv_member(zf, member, key_col, val_col):
+    """Stream-parse one CSV member of an open ZipFile into {key: value}.
 
-    Rows are accumulated in batches of SQLITE_INSERT_BATCH and flushed with
-    executemany(). Peak memory is one batch, not the whole file.
-
-    Yields the GIL every SQLITE_YIELD_EVERY_N_BATCHES batches via
-    time.sleep(0). The bulk insert of ~94k trip headsigns is CPU-bound and
-    holds the GIL in chunks; on a 0.1-CPU instance that was enough to
-    starve gunicorn's acceptor thread for the duration of the cold-start
-    parse (~10s), which surfaced as "No open HTTP ports detected on
-    0.0.0.0" in Render's logs. time.sleep(0) explicitly releases the GIL
-    so the acceptor can respond to Render's health check while the insert
-    proceeds.
+    Reads row-by-row from the zip entry, so a statewide trips.txt doesn't
+    produce a 100-200MB transient peak from read+decode+list().
     """
+    result = {}
     if member not in zf.namelist():
-        return 0
-    count = 0
+        return result
     with zf.open(member) as raw:
         reader = csv.reader(codecs.iterdecode(raw, "utf-8-sig"))
         try:
             header = [h.strip() for h in next(reader)]
         except StopIteration:
-            return 0
+            return result
         if key_col not in header or val_col not in header:
-            return 0
+            return result
         key_idx = header.index(key_col)
         val_idx = header.index(val_col)
-        max_idx = max(key_idx, val_idx)
-        batch = []
-        batches_since_yield = 0
         for row in reader:
-            if len(row) > max_idx and row[val_idx].strip():
-                batch.append((row[key_idx].strip(), row[val_idx].strip()))
-                if len(batch) >= SQLITE_INSERT_BATCH:
-                    conn.executemany(f"INSERT OR REPLACE INTO {table} VALUES (?, ?)", batch)
-                    count += len(batch)
-                    batch.clear()
-                    batches_since_yield += 1
-                    if batches_since_yield >= SQLITE_YIELD_EVERY_N_BATCHES:
-                        batches_since_yield = 0
-                        time.sleep(0)  # release GIL so acceptor/health-check threads run
-        if batch:
-            conn.executemany(f"INSERT OR REPLACE INTO {table} VALUES (?, ?)", batch)
-            count += len(batch)
-    return count
+            if len(row) > max(key_idx, val_idx) and row[val_idx].strip():
+                result[row[key_idx].strip()] = row[val_idx].strip()
+    return result
 
 
 def load_schedule_lookups():
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
+
+    Loads from the 24h disk cache if fresh, otherwise streams the schedule
+    bundle to disk and stream-parses each CSV member. The parsed dicts are
+    held in _schedule_cache for the life of the process, so this only does
+    real work once per cold start.
+    """
     with _schedule_lock:
-        if _schedule_db_is_fresh(SCHEDULE_DB_FILE):
+        if _schedule_cache["agency_names"] is not None:
+            return (_schedule_cache["agency_names"],
+                    _schedule_cache["trip_headsigns"],
+                    _schedule_cache["error"])
+
+        if AGENCY_CACHE_FILE.exists():
             try:
-                agencies = _load_agencies_from_db(SCHEDULE_DB_FILE)
-                _log_rss("schedule-loaded-from-db")
-                return agencies, HeadsignStore(SCHEDULE_DB_FILE), None
-            except Exception as e:
-                print(f"[schedule] failed to load agencies from fresh DB: {e}", flush=True)
+                with open(AGENCY_CACHE_FILE) as f:
+                    cached = json.load(f)
+                fetched_at = datetime.fromisoformat(cached["fetched_at"])
+                if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
+                    _schedule_cache["agency_names"] = cached["agencies"]
+                    _schedule_cache["trip_headsigns"] = cached.get("trip_headsigns", {})
+                    _schedule_cache["error"] = None
+                    _log_rss("schedule-loaded-from-disk")
+                    return cached["agencies"], cached.get("trip_headsigns", {}), None
+            except Exception:
+                pass
 
         tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
-        tmp_db_path = os.path.join(tmpdir, "schedule.db")
         try:
             outer_path = os.path.join(tmpdir, "schedule.zip")
             outer_size = _download_to_path(
@@ -384,84 +271,66 @@ def load_schedule_lookups():
             print(f"[schedule] downloaded {outer_size / 1e6:.1f}MB to disk", flush=True)
             _log_rss("after-download")
 
-            _init_schedule_db(tmp_db_path)
-            conn = sqlite3.connect(tmp_db_path, timeout=30)
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                total_agencies = 0
-                total_headsigns = 0
+            agencies = {}
+            trip_headsigns = {}
 
-                with zipfile.ZipFile(outer_path) as outer:
-                    names = outer.namelist()
-                    if "agency.txt" in names or "trips.txt" in names:
-                        total_agencies += _stream_csv_to_sqlite(
-                            outer, "agency.txt", conn, "agency_id", "agency_name", "agencies"
-                        )
-                        if ENABLE_TRIP_HEADSIGNS:
-                            total_headsigns += _stream_csv_to_sqlite(
-                                outer, "trips.txt", conn, "trip_id", "trip_headsign", "headsigns"
-                            )
-                    else:
-                        for i, name in enumerate(names):
-                            if not name.endswith(".zip"):
-                                continue
-                            inner_path = os.path.join(tmpdir, f"inner_{i}.zip")
-                            with outer.open(name) as src, open(inner_path, "wb") as dst:
-                                shutil.copyfileobj(src, dst, length=64 * 1024)
+            with zipfile.ZipFile(outer_path) as outer:
+                names = outer.namelist()
+                if "agency.txt" in names or "trips.txt" in names:
+                    agencies.update(_parse_csv_member(outer, "agency.txt", "agency_id", "agency_name"))
+                    if ENABLE_TRIP_HEADSIGNS:
+                        trip_headsigns.update(_parse_csv_member(outer, "trips.txt", "trip_id", "trip_headsign"))
+                else:
+                    for i, name in enumerate(names):
+                        if not name.endswith(".zip"):
+                            continue
+                        inner_path = os.path.join(tmpdir, f"inner_{i}.zip")
+                        with outer.open(name) as src, open(inner_path, "wb") as dst:
+                            shutil.copyfileobj(src, dst, length=64 * 1024)
+                        try:
+                            with zipfile.ZipFile(inner_path) as inner:
+                                agencies.update(_parse_csv_member(inner, "agency.txt", "agency_id", "agency_name"))
+                                if ENABLE_TRIP_HEADSIGNS:
+                                    trip_headsigns.update(_parse_csv_member(inner, "trips.txt", "trip_id", "trip_headsign"))
+                        finally:
                             try:
-                                with zipfile.ZipFile(inner_path) as inner:
-                                    total_agencies += _stream_csv_to_sqlite(
-                                        inner, "agency.txt", conn, "agency_id", "agency_name", "agencies"
-                                    )
-                                    if ENABLE_TRIP_HEADSIGNS:
-                                        total_headsigns += _stream_csv_to_sqlite(
-                                            inner, "trips.txt", conn, "trip_id", "trip_headsign", "headsigns"
-                                        )
-                            finally:
-                                try:
-                                    os.unlink(inner_path)
-                                except OSError:
-                                    pass
+                                os.unlink(inner_path)
+                            except OSError:
+                                pass
 
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta VALUES ('fetched_at', ?)",
-                    (datetime.now(tz=SYDNEY_TZ).isoformat(),),
-                )
-                conn.commit()
-                try:
-                    conn.execute("VACUUM")
-                except sqlite3.Error:
-                    pass
-            finally:
-                conn.close()
-
-            print(f"[schedule] parsed {total_agencies} agencies, "
-                  f"{total_headsigns} trip headsigns into SQLite", flush=True)
+            print(f"[schedule] parsed {len(agencies)} agencies, {len(trip_headsigns)} trip headsigns", flush=True)
             _log_rss("after-parse")
 
-            if total_agencies == 0:
-                raise RuntimeError("Downloaded schedule bundle but found no agency rows in it.")
+            if not agencies:
+                raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
 
-            for suffix in ("", "-wal", "-shm"):
-                stale = str(SCHEDULE_DB_FILE) + suffix
-                if os.path.exists(stale):
-                    try:
-                        os.unlink(stale)
-                    except OSError:
-                        pass
-            shutil.move(tmp_db_path, str(SCHEDULE_DB_FILE))
+            with open(AGENCY_CACHE_FILE, "w") as f:
+                json.dump({
+                    "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
+                    "agencies": agencies,
+                    "trip_headsigns": trip_headsigns,
+                }, f)
 
-            agencies = _load_agencies_from_db(SCHEDULE_DB_FILE)
+            _schedule_cache["agency_names"] = agencies
+            _schedule_cache["trip_headsigns"] = trip_headsigns
+            _schedule_cache["error"] = None
             _log_rss("after-cache-write")
-            return agencies, HeadsignStore(SCHEDULE_DB_FILE), None
+            return agencies, trip_headsigns, None
         except Exception as e:
-            if os.path.exists(SCHEDULE_DB_FILE):
+            if AGENCY_CACHE_FILE.exists():
                 try:
-                    agencies = _load_agencies_from_db(SCHEDULE_DB_FILE)
-                    return agencies, HeadsignStore(SCHEDULE_DB_FILE), f"Using stale cached schedule ({e})"
+                    with open(AGENCY_CACHE_FILE) as f:
+                        cached = json.load(f)
+                    _schedule_cache["agency_names"] = cached["agencies"]
+                    _schedule_cache["trip_headsigns"] = cached.get("trip_headsigns", {})
+                    _schedule_cache["error"] = f"Using stale cached names ({e})"
+                    return cached["agencies"], cached.get("trip_headsigns", {}), _schedule_cache["error"]
                 except Exception:
                     pass
-            return {}, None, str(e)
+            _schedule_cache["agency_names"] = {}
+            _schedule_cache["trip_headsigns"] = {}
+            _schedule_cache["error"] = str(e)
+            return {}, {}, str(e)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -523,26 +392,15 @@ def latest_reading_per_trip(rows):
     return latest
 
 
-def extract_vehicles(feed, agency_names, headsign_store=None):
-    raw = []
-    trip_ids = []
+def extract_vehicles(feed, agency_names, trip_headsigns=None):
+    trip_headsigns = trip_headsigns or {}
+    vehicles = []
     for entity in feed.entity:
         if not entity.HasField("vehicle"):
             continue
         v = entity.vehicle
         if not v.HasField("position"):
             continue
-        trip_id = v.trip.trip_id if v.HasField("trip") else None
-        if trip_id:
-            trip_ids.append(trip_id)
-        raw.append((entity, v))
-
-    headsigns = {}
-    if headsign_store is not None and trip_ids:
-        headsigns = headsign_store.get_many(trip_ids)
-
-    vehicles = []
-    for entity, v in raw:
         route_id = v.trip.route_id if v.HasField("trip") else ""
         trip_id = v.trip.trip_id if v.HasField("trip") else None
         route_num, route_operator = split_route(route_id, agency_names) if route_id else ("", "")
@@ -552,7 +410,7 @@ def extract_vehicles(feed, agency_names, headsign_store=None):
             "route_id": route_id,
             "route_num": route_num,
             "route_operator": route_operator,
-            "headsign": headsigns.get(trip_id),
+            "headsign": trip_headsigns.get(trip_id),
             "lat": v.position.latitude,
             "lon": v.position.longitude,
             "bearing": v.position.bearing if v.HasField("position") else None,
@@ -624,65 +482,39 @@ def split_route(route_id, agency_names):
 
 
 CACHE_TTL_SECONDS = 12
-_rows_cache = {"all_rows": None, "agency_names": None, "headsign_store": None,
+_rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
 _heatmap_cache = {}
 
 
 def get_all_rows_cached():
-    """Fetch+parse the trip-update feed with double-checked locking.
-
-    The outer check is the fast path (most requests hit this). If the cache
-    is expired, only one thread enters the lock and does the slow fetch;
-    every other concurrent thread blocks on the lock, then finds a fresh
-    cache and returns immediately. Without this, N concurrent requests
-    arriving right after a TTL expiry would each independently fire the
-    TfNSW fetch and block every gunicorn thread — that was what made
-    Render's port scanner give up during the first few seconds after
-    deploy ("No open HTTP ports detected on 0.0.0.0").
-    """
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _rows_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
-        return (_rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["headsign_store"],
+        return (_rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"],
                 _rows_cache["agency_error"])
 
-    with _rows_fetch_lock:
-        now = datetime.now(tz=SYDNEY_TZ)
-        cached_at = _rows_cache["fetched_at"]
-        if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
-            return (_rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["headsign_store"],
-                    _rows_cache["agency_error"])
+    agency_names, trip_headsigns, agency_error = load_schedule_lookups()
+    feed = fetch_feed()
+    all_rows = extract_rows(feed, agency_names)
+    append_to_log(all_rows)
 
-        agency_names, headsign_store, agency_error = load_schedule_lookups()
-        feed = fetch_feed()
-        all_rows = extract_rows(feed, agency_names)
-        append_to_log(all_rows)
-
-        _rows_cache.update(all_rows=all_rows, agency_names=agency_names, headsign_store=headsign_store,
-                           agency_error=agency_error, fetched_at=now)
-        return all_rows, agency_names, headsign_store, agency_error
+    _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
+                       agency_error=agency_error, fetched_at=now)
+    return all_rows, agency_names, trip_headsigns, agency_error
 
 
-def get_vehicles_cached(agency_names, headsign_store):
-    """Fetch+parse the vehicle-position feed with double-checked locking.
-    See get_all_rows_cached() for why."""
+def get_vehicles_cached(agency_names, trip_headsigns):
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _vehicles_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
         return [dict(v) for v in _vehicles_cache["vehicles"]]
 
-    with _vehicles_fetch_lock:
-        now = datetime.now(tz=SYDNEY_TZ)
-        cached_at = _vehicles_cache["fetched_at"]
-        if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
-            return [dict(v) for v in _vehicles_cache["vehicles"]]
-
-        vfeed = fetch_vehicle_feed()
-        vehicles = extract_vehicles(vfeed, agency_names, headsign_store)
-        _vehicles_cache.update(vehicles=vehicles, fetched_at=now)
-        return [dict(v) for v in vehicles]
+    vfeed = fetch_vehicle_feed()
+    vehicles = extract_vehicles(vfeed, agency_names, trip_headsigns)
+    _vehicles_cache.update(vehicles=vehicles, fetched_at=now)
+    return [dict(v) for v in vehicles]
 
 
 def _fetch_one_day_into(date_str, cutoff, local_cells):
@@ -829,7 +661,7 @@ def compute_delay_data(args):
     q_operator = args.get("operator", "").strip().lower()
     apply_bounds = args.get("bounds", "1") == "1"
 
-    all_rows, agency_names, headsign_store, agency_error = get_all_rows_cached()
+    all_rows, agency_names, trip_headsigns, agency_error = get_all_rows_cached()
 
     rows = [r for r in all_rows if not (hide_anomalies and r["anomaly"])]
 
@@ -853,7 +685,7 @@ def compute_delay_data(args):
         "q_stop": q_stop,
         "q_operator": q_operator,
         "agency_names": agency_names,
-        "headsign_store": headsign_store,
+        "trip_headsigns": trip_headsigns,
         "agency_error": agency_error,
         "all_rows": all_rows,
         "latest_by_trip": latest_by_trip,
@@ -866,7 +698,7 @@ def compute_delay_data(args):
 
 def compute_vehicles(data):
     try:
-        vehicles = get_vehicles_cached(data["agency_names"], data["headsign_store"])
+        vehicles = get_vehicles_cached(data["agency_names"], data["trip_headsigns"])
     except requests.RequestException as e:
         return [], str(e)
 
@@ -1117,6 +949,21 @@ PAGE = """
 
     const HEAT_GRADIENT = { 0.0: '#0d0887', 0.3: '#7e03a8', 0.55: '#cc4778', 0.75: '#f89441', 1.0: '#f0f921' };
 
+    // --- Zoom-locked heat sizing -----------------------------------------
+    //
+    // Both heat layers size their radius/blur in METRES, converted to
+    // screen pixels at the current zoom, so at high zoom a blob represents
+    // a fixed geographic area (~220m diameter) regardless of zoom level.
+    //
+    // Pure metre-based sizing breaks at LOW zoom: at a whole-Sydney view,
+    // 220m is only ~3px, so every cell collapses into pixel noise. The fix
+    // is a FLOOR on the computed pixel radius: below the crossover zoom,
+    // blobs stay at a fixed pixel size so dense corridors remain visible.
+    // Above the crossover zoom, metre-based sizing takes over.
+    //
+    // Tune HEAT_MIN_RADIUS_PX up for chunkier blobs when zoomed out, down
+    // for finer structure. Both layers share the same sizing so live and
+    // historical look identical at every zoom level.
     const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
     const HEAT_MIN_RADIUS_PX = 12, HEAT_MIN_BLUR_PX = 10;
 

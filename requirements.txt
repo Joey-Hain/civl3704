@@ -1,5 +1,5 @@
 flask
-gunicorn==23.0.0
+gunicorn
 requests
 python-dotenv
 gtfs-realtime-bindings
