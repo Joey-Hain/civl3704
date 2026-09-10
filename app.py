@@ -739,6 +739,7 @@ PAGE = """
     margin: 4px 0 2px 22px;
   }
   #histWindowPicker select { font: inherit; }
+  #histWindowStatus { font: 11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color: #b3261e; margin: 2px 0 2px 22px; max-width: 220px; }
 </style>
 </head>
 <body>
@@ -833,12 +834,18 @@ PAGE = """
     // at low density up through red (#e60b09) at high density.
     const HEAT_GRADIENT = { 0.2: '#e9d022', 0.6: '#f2650f', 1.0: '#e60b09' };
 
-    // --- Live density heatmap (positions only, no delay weighting) ---
+    // --- Live density heatmap (positions only, no delay weighting).
+    // radius/blur are in SCREEN PIXELS at the current zoom, not metres —
+    // small values leave visible gaps between points ("discrete blobs")
+    // rather than a smooth continuous field. Bumped up substantially. ---
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.35, gradient: HEAT_GRADIENT });
+    const heatLayer = L.heatLayer([], { radius: 32, blur: 24, maxZoom: 15, minOpacity: 0.35, gradient: HEAT_GRADIENT });
 
-    // --- Historical density heatmap, from the gtfs-r-scrape repo ---
-    const histHeatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.25, gradient: HEAT_GRADIENT });
+    // --- Historical density heatmap, from the gtfs-r-scrape repo. Even
+    // larger radius than the live layer: hourly collection means far fewer
+    // total points than 15s live polling, so more per-point spread is
+    // needed for those sparser points to visually merge into regions. ---
+    const histHeatLayer = L.heatLayer([], { radius: 48, blur: 34, maxZoom: 14, minOpacity: 0.25, gradient: HEAT_GRADIENT });
 
     const layersControl = L.control.layers(null, {
       'Bus markers': markersLayer,
@@ -846,8 +853,10 @@ PAGE = """
       'Vehicle density heatmap (historical)': histHeatLayer
     }, { collapsed: false }).addTo(map);
 
-    // Inject a small time-window picker under the layer control, only
-    // relevant to the historical layer.
+    // Inject a small time-window picker + status line under the layer
+    // control, only relevant to the historical layer. The status line
+    // shows point count or the actual fetch/data error visibly, rather
+    // than only logging to the console where it's easy to miss.
     const pickerDiv = document.createElement('div');
     pickerDiv.id = 'histWindowPicker';
     pickerDiv.innerHTML = `
@@ -859,19 +868,31 @@ PAGE = """
       </select>
     `;
     layersControl.getContainer().appendChild(pickerDiv);
+    const statusDiv = document.createElement('div');
+    statusDiv.id = 'histWindowStatus';
+    layersControl.getContainer().appendChild(statusDiv);
     // Stop map drag/zoom from hijacking clicks on the picker
     L.DomEvent.disableClickPropagation(pickerDiv);
 
     async function loadHistoricalHeatmap() {
       const windowHours = document.getElementById('histWindowSelect').value;
+      statusDiv.textContent = 'Loading…';
+      statusDiv.style.color = '#666';
       try {
         const res = await fetch('/api/heatmap?window=' + windowHours);
         const data = await res.json();
-        histHeatLayer.setLatLngs(data.points || []);
+        const points = data.points || [];
+        histHeatLayer.setLatLngs(points);
         if (data.error) {
-          console.warn('Historical heatmap:', data.error);
+          statusDiv.textContent = data.error;
+          statusDiv.style.color = '#b3261e';
+        } else {
+          statusDiv.textContent = points.length + ' historical points loaded';
+          statusDiv.style.color = '#666';
         }
       } catch (e) {
+        statusDiv.textContent = 'Fetch failed: ' + e;
+        statusDiv.style.color = '#b3261e';
         console.warn('Historical heatmap fetch failed', e);
       }
     }
