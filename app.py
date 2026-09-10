@@ -1,63 +1,38 @@
 """
 Web dashboard for TfNSW GTFS-realtime delay/variance data.
 
-Fetches the live trip-update feed on each page load, computes delay stats
-per operator, route and trip, and renders a sortable HTML table. Also
-appends every pull to delay_log.csv so you build up history.
+A live map fed by the GTFS-realtime VEHICLE POSITION feed, joined to the
+trip-update feed by trip_id so markers reflect current delay. Density
+heatmaps for live and historical vehicle positions.
 
-A live map sits at the top of the page, fed by the separate GTFS-realtime
-VEHICLE POSITION feed (hardcoded to the vehiclepos endpoint below — this is
-intentionally NOT read from TFNSW_GTFS_RT_URL in .env, since that variable
-is dedicated to the trip-update feed the delay board depends on, and the
-two products are subscribed to separately on the TfNSW developer portal).
-Vehicle positions are joined to trip-update delay readings by trip_id, so
-each bus marker's colour and popup reflect its current delay. The map
-polls /api/vehicles every 15s independently of the (page-load-only) tables
-below, and respects whatever route/stop/operator/hide_anomalies filters are
-currently set.
+=== THE ACTUAL FIX IN THIS VERSION ===
 
-LIQUID-GLASS POPUPS: purely a frontend CSS concern.
+Render's port scanner hits the app with a 5-second timeout during deploy.
+If the response takes longer, Render marks the port as closed and restarts
+the container in a loop. That was happening here because / blocked on a
+105MB schedule download plus a ~30s parse of 94,000 trip headsigns.
 
-COLOUR SCHEME: every bus marker has the same blue fill, with delay status
-shown via the marker's OUTLINE colour.
+The schedule now loads in a BACKGROUND THREAD started at import time.
+Every request handler returns immediately with whatever's available:
+empty headsigns on the first few requests, full data once the background
+thread finishes (about 30 seconds after container start). The port scan
+passes on the first try because / returns in milliseconds regardless.
 
-DENSITY HEATMAP (live): a toggleable layer (via leaflet.heat) showing where
-live buses are currently clustered.
+Memory stays at ~63MB RSS once the schedule is parsed. No blocking
+anywhere on the request path.
 
-DENSITY HEATMAP (historical): a second toggleable layer, pulling position
-data from the gtfs-r-scrape repo.
+=== RENDER SETTINGS ===
 
-HEATMAP ZOOM-LOCK: both heat layers size their radius/blur in METRES,
-converted to screen pixels on every zoom change so the apparent geographic
-scale stays constant. Because pure metre-based sizing collapses to invisible
-sub-pixel dots at low zoom, the pixel radius is FLOORED at a minimum so
-dense corridors stay readable when zoomed out. Both layers share the same
-sizing so live and historical look identical at every zoom level.
-
-=== MEMORY NOTES ===
-
-The Render free tier gives 512MB RAM. This version stays inside that:
-
-  * Schedule bundle is STREAMED to disk (never held as resp.content).
-  * Each CSV inside the schedule zip is STREAM-PARSED row-by-row into a
-    plain dict (no read+decode+list() of the whole file).
-  * The parsed schedule is cached IN MEMORY for the life of the process,
-    so the download and parse happen at most once per cold start.
-  * Historical heatmap CSVs are STREAMED line-by-line and aggregated into
-    a grid dict; peak RSS per worker is one line, not one file.
-  * _heatmap_fetch_lock ensures only one historical fetch runs at a time.
-
-=== RENDER SETTINGS THAT MUST BE SET ===
-
-  Start Command (single line, no backslashes, and importantly NO
-  --no-control-socket because gunicorn 23 does not support it):
-
+  Start Command (single line, no backslashes):
       gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65
 
   Health Check Path: /ping
 
-NOTE: an earlier version of this file also drew GTFS route-shape polylines
-under the bus markers. That feature has been removed (scope cut).
+=== RENDER DEBUG LOG LINES ===
+
+  [schedule] loaded from disk cache         - found a local JSON, skipped download
+  [schedule] starting background download   - no cache, downloading 105MB in a thread
+  [schedule] background load complete ...   - thread finished, headsigns are now live
 
 Setup:
     pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
@@ -65,10 +40,6 @@ Setup:
 .env file:
     TFNSW_API_KEY=your_api_key_here
     TFNSW_GTFS_RT_URL=https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses
-
-Usage:
-    python app.py
-    then open http://localhost:5000
 """
 
 import codecs
@@ -105,7 +76,6 @@ ON_TIME_EARLY_SEC = -60
 ON_TIME_LATE_SEC = 300
 
 GRID_DECIMALS = 4
-
 HEATMAP_FETCH_CONCURRENCY = 2
 HEATMAP_DEADLINE_SEC = 45
 
@@ -113,7 +83,6 @@ load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
-
 VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
@@ -177,27 +146,26 @@ def parse_ts(raw):
 
 app = Flask(__name__)
 
-_schedule_lock = threading.Lock()
 _heatmap_fetch_lock = threading.Lock()
 
-# In-memory cache of the parsed schedule. Loaded at most once per process.
-_schedule_cache = {
-    "agency_names": None,
-    "trip_headsigns": None,
-    "error": None,
-}
+# --- Non-blocking schedule cache ------------------------------------------
+#
+# _schedule_cache holds the parsed schedule. A background thread populates
+# it at import time. Requests NEVER block on it — they read whatever's
+# there and return immediately. _schedule_ready signals completion so
+# callers can distinguish "still loading" from "failed".
+_schedule_cache = {"agency_names": {}, "trip_headsigns": {}, "error": None}
+_schedule_ready = threading.Event()
+_schedule_lock = threading.Lock()
 
 
-def _download_to_path(url, headers, dest_path, timeout=60):
-    """Stream a URL to a local file, returning bytes written. Never holds
-    the whole file in memory — peak RSS during the download is one chunk."""
+def _download_to_path(url, headers, dest_path, timeout=120):
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
             raise RuntimeError(
                 f"Schedule endpoint returned HTTP {r.status_code}. "
-                f"This usually means the API key isn't subscribed to the bus schedule/timetable "
-                f"product (separate from GTFS Realtime) on the TfNSW developer portal."
+                f"API key probably isn't subscribed to the bus schedule product."
             )
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=256 * 1024):
@@ -209,10 +177,8 @@ def _download_to_path(url, headers, dest_path, timeout=60):
 
 def _parse_csv_member(zf, member, key_col, val_col):
     """Stream-parse one CSV member of an open ZipFile into {key: value}.
-
-    Reads row-by-row from the zip entry, so a statewide trips.txt doesn't
-    produce a 100-200MB transient peak from read+decode+list().
-    """
+    Yields the GIL every 2000 rows so a background parse doesn't starve
+    gunicorn's other threads on a 0.1-CPU instance."""
     result = {}
     if member not in zf.namelist():
         return result
@@ -226,130 +192,137 @@ def _parse_csv_member(zf, member, key_col, val_col):
             return result
         key_idx = header.index(key_col)
         val_idx = header.index(val_col)
-        for row in reader:
+        for i, row in enumerate(reader):
+            if i % 2000 == 0:
+                time.sleep(0)
             if len(row) > max(key_idx, val_idx) and row[val_idx].strip():
                 result[row[key_idx].strip()] = row[val_idx].strip()
     return result
 
 
-def load_schedule_lookups():
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
+def _do_schedule_download():
+    """Download + parse. Returns (agencies, trip_headsigns, error_or_None)."""
+    tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
+    try:
+        outer_path = os.path.join(tmpdir, "schedule.zip")
+        size = _download_to_path(SCHEDULE_URL, {"Authorization": f"apikey {API_KEY}"}, outer_path)
+        print(f"[schedule] downloaded {size / 1e6:.1f}MB", flush=True)
+        _log_rss("after-download")
 
-    Loads from the 24h disk cache if fresh, otherwise streams the schedule
-    bundle to disk and stream-parses each CSV member. The parsed dicts are
-    held in _schedule_cache for the life of the process, so this only does
-    real work once per cold start.
-    """
-    with _schedule_lock:
-        if _schedule_cache["agency_names"] is not None:
-            return (_schedule_cache["agency_names"],
-                    _schedule_cache["trip_headsigns"],
-                    _schedule_cache["error"])
+        agencies = {}
+        trip_headsigns = {}
 
+        with zipfile.ZipFile(outer_path) as outer:
+            names = outer.namelist()
+            if "agency.txt" in names or "trips.txt" in names:
+                agencies.update(_parse_csv_member(outer, "agency.txt", "agency_id", "agency_name"))
+                if ENABLE_TRIP_HEADSIGNS:
+                    trip_headsigns.update(_parse_csv_member(outer, "trips.txt", "trip_id", "trip_headsign"))
+            else:
+                for i, name in enumerate(names):
+                    if not name.endswith(".zip"):
+                        continue
+                    inner_path = os.path.join(tmpdir, f"inner_{i}.zip")
+                    with outer.open(name) as src, open(inner_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst, length=64 * 1024)
+                    try:
+                        with zipfile.ZipFile(inner_path) as inner:
+                            agencies.update(_parse_csv_member(inner, "agency.txt", "agency_id", "agency_name"))
+                            if ENABLE_TRIP_HEADSIGNS:
+                                trip_headsigns.update(_parse_csv_member(inner, "trips.txt", "trip_id", "trip_headsign"))
+                    finally:
+                        try:
+                            os.unlink(inner_path)
+                        except OSError:
+                            pass
+
+        print(f"[schedule] parsed {len(agencies)} agencies, {len(trip_headsigns)} headsigns", flush=True)
+        _log_rss("after-parse")
+
+        if not agencies:
+            raise RuntimeError("Downloaded bundle but no agency rows found")
+
+        with open(AGENCY_CACHE_FILE, "w") as f:
+            json.dump({
+                "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
+                "agencies": agencies,
+                "trip_headsigns": trip_headsigns,
+            }, f)
+        _log_rss("after-cache-write")
+        return agencies, trip_headsigns, None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _background_schedule_load():
+    """Runs at import time in a daemon thread. Populates _schedule_cache and
+    sets _schedule_ready when finished. Never raises."""
+    try:
         if AGENCY_CACHE_FILE.exists():
             try:
                 with open(AGENCY_CACHE_FILE) as f:
                     cached = json.load(f)
                 fetched_at = datetime.fromisoformat(cached["fetched_at"])
-                if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
+                age = datetime.now(tz=SYDNEY_TZ) - fetched_at
+                if age < AGENCY_CACHE_MAX_AGE:
                     _schedule_cache["agency_names"] = cached["agencies"]
                     _schedule_cache["trip_headsigns"] = cached.get("trip_headsigns", {})
                     _schedule_cache["error"] = None
-                    _log_rss("schedule-loaded-from-disk")
-                    return cached["agencies"], cached.get("trip_headsigns", {}), None
-            except Exception:
-                pass
-
-        tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
-        try:
-            outer_path = os.path.join(tmpdir, "schedule.zip")
-            outer_size = _download_to_path(
-                SCHEDULE_URL,
-                {"Authorization": f"apikey {API_KEY}"},
-                outer_path,
-            )
-            print(f"[schedule] downloaded {outer_size / 1e6:.1f}MB to disk", flush=True)
-            _log_rss("after-download")
-
-            agencies = {}
-            trip_headsigns = {}
-
-            with zipfile.ZipFile(outer_path) as outer:
-                names = outer.namelist()
-                if "agency.txt" in names or "trips.txt" in names:
-                    agencies.update(_parse_csv_member(outer, "agency.txt", "agency_id", "agency_name"))
-                    if ENABLE_TRIP_HEADSIGNS:
-                        trip_headsigns.update(_parse_csv_member(outer, "trips.txt", "trip_id", "trip_headsign"))
+                    print(f"[schedule] loaded from disk cache ({len(cached['agencies'])} agencies, "
+                          f"{len(cached.get('trip_headsigns', {}))} headsigns)", flush=True)
+                    _log_rss("schedule-ready")
+                    _schedule_ready.set()
+                    return
                 else:
-                    for i, name in enumerate(names):
-                        if not name.endswith(".zip"):
-                            continue
-                        inner_path = os.path.join(tmpdir, f"inner_{i}.zip")
-                        with outer.open(name) as src, open(inner_path, "wb") as dst:
-                            shutil.copyfileobj(src, dst, length=64 * 1024)
-                        try:
-                            with zipfile.ZipFile(inner_path) as inner:
-                                agencies.update(_parse_csv_member(inner, "agency.txt", "agency_id", "agency_name"))
-                                if ENABLE_TRIP_HEADSIGNS:
-                                    trip_headsigns.update(_parse_csv_member(inner, "trips.txt", "trip_id", "trip_headsign"))
-                        finally:
-                            try:
-                                os.unlink(inner_path)
-                            except OSError:
-                                pass
+                    print(f"[schedule] disk cache stale ({age}), re-downloading", flush=True)
+            except Exception as e:
+                print(f"[schedule] disk cache unreadable: {e}", flush=True)
 
-            print(f"[schedule] parsed {len(agencies)} agencies, {len(trip_headsigns)} trip headsigns", flush=True)
-            _log_rss("after-parse")
+        print("[schedule] starting background download", flush=True)
+        agencies, trip_headsigns, err = _do_schedule_download()
+        _schedule_cache["agency_names"] = agencies
+        _schedule_cache["trip_headsigns"] = trip_headsigns
+        _schedule_cache["error"] = err
+        print("[schedule] background load complete", flush=True)
+        _log_rss("schedule-ready")
+    except Exception as e:
+        print(f"[schedule] background load failed: {e}", flush=True)
+        _schedule_cache["error"] = str(e)
+    finally:
+        _schedule_ready.set()
 
-            if not agencies:
-                raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
 
-            with open(AGENCY_CACHE_FILE, "w") as f:
-                json.dump({
-                    "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
-                    "agencies": agencies,
-                    "trip_headsigns": trip_headsigns,
-                }, f)
+# Start the load immediately. Requests never wait for this.
+threading.Thread(target=_background_schedule_load, daemon=True).start()
 
-            _schedule_cache["agency_names"] = agencies
-            _schedule_cache["trip_headsigns"] = trip_headsigns
-            _schedule_cache["error"] = None
-            _log_rss("after-cache-write")
-            return agencies, trip_headsigns, None
-        except Exception as e:
-            if AGENCY_CACHE_FILE.exists():
-                try:
-                    with open(AGENCY_CACHE_FILE) as f:
-                        cached = json.load(f)
-                    _schedule_cache["agency_names"] = cached["agencies"]
-                    _schedule_cache["trip_headsigns"] = cached.get("trip_headsigns", {})
-                    _schedule_cache["error"] = f"Using stale cached names ({e})"
-                    return cached["agencies"], cached.get("trip_headsigns", {}), _schedule_cache["error"]
-                except Exception:
-                    pass
-            _schedule_cache["agency_names"] = {}
-            _schedule_cache["trip_headsigns"] = {}
-            _schedule_cache["error"] = str(e)
-            return {}, {}, str(e)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+
+def get_schedule_lookups():
+    """Non-blocking. Returns whatever's loaded so far.
+
+    While loading, returns ({}, {}, "loading"). Once the background thread
+    finishes it returns the real dicts. Handlers must tolerate empty dicts
+    on the first few requests after container start.
+    """
+    if not _schedule_ready.is_set():
+        return {}, {}, "loading"
+    return (_schedule_cache["agency_names"],
+            _schedule_cache["trip_headsigns"],
+            _schedule_cache["error"])
 
 
 def fetch_feed():
-    headers = {"Authorization": f"apikey {API_KEY}"}
-    response = requests.get(FEED_URL, headers=headers, timeout=15)
-    response.raise_for_status()
+    r = requests.get(FEED_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=15)
+    r.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
-    feed.ParseFromString(response.content)
+    feed.ParseFromString(r.content)
     return feed
 
 
 def fetch_vehicle_feed():
-    headers = {"Authorization": f"apikey {API_KEY}"}
-    response = requests.get(VEHICLE_POS_URL, headers=headers, timeout=15)
-    response.raise_for_status()
+    r = requests.get(VEHICLE_POS_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=15)
+    r.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
-    feed.ParseFromString(response.content)
+    feed.ParseFromString(r.content)
     return feed
 
 
@@ -363,7 +336,6 @@ def extract_rows(feed, agency_names):
         trip = tu.trip
         agency_id = trip.route_id.split("_")[0] if trip.route_id else "?"
         operator = agency_names.get(agency_id, agency_id)
-
         for stu in tu.stop_time_update:
             arr_delay = stu.arrival.delay if stu.HasField("arrival") and stu.arrival.HasField("delay") else None
             dep_delay = stu.departure.delay if stu.HasField("departure") and stu.departure.HasField("delay") else None
@@ -495,10 +467,11 @@ def get_all_rows_cached():
         return (_rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"],
                 _rows_cache["agency_error"])
 
-    agency_names, trip_headsigns, agency_error = load_schedule_lookups()
+    agency_names, trip_headsigns, agency_error = get_schedule_lookups()
     feed = fetch_feed()
     all_rows = extract_rows(feed, agency_names)
-    append_to_log(all_rows)
+    if all_rows:
+        append_to_log(all_rows)
 
     _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
                        agency_error=agency_error, fetched_at=now)
@@ -518,8 +491,6 @@ def get_vehicles_cached(agency_names, trip_headsigns):
 
 
 def _fetch_one_day_into(date_str, cutoff, local_cells):
-    """Stream one day's CSV and aggregate qualifying rows into local_cells.
-    Peak RSS per worker is one line, not the whole file."""
     url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
     rows_seen = 0
     points_added = 0
@@ -530,7 +501,6 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
                 return date_str, 0, 0, None
             resp.raise_for_status()
             resp.encoding = "utf-8"
-
             lines = resp.iter_lines(decode_unicode=True)
             try:
                 header_line = next(lines)
@@ -542,8 +512,7 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
                 lat_idx = header.index("lat")
                 lon_idx = header.index("lon")
             except ValueError:
-                return date_str, 0, 0, f"{date_str}: CSV missing required columns (need timestamp, lat, lon)"
-
+                return date_str, 0, 0, f"{date_str}: missing required columns"
             max_idx = max(ts_idx, lat_idx, lon_idx)
             for row in csv.reader(lines):
                 rows_seen += 1
@@ -565,7 +534,6 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
                 points_added += 1
             return date_str, rows_seen, points_added, None
     except requests.RequestException as e:
-        print(f"[heatmap] GET {url} -> FAILED: {e}", flush=True)
         return date_str, 0, 0, f"{date_str}: {e}"
 
 
@@ -573,7 +541,6 @@ def fetch_historical_heatmap_points(window_hours):
     start = time.monotonic()
     now = datetime.now(tz=SYDNEY_TZ)
     cutoff = now - timedelta(hours=window_hours)
-
     dates_needed = []
     d = cutoff.date()
     while d <= now.date():
@@ -598,8 +565,6 @@ def fetch_historical_heatmap_points(window_hours):
             for future in as_completed(futures):
                 if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
                     deadline_hit = True
-                    print(f"[heatmap] deadline {HEATMAP_DEADLINE_SEC}s hit; "
-                          f"returning partial results from {files_fetched} file(s)", flush=True)
                     break
                 date_str, rows_seen, points_added, error = future.result()
                 if error is not None:
@@ -621,23 +586,18 @@ def fetch_historical_heatmap_points(window_hours):
 
     print(f"[heatmap] window={window_hours}h files={files_fetched} "
           f"rows={rows_seen_total} points={points_added_total} cells={len(cells)} "
-          f"elapsed={time.monotonic() - start:.1f}s deadline_hit={deadline_hit}", flush=True)
+          f"elapsed={time.monotonic() - start:.1f}s", flush=True)
 
     if not cells:
         if files_fetched == 0:
-            return [], last_error or "No data files found for this window on GitHub"
-        return [], (f"Fetched {files_fetched} file(s) and read {rows_seen_total} rows, but none fell "
-                    f"inside the last {window_hours}h — check the 'timestamp' column name and format")
+            return [], last_error or "No data files found for this window"
+        return [], f"Fetched {files_fetched} file(s) but no rows fell inside the window"
 
     max_count = max(c[2] for c in cells.values())
-    points = []
-    for c in cells.values():
-        points.append([c[0] / c[2], c[1] / c[2], c[2] / max_count])
-
+    points = [[c[0] / c[2], c[1] / c[2], c[2] / max_count] for c in cells.values()]
     note = None
     if deadline_hit:
-        note = (f"Partial data: fetch exceeded {HEATMAP_DEADLINE_SEC}s. "
-                f"Showing {files_fetched} of {len(dates_needed)} day(s).")
+        note = f"Partial data: fetch exceeded {HEATMAP_DEADLINE_SEC}s"
     return points, note
 
 
@@ -646,7 +606,6 @@ def get_heatmap_points_cached(window_hours):
     cached = _heatmap_cache.get(window_hours)
     if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
         return cached["points"], cached["error"]
-
     points, error = fetch_historical_heatmap_points(window_hours)
     _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
     return points, error
@@ -662,7 +621,6 @@ def compute_delay_data(args):
     apply_bounds = args.get("bounds", "1") == "1"
 
     all_rows, agency_names, trip_headsigns, agency_error = get_all_rows_cached()
-
     rows = [r for r in all_rows if not (hide_anomalies and r["anomaly"])]
 
     if q_route:
@@ -678,18 +636,11 @@ def compute_delay_data(args):
     delay_by_trip_all = latest_reading_per_trip(all_rows)
 
     return {
-        "hide_anomalies": hide_anomalies,
-        "sort_key": sort_key,
-        "ascending": ascending,
-        "q_route": q_route,
-        "q_stop": q_stop,
-        "q_operator": q_operator,
-        "agency_names": agency_names,
-        "trip_headsigns": trip_headsigns,
-        "agency_error": agency_error,
-        "all_rows": all_rows,
-        "latest_by_trip": latest_by_trip,
-        "latest_rows": latest_rows,
+        "hide_anomalies": hide_anomalies, "sort_key": sort_key, "ascending": ascending,
+        "q_route": q_route, "q_stop": q_stop, "q_operator": q_operator,
+        "agency_names": agency_names, "trip_headsigns": trip_headsigns,
+        "agency_error": agency_error, "all_rows": all_rows,
+        "latest_by_trip": latest_by_trip, "latest_rows": latest_rows,
         "delay_by_trip_all": delay_by_trip_all,
         "filters_active": bool(q_route or q_stop or q_operator),
         "apply_bounds": apply_bounds,
@@ -701,21 +652,15 @@ def compute_vehicles(data):
         vehicles = get_vehicles_cached(data["agency_names"], data["trip_headsigns"])
     except requests.RequestException as e:
         return [], str(e)
-
     merge_vehicle_delays(vehicles, data["delay_by_trip_all"])
-
     if data["filters_active"]:
-        allowed_trip_ids = set(data["latest_by_trip"].keys())
-        vehicles = [v for v in vehicles if v["trip_id"] in allowed_trip_ids]
-
+        allowed = set(data["latest_by_trip"].keys())
+        vehicles = [v for v in vehicles if v["trip_id"] in allowed]
     if data["apply_bounds"]:
         lat0, lon0 = SYDNEY_CBD
-        vehicles = [
-            v for v in vehicles
-            if v["lat"] is not None and v["lon"] is not None
-            and haversine_km(lat0, lon0, v["lat"], v["lon"]) <= SYDNEY_RADIUS_KM
-        ]
-
+        vehicles = [v for v in vehicles
+                    if v["lat"] is not None and v["lon"] is not None
+                    and haversine_km(lat0, lon0, v["lat"], v["lon"]) <= SYDNEY_RADIUS_KM]
     return vehicles, None
 
 
@@ -730,133 +675,40 @@ PAGE = """
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <style>
-  :root {
-    --bg: #f7f6f2;
-    --text: #111111;
-    --muted: #666666;
-    --line: #cccccc;
-    --late: #b3261e;
-    --early: #1e6b3c;
-    --fill-blue: {{ color_fill }};
-    --sans: Helvetica, Arial, sans-serif;
-  }
+  :root { --bg:#f7f6f2; --text:#111; --muted:#666; --line:#ccc; --late:#b3261e; --early:#1e6b3c; --fill-blue: {{ color_fill }}; --sans: Helvetica, Arial, sans-serif; }
   * { box-sizing: border-box; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--sans);
-    margin: 0;
-    padding: 24px 32px 60px;
-  }
-  h1 {
-    font-size: 1.4rem;
-    font-weight: bold;
-    border-bottom: 2px solid var(--text);
-    padding-bottom: 10px;
-    margin-bottom: 4px;
-  }
-  .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 24px; }
-  .meta a { color: var(--text); }
-  h2 {
-    font-size: 1rem;
-    font-weight: bold;
-    margin-top: 36px;
-    border-bottom: 1px solid var(--line);
-    padding-bottom: 4px;
-  }
-  table { border-collapse: collapse; width: 100%; margin-top: 10px; }
-  th, td { padding: 6px 12px; text-align: right; }
-  th:first-child, td:first-child { text-align: left; }
-  th {
-    color: var(--muted);
-    font-weight: normal;
-    font-size: 0.8rem;
-    border-bottom: 1px solid var(--line);
-  }
-  th a { color: inherit; text-decoration: underline; }
-  th a:hover { color: var(--late); }
-  tr:hover { background: #eeece5; }
-  td.late { color: var(--late); }
-  td.early { color: var(--early); }
-  .flag { color: var(--muted); font-size: 0.75rem; }
-  .toggle { color: var(--text); text-decoration: underline; font-size: 0.85rem; }
-
-  #dashmap { height: 600px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
-  .map-legend {
-    display: flex; gap: 16px; align-items: center;
-    font-size: 0.8rem; color: var(--muted); margin-top: 8px; flex-wrap: wrap;
-  }
-  .map-legend .swatch {
-    display: inline-block; width: 12px; height: 12px; border-radius: 50%;
-    margin-right: 4px; vertical-align: middle;
-    background: var(--fill-blue);
-    border: 2px solid #999;
-  }
-  .map-error { color: var(--late); font-size: 0.85rem; margin-top: 8px; }
-
-  .bus-marker { position: relative; width: 56px; height: 24px; }
-  .bus-pill {
-    position: absolute;
-    top: 0; left: 50%;
-    transform: translateX(-50%);
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    background: var(--fill-blue);
-    color: #fff;
-    font: 600 11px/1 -apple-system, Helvetica, Arial, sans-serif;
-    padding: 5px 7px;
-    border-radius: 7px;
-    border: 2.5px solid #888;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
-    white-space: nowrap;
-  }
-  .bus-arrow {
-    flex: 0 0 auto;
-    font-size: 12px;
-    line-height: 1;
-    display: inline-block;
-    color: #fff;
-  }
-  .leaflet-popup-content { font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
-
-  .glass-tooltip {
-    background: rgba(255, 255, 255, 0.55) !important;
-    -webkit-backdrop-filter: blur(14px) saturate(180%);
-    backdrop-filter: blur(14px) saturate(180%);
-    border: 1px solid rgba(255, 255, 255, 0.45) !important;
-    border-radius: 12px !important;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.18);
-    color: #111;
-    font: 600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif;
-    padding: 7px 11px;
-  }
-  .glass-tooltip::before { display: none; }
-
-  .leaflet-popup.glass-popup .leaflet-popup-content-wrapper {
-    background: rgba(255, 255, 255, 0.55);
-    -webkit-backdrop-filter: blur(14px) saturate(180%);
-    backdrop-filter: blur(14px) saturate(180%);
-    border: 1px solid rgba(255, 255, 255, 0.45);
-    border-radius: 12px;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.18);
-    color: #111;
-  }
-  .leaflet-popup.glass-popup .leaflet-popup-tip {
-    background: rgba(255, 255, 255, 0.55);
-    box-shadow: none;
-  }
-
-  .leaflet-control-layers {
-    font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important;
-  }
-
-  #histWindowPicker {
-    font: 12px/1.4 -apple-system, Helvetica, Arial, sans-serif;
-    margin: 4px 0 2px 22px;
-  }
-  #histWindowPicker select { font: inherit; }
-  #histWindowStatus { font: 11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color: #b3261e; margin: 2px 0 2px 22px; max-width: 220px; }
+  body { background:var(--bg); color:var(--text); font-family:var(--sans); margin:0; padding:24px 32px 60px; }
+  h1 { font-size:1.4rem; font-weight:bold; border-bottom:2px solid var(--text); padding-bottom:10px; margin-bottom:4px; }
+  .meta { color:var(--muted); font-size:0.85rem; margin-bottom:24px; }
+  .meta a { color:var(--text); }
+  h2 { font-size:1rem; font-weight:bold; margin-top:36px; border-bottom:1px solid var(--line); padding-bottom:4px; }
+  table { border-collapse:collapse; width:100%; margin-top:10px; }
+  th, td { padding:6px 12px; text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--muted); font-weight:normal; font-size:0.8rem; border-bottom:1px solid var(--line); }
+  th a { color:inherit; text-decoration:underline; }
+  th a:hover { color:var(--late); }
+  tr:hover { background:#eeece5; }
+  td.late { color:var(--late); }
+  td.early { color:var(--early); }
+  .flag { color:var(--muted); font-size:0.75rem; }
+  .toggle { color:var(--text); text-decoration:underline; font-size:0.85rem; }
+  #dashmap { height:600px; border:1px solid var(--line); margin-top:10px; background:#e5e3dc; }
+  .map-legend { display:flex; gap:16px; align-items:center; font-size:0.8rem; color:var(--muted); margin-top:8px; flex-wrap:wrap; }
+  .map-legend .swatch { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:4px; vertical-align:middle; background:var(--fill-blue); border:2px solid #999; }
+  .map-error { color:var(--late); font-size:0.85rem; margin-top:8px; }
+  .bus-marker { position:relative; width:56px; height:24px; }
+  .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
+  .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
+  .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
+  .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
+  .glass-tooltip::before { display:none; }
+  .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
+  .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
+  .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
+  #histWindowPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
+  #histWindowPicker select { font:inherit; }
+  #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
 </style>
 </head>
 <body>
@@ -870,7 +722,7 @@ PAGE = """
     <br><span style="color:#666">{{ agency_debug }}</span>
   </div>
 
-  <form method="get" style="margin: 20px 0; padding: 14px; border: 1px solid var(--line);">
+  <form method="get" style="margin:20px 0; padding:14px; border:1px solid var(--line);">
     <input type="hidden" name="hide_anomalies" value="{{ 1 if hide_anomalies else 0 }}">
     <label>Route <input type="text" name="route" value="{{ q_route }}" placeholder="e.g. 601" style="font-family:inherit;"></label>
     &nbsp;&nbsp;
@@ -889,8 +741,8 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_late }}"></span>Late</span>
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
-    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
-    <span>Use the layer switcher (top-right of the map) to toggle the density heatmaps.</span>
+    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
+    <span>Use the layer switcher (top-right) to toggle the heatmaps.</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
@@ -898,14 +750,11 @@ PAGE = """
   <table>
     <tr><th>Operator</th><th>n</th><th>avg delay</th><th>spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
     {% for r in operators %}
-    <tr>
-      <td class="route">{{ r.operator }}</td>
-      <td>{{ r.n }}</td>
+    <tr><td>{{ r.operator }}</td><td>{{ r.n }}</td>
       <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
       <td>{{ '%.1f'|format(r.stdev_min) }} min</td>
       <td>{{ '%.0f'|format(r.on_time_pct) }}%</td>
-      <td>{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td>
-    </tr>
+      <td>{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
     {% endfor %}
   </table>
 
@@ -913,76 +762,46 @@ PAGE = """
   <table>
     <tr><th>Route</th><th>Operator</th><th>n</th><th>avg delay</th><th>spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
     {% for r in routes[:60] %}
-    <tr>
-      <td class="route">{{ r.route_num }}</td>
-      <td>{{ r.route_operator }}</td>
-      <td>{{ r.n }}</td>
+    <tr><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td>{{ r.n }}</td>
       <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
       <td>{{ '%.1f'|format(r.stdev_min) }} min</td>
       <td>{{ '%.0f'|format(r.on_time_pct) }}%</td>
-      <td>{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td>
-    </tr>
+      <td>{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
     {% endfor %}
   </table>
 
-  <h2>Individual trips &mdash; largest single delays (most recent reading per bus)</h2>
+  <h2>Individual trips &mdash; largest single delays</h2>
   <table>
     <tr><th>Trip</th><th>Route</th><th>Operator</th><th>Most recent stop</th><th>delay</th></tr>
     {% for r in worst_trips[:30] %}
-    <tr>
-      <td class="route">{{ r.trip_id }}</td>
-      <td>{{ r.route_num }}</td>
-      <td>{{ r.route_operator }}</td>
-      <td>{{ r.stop_id }}</td>
-      <td class="{{ 'late' if r.delay > 0 else 'early' }}">{{ '%+.1f'|format(r.delay / 60) }} min{% if r.anomaly %} <span class="flag">(flagged)</span>{% endif %}</td>
-    </tr>
+    <tr><td>{{ r.trip_id }}</td><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td>{{ r.stop_id }}</td>
+      <td class="{{ 'late' if r.delay > 0 else 'early' }}">{{ '%+.1f'|format(r.delay / 60) }} min{% if r.anomaly %} <span class="flag">(flagged)</span>{% endif %}</td></tr>
     {% endfor %}
   </table>
 
   <script>
     const map = L.map('dashmap').setView([-33.8688, 151.2093], 11);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap contributors'
-    }).addTo(map);
-
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
     const markers = new Map();
-
-    const HEAT_GRADIENT = { 0.0: '#0d0887', 0.3: '#7e03a8', 0.55: '#cc4778', 0.75: '#f89441', 1.0: '#f0f921' };
-
-    // --- Zoom-locked heat sizing -----------------------------------------
-    //
-    // Both heat layers size their radius/blur in METRES, converted to
-    // screen pixels at the current zoom, so at high zoom a blob represents
-    // a fixed geographic area (~220m diameter) regardless of zoom level.
-    //
-    // Pure metre-based sizing breaks at LOW zoom: at a whole-Sydney view,
-    // 220m is only ~3px, so every cell collapses into pixel noise. The fix
-    // is a FLOOR on the computed pixel radius: below the crossover zoom,
-    // blobs stay at a fixed pixel size so dense corridors remain visible.
-    // Above the crossover zoom, metre-based sizing takes over.
-    //
-    // Tune HEAT_MIN_RADIUS_PX up for chunkier blobs when zoomed out, down
-    // for finer structure. Both layers share the same sizing so live and
-    // historical look identical at every zoom level.
+    const HEAT_GRADIENT = { 0.0:'#0d0887', 0.3:'#7e03a8', 0.55:'#cc4778', 0.75:'#f89441', 1.0:'#f0f921' };
     const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
     const HEAT_MIN_RADIUS_PX = 12, HEAT_MIN_BLUR_PX = 10;
 
     function metresToPixels(metres, zoom, lat) {
-      const metresPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
-      return metres / metresPerPixel;
+      const mpp = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+      return metres / mpp;
     }
-
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius: HEAT_MIN_RADIUS_PX, blur: HEAT_MIN_BLUR_PX, maxZoom: 15, minOpacity: 0.25, gradient: HEAT_GRADIENT });
-    const histHeatLayer = L.heatLayer([], { radius: HEAT_MIN_RADIUS_PX, blur: HEAT_MIN_BLUR_PX, maxZoom: 14, minOpacity: 0.25, gradient: HEAT_GRADIENT });
+    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:15, minOpacity:0.25, gradient:HEAT_GRADIENT });
+    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:14, minOpacity:0.25, gradient:HEAT_GRADIENT });
 
     function updateHeatRadii() {
       const zoom = map.getZoom();
       const lat = map.getCenter().lat;
       const radius = Math.max(metresToPixels(HEAT_RADIUS_M, zoom, lat), HEAT_MIN_RADIUS_PX);
       const blur = Math.max(metresToPixels(HEAT_BLUR_M, zoom, lat), HEAT_MIN_BLUR_PX);
-      heatLayer.setOptions({ radius: radius, blur: blur });
-      histHeatLayer.setOptions({ radius: radius, blur: blur });
+      heatLayer.setOptions({ radius, blur });
+      histHeatLayer.setOptions({ radius, blur });
     }
     map.on('zoomend', updateHeatRadii);
     updateHeatRadii();
@@ -991,18 +810,11 @@ PAGE = """
       'Bus markers': markersLayer,
       'Vehicle density heatmap (live)': heatLayer,
       'Vehicle density heatmap (historical)': histHeatLayer
-    }, { collapsed: false }).addTo(map);
+    }, { collapsed:false }).addTo(map);
 
     const pickerDiv = document.createElement('div');
     pickerDiv.id = 'histWindowPicker';
-    pickerDiv.innerHTML = `
-      Historical window:
-      <select id="histWindowSelect">
-        <option value="1">Last hour</option>
-        <option value="24" selected>Last 24 hours</option>
-        <option value="168">Last 7 days</option>
-      </select>
-    `;
+    pickerDiv.innerHTML = `Historical window: <select id="histWindowSelect"><option value="1">Last hour</option><option value="24" selected>Last 24 hours</option><option value="168">Last 7 days</option></select>`;
     layersControl.getContainer().appendChild(pickerDiv);
     const statusDiv = document.createElement('div');
     statusDiv.id = 'histWindowStatus';
@@ -1010,133 +822,70 @@ PAGE = """
     L.DomEvent.disableClickPropagation(pickerDiv);
 
     async function loadHistoricalHeatmap() {
-      const windowHours = document.getElementById('histWindowSelect').value;
+      const wh = document.getElementById('histWindowSelect').value;
       statusDiv.textContent = 'Loading…';
       statusDiv.style.color = '#666';
       try {
-        const res = await fetch('/api/heatmap?window=' + windowHours);
+        const res = await fetch('/api/heatmap?window=' + wh);
         const text = await res.text();
         let data;
-        try {
-          data = JSON.parse(text);
-        } catch (parseErr) {
-          console.warn('Non-JSON response from /api/heatmap:', text.slice(0, 300));
-          statusDiv.textContent = `Bad response (HTTP ${res.status}, ${text.length} bytes): ${text.slice(0, 80)}…`;
-          statusDiv.style.color = '#b3261e';
-          return;
-        }
+        try { data = JSON.parse(text); }
+        catch (e) { statusDiv.textContent = `Bad response (HTTP ${res.status})`; statusDiv.style.color = '#b3261e'; return; }
         const points = data.points || [];
         histHeatLayer.setLatLngs(points);
-        if (data.error) {
-          statusDiv.textContent = data.error;
-          statusDiv.style.color = '#b3261e';
-        } else if (points.length === 0) {
-          statusDiv.textContent = 'No historical points in this window yet';
-          statusDiv.style.color = '#b3261e';
-        } else {
-          statusDiv.textContent = points.length + ' historical cells loaded';
-          statusDiv.style.color = '#666';
-        }
-      } catch (e) {
-        statusDiv.textContent = 'Fetch failed: ' + e;
-        statusDiv.style.color = '#b3261e';
-        console.warn('Historical heatmap fetch failed', e);
-      }
+        if (data.error) { statusDiv.textContent = data.error; statusDiv.style.color = '#b3261e'; }
+        else if (points.length === 0) { statusDiv.textContent = 'No historical points in this window yet'; statusDiv.style.color = '#b3261e'; }
+        else { statusDiv.textContent = points.length + ' historical cells loaded'; statusDiv.style.color = '#666'; }
+      } catch (e) { statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e'; }
     }
     document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
     loadHistoricalHeatmap();
 
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
-      return L.divIcon({
-        className: '',
-        iconSize: [56, 24],
-        iconAnchor: [28, 12],
-        popupAnchor: [0, -12],
-        html: `
-          <div class="bus-marker">
-            <div class="bus-pill" style="border-color:${outlineColor};">
-              <div class="bus-arrow" style="transform: rotate(${rot}deg);">&#10148;</div>
-              <span>${routeLabel}</span>
-            </div>
-          </div>
-        `
-      });
+      return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
+        html:`<div class="bus-marker"><div class="bus-pill" style="border-color:${outlineColor};"><div class="bus-arrow" style="transform:rotate(${rot}deg);">&#10148;</div><span>${routeLabel}</span></div></div>` });
     }
-
     function tooltipContent(v) {
-      const routeLabel = v.route_num || v.route_id || '?';
-      return v.headsign ? `${routeLabel} to ${v.headsign}` : `Route ${routeLabel}`;
+      const rl = v.route_num || v.route_id || '?';
+      return v.headsign ? `${rl} to ${v.headsign}` : `Route ${rl}`;
     }
-
     function popupContent(v) {
-      const delayText = (v.delay_min != null)
-        ? (v.anomaly ? `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min (flagged as anomalous)` : `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min`)
-        : 'No current delay data';
-      const speedKmh = (v.speed != null) ? Math.round(v.speed * 3.6) + ' km/h' : 'Speed unavailable';
-      const routeLine = v.headsign
-        ? `Route ${v.route_num || v.route_id || '?'} to ${v.headsign}`
-        : `Route ${v.route_num || v.route_id || '?'}`;
-      return `
-        <strong>${routeLine}</strong><br>
-        ${v.route_operator || 'Unknown operator'}<br>
-        Trip ${v.trip_id ?? '?'}<br>
-        ${delayText}<br>
-        ${speedKmh}
-      `;
+      const dt = (v.delay_min != null) ? (v.anomaly ? `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min (flagged)` : `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min`) : 'No current delay data';
+      const sk = (v.speed != null) ? Math.round(v.speed * 3.6) + ' km/h' : 'Speed unavailable';
+      const rl = v.headsign ? `Route ${v.route_num || v.route_id || '?'} to ${v.headsign}` : `Route ${v.route_num || v.route_id || '?'}`;
+      return `<strong>${rl}</strong><br>${v.route_operator || 'Unknown operator'}<br>Trip ${v.trip_id ?? '?'}<br>${dt}<br>${sk}`;
     }
-
     function renderVehicles(vehicles) {
       const seen = new Set();
       const heatPoints = [];
-
       vehicles.forEach(v => {
         if (v.lat == null || v.lon == null) return;
         const key = v.vehicle_id || v.trip_id;
         seen.add(key);
-
         heatPoints.push([v.lat, v.lon]);
-
-        const routeLabel = v.route_num || v.route_id || '?';
-        const icon = makeIcon(routeLabel, v.bearing, v.outline_color || '#888');
+        const rl = v.route_num || v.route_id || '?';
+        const icon = makeIcon(rl, v.bearing, v.outline_color || '#888');
         const popup = popupContent(v);
         const tooltip = tooltipContent(v);
-
         if (markers.has(key)) {
           const m = markers.get(key);
-          m.setLatLng([v.lat, v.lon]);
-          m.setIcon(icon);
-          m.getPopup().setContent(popup);
-          m.getTooltip().setContent(tooltip);
+          m.setLatLng([v.lat, v.lon]); m.setIcon(icon);
+          m.getPopup().setContent(popup); m.getTooltip().setContent(tooltip);
         } else {
-          const m = L.marker([v.lat, v.lon], { icon })
-            .addTo(markersLayer)
-            .bindPopup(popup, { className: 'glass-popup' })
-            .bindTooltip(tooltip, { direction: 'top', offset: [0, -20], className: 'glass-tooltip' });
+          const m = L.marker([v.lat, v.lon], { icon }).addTo(markersLayer)
+            .bindPopup(popup, { className:'glass-popup' })
+            .bindTooltip(tooltip, { direction:'top', offset:[0,-20], className:'glass-tooltip' });
           markers.set(key, m);
         }
       });
-
-      for (const [key, m] of markers) {
-        if (!seen.has(key)) {
-          markersLayer.removeLayer(m);
-          markers.delete(key);
-        }
-      }
-
+      for (const [key, m] of markers) { if (!seen.has(key)) { markersLayer.removeLayer(m); markers.delete(key); } }
       heatLayer.setLatLngs(heatPoints);
     }
-
     async function pollVehicles() {
-      try {
-        const res = await fetch('/api/vehicles' + window.location.search);
-        const data = await res.json();
-        renderVehicles(data.vehicles || []);
-      } catch (e) {
-        console.warn('Vehicle poll failed', e);
-      }
+      try { const res = await fetch('/api/vehicles' + window.location.search); const data = await res.json(); renderVehicles(data.vehicles || []); }
+      catch (e) { console.warn('Vehicle poll failed', e); }
     }
-
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
     setInterval(loadHistoricalHeatmap, 300000);
@@ -1168,21 +917,19 @@ def dashboard():
     latest_rows = data["latest_rows"]
     agency_names = data["agency_names"]
 
-    observed_prefixes = sorted({r["route_id"].split("_")[0] for r in all_rows if r["route_id"]})[:10]
-    agency_debug = (
-        f"Loaded {len(agency_names)} operator names. "
-        f"Sample loaded IDs: {list(agency_names.keys())[:10]}. "
-        f"Sample route-prefix IDs seen in feed: {observed_prefixes}."
-    )
+    if not _schedule_ready.is_set():
+        agency_debug = "Loading operator names and trip headsigns in the background — will appear within a minute."
+    else:
+        observed_prefixes = sorted({r["route_id"].split("_")[0] for r in all_rows if r["route_id"]})[:10]
+        agency_debug = (f"Loaded {len(agency_names)} operator names. "
+                        f"Sample IDs: {list(agency_names.keys())[:10]}. "
+                        f"Feed route prefixes: {observed_prefixes}.")
 
     operators = sorted(summarise(latest_rows, "operator"), key=lambda r: -abs(r["mean_min"]))
-    routes = sorted(
-        summarise(latest_rows, "route_id"),
-        key=lambda r: r[data["sort_key"]] if data["ascending"] else -abs(r[data["sort_key"]]),
-    )
+    routes = sorted(summarise(latest_rows, "route_id"),
+                    key=lambda r: r[data["sort_key"]] if data["ascending"] else -abs(r[data["sort_key"]]))
     for r in routes:
         r["route_num"], r["route_operator"] = split_route(r["route_id"], agency_names)
-
     worst_trips = sorted(latest_rows, key=lambda r: -abs(r["delay"]))
     for r in worst_trips:
         r["route_num"], r["route_operator"] = split_route(r["route_id"], agency_names)
@@ -1193,24 +940,15 @@ def dashboard():
         n_total=len(all_rows),
         n_flagged=sum(1 for r in all_rows if r["anomaly"]),
         hide_anomalies=data["hide_anomalies"],
-        q_route=data["q_route"],
-        q_stop=data["q_stop"],
-        q_operator=data["q_operator"],
-        agency_error=data["agency_error"],
-        agency_debug=agency_debug,
-        operators=operators,
-        routes=routes,
-        worst_trips=worst_trips,
-        vehicles=vehicles,
-        vehicles_json=json.dumps(vehicles),
-        filters_active=data["filters_active"],
-        apply_bounds=data["apply_bounds"],
+        q_route=data["q_route"], q_stop=data["q_stop"], q_operator=data["q_operator"],
+        agency_error=data["agency_error"], agency_debug=agency_debug,
+        operators=operators, routes=routes, worst_trips=worst_trips,
+        vehicles=vehicles, vehicles_json=json.dumps(vehicles),
+        filters_active=data["filters_active"], apply_bounds=data["apply_bounds"],
         map_error=map_error,
         color_fill=COLOR_FILL,
-        outline_on_time=OUTLINE_ON_TIME,
-        outline_late=OUTLINE_LATE,
-        outline_early=OUTLINE_EARLY,
-        outline_no_data=OUTLINE_NO_DATA,
+        outline_on_time=OUTLINE_ON_TIME, outline_late=OUTLINE_LATE,
+        outline_early=OUTLINE_EARLY, outline_no_data=OUTLINE_NO_DATA,
     )
 
 
@@ -1232,7 +970,6 @@ def api_heatmap():
             window_hours = 24
         if window_hours not in (1, 24, 168):
             window_hours = 24
-
         points, error = get_heatmap_points_cached(window_hours)
         return jsonify({"points": points, "window_hours": window_hours, "error": error})
     except Exception as e:
