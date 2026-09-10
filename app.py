@@ -1,32 +1,46 @@
 """
 Web dashboard for TfNSW GTFS-realtime delay/variance data.
 
-=== SCHEDULE LOADING ===
+=== SCHEDULE LOADING — HOW IT ACTUALLY WORKS ===
 
-Operators and trip headsigns come from the TfNSW schedule bundle, downloaded
-and parsed ON THE FIRST REQUEST that needs them, synchronously, under a lock.
-The first request after a cold start takes ~30 seconds; every subsequent
-request has full data immediately.
+Two paths, and every request checks both:
 
-Why not a background thread: with gunicorn's worker model, a thread started
-at module import time doesn't reliably share state with the process that
-handles requests. The logs showed the thread finishing (35 agencies, 93,947
-headsigns) while /status simultaneously showed empty dicts — they were
-running in different processes. Loading synchronously in the request handler
-eliminates the whole class of problem.
+  1. IN-MEMORY cache (_schedule_cache). Fast. Populated when either the
+     background thread finishes OR a request reads the disk file.
 
-Render's health check hits /ping, which never touches the schedule, so it
-always returns "pong" in microseconds and never times out.
+  2. DISK FILE (CIVL3704/schedule.json). Populated by the background thread
+     when it finishes downloading + parsing. Read by any request that finds
+     the in-memory cache empty.
 
-=== HISTORICAL HEATMAP ===
+The disk path exists because gunicorn's process model does not reliably
+share module-level state between a thread started at import time and the
+worker process serving requests. The symptom was: the log said
+"[schedule] background load complete" while /status simultaneously showed
+empty caches. The disk file bridges whatever boundary that is.
 
-/api/heatmap fetches daily CSVs from the gtfs-r-scrape repo synchronously
-with a 20-second deadline. The frontend auto-loads it on page view.
+Flow on a cold start:
+
+  * Gunicorn boots, imports this module, starts the background thread.
+  * First request to / finds both caches empty, kicks off the download if
+    not already running, returns the page immediately with IDs as-is.
+  * ~30s later the thread finishes, writes CIVL3704/schedule.json.
+  * Next request finds the disk file, loads it, populates the in-memory
+    cache. From then on it's the fast path.
+
+=== OTHER NOTES ===
+
+  * /ping is trivial — 200 in microseconds, no side effects, no locks.
+  * /api/heatmap is non-blocking: returns cached data, refreshes in a
+    background thread if stale.
+  * Use --threads 32 in the start command. With 8 threads, page load +
+    favicon + vehicle poll + heatmap poll + Render's port scanner can
+    exhaust the pool, and the port scanner then reports "no open HTTP
+    ports", which triggers a restart. 32 threads gives plenty of headroom.
 
 === RENDER SETTINGS ===
 
   Start Command (single line, no backslashes):
-      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65
+      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 32 --worker-class gthread --timeout 120 --keep-alive 65
 
   Health Check Path: /ping
 
@@ -65,6 +79,7 @@ UTC_TZ = ZoneInfo("UTC")
 DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
+SCHEDULE_FILE = DATA_DIR / "schedule.json"
 ANOMALY_ABS_SEC = 3600
 ON_TIME_EARLY_SEC = -60
 ON_TIME_LATE_SEC = 300
@@ -72,7 +87,6 @@ ON_TIME_LATE_SEC = 300
 GRID_DECIMALS = 4
 HEATMAP_FETCH_CONCURRENCY = 1
 HEATMAP_DEADLINE_SEC = 20
-
 PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
 
@@ -143,9 +157,13 @@ def parse_ts(raw):
 
 app = Flask(__name__)
 
-_schedule_lock = threading.Lock()
 _schedule_cache = {"agency_names": None, "trip_headsigns": None, "error": None}
+_schedule_bg_started = False
+_schedule_bg_lock = threading.Lock()
+
 _heatmap_cache = {}
+_heatmap_bg_lock = threading.Lock()
+_heatmap_bg = {"running": False, "window": None}
 
 
 def _download_to_path(url, headers, dest_path, timeout=90):
@@ -227,52 +245,93 @@ def _do_schedule_download():
 
         if not agencies:
             raise RuntimeError("Downloaded bundle but no agency rows found")
-        return agencies, trip_headsigns, None
+        return agencies, trip_headsigns
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def get_schedule_lookups():
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
-
-    Downloads and parses the TfNSW schedule bundle on the first call,
-    blocking until done. Subsequent calls return the cached dicts
-    immediately. A lock ensures only one download happens even if
-    multiple requests arrive concurrently.
-
-    The first request after a cold start takes ~30 seconds. Render's
-    health check hits /ping, not /, so the container doesn't get killed
-    during the download.
-    """
-    if _schedule_cache["agency_names"] is not None:
-        return (_schedule_cache["agency_names"],
-                _schedule_cache["trip_headsigns"],
-                _schedule_cache["error"])
-
-    with _schedule_lock:
-        if _schedule_cache["agency_names"] is not None:
-            return (_schedule_cache["agency_names"],
-                    _schedule_cache["trip_headsigns"],
-                    _schedule_cache["error"])
-
-        print("[schedule] first request — downloading + parsing, this takes ~30s", flush=True)
-        t0 = time.monotonic()
+def _bg_schedule_load():
+    """Download + parse, write to disk, populate in-memory cache."""
+    try:
+        agencies, trip_headsigns = _do_schedule_download()
+        # Write to disk FIRST so any other process can read it, then populate
+        # the in-memory cache in this process.
         try:
-            agencies, trip_headsigns, err = _do_schedule_download()
+            with open(SCHEDULE_FILE, "w") as f:
+                json.dump({"agencies": agencies, "trip_headsigns": trip_headsigns}, f)
+            print(f"[schedule] wrote {SCHEDULE_FILE} "
+                  f"({SCHEDULE_FILE.stat().st_size / 1e6:.1f}MB)", flush=True)
         except Exception as e:
-            print(f"[schedule] load failed: {e}", flush=True)
-            _schedule_cache["agency_names"] = {}
-            _schedule_cache["trip_headsigns"] = {}
-            _schedule_cache["error"] = str(e)
-            return {}, {}, str(e)
+            print(f"[schedule] disk write failed: {e}", flush=True)
 
         _schedule_cache["agency_names"] = agencies
         _schedule_cache["trip_headsigns"] = trip_headsigns
-        _schedule_cache["error"] = err
-        print(f"[schedule] loaded in {time.monotonic() - t0:.1f}s — "
-              f"{len(agencies)} agencies, {len(trip_headsigns)} headsigns", flush=True)
+        _schedule_cache["error"] = None
+        print("[schedule] background load complete", flush=True)
         _log_rss("schedule-ready")
-        return agencies, trip_headsigns, err
+    except Exception as e:
+        print(f"[schedule] background load failed: {e}", flush=True)
+        _schedule_cache["error"] = str(e)
+
+
+def _try_load_from_disk():
+    """If the file exists, load it into the in-memory cache. Returns True if
+    loaded. Cheap enough to call on every request when the cache is empty."""
+    if not SCHEDULE_FILE.exists():
+        return False
+    try:
+        size = SCHEDULE_FILE.stat().st_size
+        if size < 1000:
+            return False
+        with open(SCHEDULE_FILE) as f:
+            data = json.load(f)
+        agencies = data.get("agencies") or {}
+        headsigns = data.get("trip_headsigns") or {}
+        if not agencies:
+            return False
+        _schedule_cache["agency_names"] = agencies
+        _schedule_cache["trip_headsigns"] = headsigns
+        _schedule_cache["error"] = None
+        print(f"[schedule] loaded from disk ({size} bytes, {len(agencies)} agencies, "
+              f"{len(headsigns)} headsigns)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[schedule] disk load failed: {e}", flush=True)
+        return False
+
+
+def get_schedule_lookups():
+    """Return ({agency_names}, {trip_headsigns}, error).
+
+    Priority order:
+      1. In-memory cache (fast path after first successful load).
+      2. Disk file written by the background thread.
+      3. Start the background thread and return empty dicts.
+    """
+    global _schedule_bg_started
+
+    if _schedule_cache["agency_names"] is not None:
+        return _schedule_cache["agency_names"], _schedule_cache["trip_headsigns"], _schedule_cache["error"]
+
+    if _try_load_from_disk():
+        return _schedule_cache["agency_names"], _schedule_cache["trip_headsigns"], _schedule_cache["error"]
+
+    with _schedule_bg_lock:
+        if not _schedule_bg_started:
+            _schedule_bg_started = True
+            print("[schedule] starting background download", flush=True)
+            threading.Thread(target=_bg_schedule_load, daemon=True).start()
+
+    return {}, {}, "loading"
+
+
+# Kick off the background load at import time too, so it's already running
+# by the time the first user request arrives.
+with _schedule_bg_lock:
+    if not _schedule_bg_started:
+        _schedule_bg_started = True
+        print("[schedule] starting background download at import", flush=True)
+        threading.Thread(target=_bg_schedule_load, daemon=True).start()
 
 
 def fetch_feed():
@@ -566,14 +625,42 @@ def fetch_historical_heatmap_points(window_hours):
     return points, note
 
 
+def _background_heatmap_fetch(window_hours):
+    try:
+        points, error = fetch_historical_heatmap_points(window_hours)
+        _heatmap_cache[window_hours] = {"points": points, "error": error,
+                                        "fetched_at": datetime.now(tz=SYDNEY_TZ)}
+    except Exception as e:
+        print(f"[heatmap] bg fetch failed: {e}", flush=True)
+        _heatmap_cache[window_hours] = {"points": [], "error": str(e),
+                                        "fetched_at": datetime.now(tz=SYDNEY_TZ)}
+    finally:
+        with _heatmap_bg_lock:
+            _heatmap_bg["running"] = False
+            _heatmap_bg["window"] = None
+
+
+def _kick_heatmap_fetch(window_hours):
+    with _heatmap_bg_lock:
+        if _heatmap_bg["running"] and _heatmap_bg["window"] == window_hours:
+            return False
+        _heatmap_bg["running"] = True
+        _heatmap_bg["window"] = window_hours
+    threading.Thread(target=_background_heatmap_fetch, args=(window_hours,), daemon=True).start()
+    return True
+
+
 def get_heatmap_points_cached(window_hours):
     now = datetime.now(tz=SYDNEY_TZ)
     cached = _heatmap_cache.get(window_hours)
-    if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
-        return cached["points"], cached["error"]
-    points, error = fetch_historical_heatmap_points(window_hours)
-    _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
-    return points, error
+    if cached is not None:
+        age = (now - cached["fetched_at"]).total_seconds()
+        if age < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
+            return cached["points"], cached["error"]
+        _kick_heatmap_fetch(window_hours)
+        return cached["points"], (cached["error"] or "Refreshing in background — reload in ~15s")
+    _kick_heatmap_fetch(window_hours)
+    return [], "Fetching in background — reload in ~15 seconds"
 
 
 def compute_delay_data(args):
@@ -886,6 +973,8 @@ def status():
         "schedule_agencies": len(agencies) if agencies else 0,
         "schedule_headsigns": len(headsigns) if headsigns else 0,
         "schedule_error": _schedule_cache["error"],
+        "schedule_file_exists": SCHEDULE_FILE.exists(),
+        "schedule_file_size": SCHEDULE_FILE.stat().st_size if SCHEDULE_FILE.exists() else 0,
         "heatmap_cache": heatmap_state,
     })
 
@@ -903,7 +992,8 @@ def dashboard():
     agency_names = data["agency_names"]
 
     if not agency_names:
-        agency_debug = "Operator names unavailable — check the /status endpoint and Render logs."
+        agency_debug = ("Schedule still loading — operators and trip headsigns will appear "
+                        "within ~30 seconds of the first request. Reload the page to pick them up.")
     else:
         observed_prefixes = sorted({r["route_id"].split("_")[0] for r in all_rows if r["route_id"]})[:10]
         agency_debug = (f"Loaded {len(agency_names)} operator names. "
