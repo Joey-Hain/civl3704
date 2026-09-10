@@ -113,7 +113,9 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
+from html import escape as html_escape
 import statistics
 import tempfile
 import threading
@@ -169,6 +171,12 @@ VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
 HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
+
+# /project page: displays TransportLab's smart-city model config, fetched
+# live from GitHub each time the cache goes stale rather than vendored,
+# so it always reflects whatever's currently on that repo's main branch.
+SMART_CITY_PARAMS_URL = "https://raw.githubusercontent.com/TransportLab/smart-city/main/params.json5"
+SMART_CITY_CACHE_TTL_SECONDS = 300
 
 COLOR_FILL = "#00B3F0"
 OUTLINE_ON_TIME = "#ffffff"
@@ -538,6 +546,171 @@ _heatmap_cells_cache = {}
 _rows_lock = threading.Lock()
 _vehicles_lock = threading.Lock()
 _heatmap_lock = threading.Lock()
+_smart_city_cache = {"params": None, "error": None, "fetched_at": None}
+_smart_city_lock = threading.Lock()
+
+
+def _json5_lite_to_json(text):
+    """Minimal JSON5 -> JSON rewriter: strips // and /* */ comments, turns
+    single-quoted strings into double-quoted, quotes bare object keys, and
+    drops trailing commas. Not a full JSON5 parser (no hex numbers, no
+    unquoted-string edge cases) but covers everything params.json5 actually
+    uses. Comment-stripping and quote-conversion are both string-aware so a
+    "//" inside a URL value (e.g. 'https://...') is never mistaken for a
+    line comment.
+    """
+
+    def strip_comments(s):
+        out, i, n, in_str = [], 0, len(s), None
+        while i < n:
+            c = s[i]
+            if in_str:
+                out.append(c)
+                if c == "\\" and i + 1 < n:
+                    out.append(s[i + 1]); i += 2; continue
+                if c == in_str:
+                    in_str = None
+                i += 1; continue
+            if c in ("\"", "'"):
+                in_str = c; out.append(c); i += 1; continue
+            if c == "/" and i + 1 < n and s[i + 1] == "/":
+                j = s.find("\n", i); i = n if j == -1 else j; continue
+            if c == "/" and i + 1 < n and s[i + 1] == "*":
+                j = s.find("*/", i + 2); i = n if j == -1 else j + 2; continue
+            out.append(c); i += 1
+        return "".join(out)
+
+    def singlequote_to_double(s):
+        out, i, n, in_str = [], 0, len(s), None
+        while i < n:
+            c = s[i]
+            if in_str:
+                if c == "\\" and i + 1 < n:
+                    out.append(c); out.append(s[i + 1]); i += 2; continue
+                if c == in_str:
+                    out.append('"'); in_str = None; i += 1; continue
+                if in_str == "'" and c == '"':
+                    out.append('\\"'); i += 1; continue
+                out.append(c); i += 1; continue
+            if c in ("\"", "'"):
+                in_str = c; out.append('"'); i += 1; continue
+            out.append(c); i += 1
+        return "".join(out)
+
+    t = strip_comments(text)
+    t = singlequote_to_double(t)
+    t = re.sub(r'([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)\s*:', r'\1"\2":', t)
+    t = re.sub(r',(\s*[}\]])', r'\1', t)
+    return t
+
+
+def get_smart_city_params_cached():
+    now = datetime.now(tz=SYDNEY_TZ)
+    fetched_at = _smart_city_cache["fetched_at"]
+    if fetched_at is not None and (now - fetched_at).total_seconds() < SMART_CITY_CACHE_TTL_SECONDS:
+        return _smart_city_cache["params"], _smart_city_cache["error"]
+
+    with _smart_city_lock:
+        now = datetime.now(tz=SYDNEY_TZ)
+        fetched_at = _smart_city_cache["fetched_at"]
+        if fetched_at is not None and (now - fetched_at).total_seconds() < SMART_CITY_CACHE_TTL_SECONDS:
+            return _smart_city_cache["params"], _smart_city_cache["error"]
+
+        params, error = None, None
+        try:
+            resp = requests.get(SMART_CITY_PARAMS_URL, timeout=15)
+            resp.raise_for_status()
+            params = json.loads(_json5_lite_to_json(resp.text))
+        except requests.RequestException as e:
+            error = f"Could not fetch params.json5: {e}"
+        except (ValueError, json.JSONDecodeError) as e:
+            error = f"Could not parse params.json5: {e}"
+
+        if params is not None or _smart_city_cache["params"] is None:
+            _smart_city_cache.update(params=params, error=error, fetched_at=now)
+        else:
+            # Fetch failed but we have a previously-good copy — keep serving
+            # it (with the new error noted) rather than blanking the page.
+            _smart_city_cache.update(error=error, fetched_at=now)
+        return _smart_city_cache["params"], _smart_city_cache["error"]
+
+
+PROJECT_SECTION_INFO = {
+    "model": ("Model", "Physical dimensions of the projected table model and the real-world lat/lng corners it maps onto."),
+    "projector": ("Projector", "Projector resolution, aspect ratio and calibration offsets for the overhead projection."),
+    "map": ("Map", "Leaflet map view settings — currently left for the app to calculate from the model properties."),
+    "threejs": ("three.js", "Camera placement for the three.js layer drawn over the map."),
+    "server": ("Server", "The smart-city app's own backend server settings."),
+    "logo": ("Logo", "University logo overlay shown on the model."),
+    "gtfs": ("GTFS (buses, light rail, ferries)", "TfNSW GTFS-realtime v1 feed — buses, light rail and ferries."),
+    "gtfs2": ("GTFS (metro, trains)", "TfNSW GTFS-realtime v2 feed — Sydney Metro and Sydney Trains."),
+    "ais": ("AIS (shipping)", "Live vessel tracking via the aisstream.io AIS feed."),
+    "flights": ("Flights", "Live aircraft tracking via the OpenSky Network API."),
+    "radar": ("Weather radar", "Bureau of Meteorology rain radar overlay."),
+    "hazards": ("Traffic hazards", "TfNSW live hazards feed (roadworks, incidents, closures)."),
+}
+PROJECT_KEY_LABELS = {
+    "ne": "Northeast corner", "sw": "Southwest corner", "lat": "Latitude", "lng": "Longitude",
+    "url": "URL", "id": "ID", "ID": "ID", "loc": "Location", "modes": "Modes",
+    "show": "Enabled", "opacity": "Opacity", "resolution": "Resolution",
+    "aspect_ratio": "Aspect ratio", "vertical_offset": "Vertical offset", "horizontal_scale": "Horizontal scale",
+    "update_interval": "Update interval", "throw_distance": "Throw distance", "pixel_size": "Pixel size",
+    "camera_location": "Camera location", "camera_rotation": "Camera rotation", "bounds": "Bounds",
+}
+
+
+def _project_label(key):
+    return PROJECT_KEY_LABELS.get(key, key.replace("_", " ").replace("-", " ").strip().title())
+
+
+def _project_format_scalar(key, value):
+    if isinstance(value, bool):
+        return '<span class="proj-yes">Yes</span>' if value else '<span class="proj-no">No</span>'
+    if isinstance(value, float):
+        s = f"{value:.6f}".rstrip("0").rstrip(".")
+        text = s if s not in ("", "-") else "0"
+    else:
+        text = str(value)
+    if key in ("update_interval",) and isinstance(value, (int, float)):
+        return html_escape(f"{text} ms ({value / 1000:g}s)")
+    if isinstance(value, str) and re.match(r"^(https?|wss?|ftp)://", value):
+        safe = html_escape(value)
+        return f'<a href="{safe}" target="_blank" rel="noopener noreferrer">{safe}</a>'
+    return html_escape(text)
+
+
+def render_project_node(value, depth=0):
+    if isinstance(value, dict):
+        if not value:
+            return '<span class="proj-muted">(none)</span>'
+        rows = "".join(
+            f"<tr><th>{html_escape(_project_label(k))}</th><td>{render_project_node(v, depth + 1)}</td></tr>"
+            for k, v in value.items()
+        )
+        return f'<table class="proj-subtable">{rows}</table>'
+    if isinstance(value, list):
+        if not value:
+            return '<span class="proj-muted">(none)</span>'
+        if all(isinstance(x, (int, float, str, bool)) for x in value):
+            return ", ".join(_project_format_scalar(None, x) for x in value)
+        return "".join(f'<div class="proj-list-item">{render_project_node(x, depth + 1)}</div>' for x in value)
+    return _project_format_scalar(None, value)
+
+
+def render_project_sections(params):
+    order = list(PROJECT_SECTION_INFO.keys())
+    keys = order + [k for k in params if k not in order]
+    cards = []
+    for key in keys:
+        if key not in params:
+            continue
+        title, desc = PROJECT_SECTION_INFO.get(key, (_project_label(key), ""))
+        body = render_project_node(params[key], depth=0)
+        desc_html = f'<div class="proj-card-desc">{html_escape(desc)}</div>' if desc else ""
+        cards.append(
+            f'<div class="proj-card"><h2>{html_escape(title)}</h2>{desc_html}{body}</div>'
+        )
+    return "".join(cards)
 
 
 def get_all_rows_cached():
@@ -933,10 +1106,11 @@ PAGE = """
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
   .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
+  #heatLoadingBanner { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:900; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
 </style>
 </head>
 <body>
-  <h1>Delay Board</h1>
+  <h1>Delay Board <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/project">smart-city project &rarr;</a></h1>
   <div class="meta">
     Pulled {{ pulled_at }} &middot; {{ n_total }} readings ({{ n_flagged }} flagged as anomalous, {{ 'hidden' if hide_anomalies else 'shown' }})
     &middot; <a class="toggle" href="?hide_anomalies={{ 0 if hide_anomalies else 1 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">{{ 'show anomalies' if hide_anomalies else 'hide anomalies' }}</a>
@@ -1014,37 +1188,36 @@ PAGE = """
     // distinct from each other, but only one metric's pair is ever visible
     // at a time.
     //
-    // Every hue anchor below (the 0.75 stop of each ramp) is one of
-    // Anthropic's documented categorical colours, and each live/hist PAIR
-    // was run through that palette's colourblind-safety checker (adjacent
-    // CVD ΔE + normal-vision ΔE, both comfortably over the pass floor) —
-    // red/violet, blue/orange, green/magenta. The first-generation ramps
-    // here used pale ColorBrewer stops that read as washed-out/grey against
-    // the map background at low weight, which is what made metric switches
-    // hard to see; these ramps stay visibly tinted even at the light end
-    // and hit a real saturated colour by the middle of the ramp, not just
-    // at the very top.
+    // Each ramp now has 7 stops instead of 5, spread with more resolution
+    // in the upper-middle range (0.55-0.85) rather than jumping straight
+    // from "medium" to "darkest" — that jump was most of why hot areas all
+    // read as one flat dark blob instead of showing gradation. Paired with
+    // HEAT_MAX below (which stops a couple of overlapping points from
+    // instantly maxing out the ramp), distinct severities now land on
+    // visibly distinct stops instead of all piling onto the top colour.
+    // Hue families unchanged from the previous pass (red/violet,
+    // blue/orange, green/magenta — each live/hist pair colourblind-safe).
     const METRICS = {
       delay: {
         label: 'Delay',
-        liveGradient:  { 0.0:'#f5e5e5', 0.25:'#eea7a6', 0.5:'#e87574', 0.75:'#e34948', 1.0:'#a61413' }, // red
-        histGradient:  { 0.0:'#e9e8f2', 0.25:'#a9a2d4', 0.5:'#776bbc', 0.75:'#4a3aa7', 1.0:'#2c216a' }, // violet
+        liveGradient:  { 0.0:'#f7e9e9', 0.15:'#f0c9c8', 0.35:'#e69795', 0.55:'#dd6664', 0.7:'#cf3d3b', 0.85:'#b21f1d', 1.0:'#7a0f0e' }, // red
+        histGradient:  { 0.0:'#eeecf5', 0.15:'#d6d0ea', 0.35:'#b3a7d9', 0.55:'#8f7ec7', 0.7:'#6c58ad', 0.85:'#4c3a8a', 1.0:'#2c2160' }, // violet
         liveTitle: 'Live snapshot — current lateness',
         histTitle: 'Historical window — mean lateness',
         ticks: ['0 min late', 'SEVERITY_CAP+ min late'],
       },
       density: {
         label: 'Density',
-        liveGradient:  { 0.0:'#cde2fb', 0.25:'#86b6ef', 0.5:'#2a78d6', 0.75:'#184f95', 1.0:'#0d366b' }, // blue
-        histGradient:  { 0.0:'#f6e9e4', 0.25:'#f2b59e', 0.5:'#ee8c65', 0.75:'#eb6834', 1.0:'#a8370a' }, // orange
+        liveGradient:  { 0.0:'#e3eefc', 0.15:'#c2ddf8', 0.35:'#93c1f0', 0.55:'#5da0e3', 0.7:'#2f7fd0', 0.85:'#1a5fa8', 1.0:'#0c3d73' }, // blue
+        histGradient:  { 0.0:'#fcece3', 0.15:'#f8d3bd', 0.35:'#f2af86', 0.55:'#ec8a57', 0.7:'#df662f', 0.85:'#b8481a', 1.0:'#7f2f0e' }, // orange
         liveTitle: 'Live snapshot — vehicle density',
         histTitle: 'Historical window — vehicle density',
         ticks: ['fewer pings', 'more pings'],
       },
       speed: {
         label: 'Speed',
-        liveGradient:  { 0.0:'#e2f8e2', 0.25:'#88c988', 0.5:'#3fa43f', 0.75:'#008300', 1.0:'#005100' }, // green
-        histGradient:  { 0.0:'#f5e6eb', 0.25:'#f0bbcf', 0.5:'#ec99b8', 0.75:'#e87ba4', 1.0:'#c21a59' }, // magenta
+        liveGradient:  { 0.0:'#e6f7e6', 0.15:'#c5ecc5', 0.35:'#98d998', 0.55:'#69c069', 0.7:'#3c9e3c', 0.85:'#217a21', 1.0:'#0f4f0f' }, // green
+        histGradient:  { 0.0:'#f8e9f0', 0.15:'#f0c8dd', 0.35:'#e498bf', 0.55:'#d669a2', 0.7:'#c2417f', 0.85:'#9c235f', 1.0:'#671041' }, // magenta
         liveTitle: 'Live snapshot — current speed',
         histTitle: 'Historical window — mean speed',
         ticks: ['0 km/h', 'SPEED_CAP+ km/h'],
@@ -1075,16 +1248,39 @@ PAGE = """
     // the map background, which was the other half of "switching metric
     // doesn't seem to do anything".
     const HEAT_MIN_OPACITY = 0.22;
-    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:15, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].liveGradient });
-    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:14, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].histGradient });
+    // Leaflet.heat merges nearby points into a shared screen-space grid
+    // cell and SUMS their weights before mapping the total through
+    // options.max (default 1) to pick a gradient colour — so with max:1,
+    // just two or three overlapping vehicles/cells (extremely common
+    // anywhere buses share a corridor) instantly saturate to the topmost
+    // colour, which is what made hot areas render as one flat dark blob
+    // with no visible gradation between "somewhat busy/late" and
+    // "extremely busy/late". Raising max gives the ramp headroom: it now
+    // takes several stacked full-weight points to reach the darkest
+    // colour, so the intermediate stops actually get used.
+    const HEAT_MAX = 3.5;
+    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, max:HEAT_MAX, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].liveGradient });
+    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, max:HEAT_MAX, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].histGradient });
 
     function updateHeatRadii() {
       const zoom = map.getZoom();
       const lat = map.getCenter().lat;
       const radius = Math.max(metresToPixels(HEAT_RADIUS_M, zoom, lat), HEAT_MIN_RADIUS_PX);
       const blur = Math.max(metresToPixels(HEAT_BLUR_M, zoom, lat), HEAT_MIN_BLUR_PX);
-      heatLayer.setOptions({ radius, blur });
-      histHeatLayer.setOptions({ radius, blur });
+      // Leaflet.heat also silently scales every point's weight by
+      // 1 / 2^(options.maxZoom - currentZoom) — a "keep the same total
+      // heat energy visible regardless of zoom" trick meant for raw
+      // point-density heatmaps. Our weights are already a meaningful
+      // per-point severity/speed/density value, not a raw count, so that
+      // extra scaling just makes colours drift as you zoom (the exact
+      // "fidelity isn't preserved when zoomed out" symptom) rather than
+      // showing the same data consistently. Pinning maxZoom to the
+      // CURRENT zoom on every change forces that scale factor to
+      // 2^0 = 1 at all times, so intensity/colour no longer depends on
+      // zoom level at all — only radius/blur (real ground distance) does,
+      // which is the only zoom-dependence we actually want.
+      heatLayer.setOptions({ radius, blur, maxZoom: zoom });
+      histHeatLayer.setOptions({ radius, blur, maxZoom: zoom });
     }
     map.on('zoomend', updateHeatRadii);
     updateHeatRadii();
@@ -1151,23 +1347,50 @@ PAGE = """
     layersControl.getContainer().appendChild(statusDiv);
     L.DomEvent.disableClickPropagation(pickerDiv);
 
+    // Historical fetches can be slow (up to HEATMAP_DEADLINE_SEC on a cold
+    // per-window cache — see server docstring) and switching metric or
+    // window quickly fires overlapping requests. The old guard only
+    // compared the response's metric against currentMetric, so a stale
+    // response from a superseded WINDOW change (metric unchanged) could
+    // still land and silently overwrite newer data — one of the "switching
+    // sometimes doesn't seem to do anything" reports. histRequestSeq
+    // tracks the single most recent request regardless of what changed;
+    // any response that isn't for the latest request is dropped outright.
+    let histRequestSeq = 0;
+    const heatLoadingBanner = document.createElement('div');
+    heatLoadingBanner.id = 'heatLoadingBanner';
+    heatLoadingBanner.hidden = true;
+    document.getElementById('dashmap').appendChild(heatLoadingBanner);
+
     async function loadHistoricalHeatmap() {
+      const seq = ++histRequestSeq;
       const wh = document.getElementById('histWindowSelect').value;
+      const metricAtRequest = currentMetric;
       statusDiv.textContent = 'Loading…';
       statusDiv.style.color = '#666';
+      // Visible on the map itself (not just the collapsed layer control)
+      // so a slow cold-cache fetch reads as "still working" rather than
+      // "did switching this do anything?".
+      heatLoadingBanner.textContent = `Updating ${METRICS[metricAtRequest].label.toLowerCase()} heatmap…`;
+      heatLoadingBanner.hidden = false;
       try {
-        const res = await fetch(`/api/heatmap?window=${wh}&metric=${currentMetric}`);
+        const res = await fetch(`/api/heatmap?window=${wh}&metric=${metricAtRequest}`);
         const text = await res.text();
+        if (seq !== histRequestSeq) return; // superseded by a newer window/metric change
         let data;
         try { data = JSON.parse(text); }
         catch (e) { statusDiv.textContent = `Bad response (HTTP ${res.status})`; statusDiv.style.color = '#b3261e'; return; }
-        if (data.metric && data.metric !== currentMetric) return; // stale response from a metric switch mid-flight
         const points = data.points || [];
         histHeatLayer.setLatLngs(points);
         if (data.error) { statusDiv.textContent = data.error; statusDiv.style.color = '#b3261e'; }
         else if (points.length === 0) { statusDiv.textContent = 'No historical points in this window yet'; statusDiv.style.color = '#b3261e'; }
         else { statusDiv.textContent = points.length + ' historical cells loaded'; statusDiv.style.color = '#666'; }
-      } catch (e) { statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e'; }
+      } catch (e) {
+        if (seq !== histRequestSeq) return;
+        statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e';
+      } finally {
+        if (seq === histRequestSeq) heatLoadingBanner.hidden = true;
+      }
     }
     document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
 
@@ -1212,6 +1435,13 @@ PAGE = """
       const cfg = METRICS[metric];
       heatLayer.setOptions({ gradient: cfg.liveGradient });
       histHeatLayer.setOptions({ gradient: cfg.histGradient });
+      // setOptions() is documented to trigger Leaflet.heat's own redraw,
+      // but the explicit redraw() calls here are cheap insurance against
+      // a canvas that doesn't repaint until the next unrelated map event —
+      // exactly what would look like "the dropdown changed but the map
+      // didn't" even though the new gradient/data was already applied.
+      heatLayer.redraw();
+      histHeatLayer.redraw();
       fillLegend(liveLegend, cfg.liveGradient, cfg.liveTitle, cfg.ticks);
       fillLegend(histLegend, cfg.histGradient, cfg.histTitle, cfg.ticks);
       updateLiveHeatFromVehicles(lastVehicles);
@@ -1272,6 +1502,71 @@ PAGE = """
 </body>
 </html>
 """
+
+
+PROJECT_PAGE = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<title>smart-city project &mdash; params.json5</title>
+<style>
+  :root { --bg:#f7f6f2; --text:#111; --muted:#666; --line:#ccc; --late:#b3261e; --early:#1e6b3c; --sans: Helvetica, Arial, sans-serif; }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--text); font-family:var(--sans); margin:0; padding:24px 32px 60px; }
+  h1 { font-size:1.4rem; font-weight:bold; border-bottom:2px solid var(--text); padding-bottom:10px; margin-bottom:4px; }
+  .meta { color:var(--muted); font-size:0.85rem; margin-bottom:24px; }
+  .meta a, .toggle { color:var(--text); }
+  .proj-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(340px, 1fr)); gap:18px; }
+  .proj-card { border:1px solid var(--line); background:#fff; padding:14px 16px 16px; }
+  .proj-card h2 { font-size:0.95rem; font-weight:bold; margin:0 0 4px; }
+  .proj-card-desc { color:var(--muted); font-size:0.78rem; margin-bottom:10px; line-height:1.35; }
+  .proj-subtable { width:100%; border-collapse:collapse; font-size:0.85rem; }
+  .proj-subtable th, .proj-subtable td { text-align:left; padding:3px 8px 3px 0; vertical-align:top; }
+  .proj-subtable th { color:var(--muted); font-weight:normal; white-space:nowrap; width:1%; }
+  .proj-subtable .proj-subtable { margin:2px 0; }
+  .proj-list-item { border-top:1px solid var(--line); padding-top:4px; margin-top:4px; }
+  .proj-list-item:first-child { border-top:none; margin-top:0; padding-top:0; }
+  .proj-yes { color:var(--early); }
+  .proj-no { color:var(--muted); }
+  .proj-muted { color:var(--muted); }
+  .proj-error { color:var(--late); border:1px solid var(--late); padding:10px 14px; margin-bottom:20px; font-size:0.85rem; }
+  a { color:inherit; }
+</style>
+</head>
+<body>
+  <h1>smart-city project <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/">&larr; Delay Board</a></h1>
+  <div class="meta">
+    Live config from <a href="https://github.com/TransportLab/smart-city/blob/main/params.json5" target="_blank" rel="noopener noreferrer">TransportLab/smart-city&nbsp;&middot;&nbsp;params.json5</a>
+    &middot; fetched {{ fetched_at }}{% if stale %} (showing last good copy){% endif %}
+  </div>
+  {% if error %}<div class="proj-error">{{ error }}</div>{% endif %}
+  {% if sections_html %}
+  <div class="proj-grid">
+    {{ sections_html|safe }}
+  </div>
+  {% elif not error %}
+  <p class="proj-muted">No config data available.</p>
+  {% endif %}
+</body>
+</html>
+"""
+
+
+@app.route("/project")
+def project():
+    params, error = get_smart_city_params_cached()
+    fetched_at = _smart_city_cache["fetched_at"]
+    fetched_str = fetched_at.strftime("%Y-%m-%d %H:%M:%S %Z") if fetched_at else "never"
+    sections_html = render_project_sections(params) if params else ""
+    return render_template_string(
+        PROJECT_PAGE,
+        error=error,
+        stale=bool(error and params),
+        fetched_at=fetched_str,
+        sections_html=sections_html,
+    )
 
 
 @app.route("/ping")
