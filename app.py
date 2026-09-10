@@ -26,15 +26,21 @@ delay status shown via the marker's OUTLINE colour instead of swapping the
 fill. This keeps the map visually calm (one colour family) while still
 making outliers scannable by ring colour.
 
-DENSITY HEATMAP: an additional toggleable layer (via leaflet.heat) showing
-where live buses are currently clustered, built purely from the same
+DENSITY HEATMAP (live): a toggleable layer (via leaflet.heat) showing where
+live buses are currently clustered, built purely from the same
 vehicle-position data already being fetched for the markers — no delay
-weighting, no historical data, just point density right now. Toggle
-between "Bus markers" and "Vehicle density heatmap" via the layer control
-in the map's top-right corner (both can be shown at once). This is
-intentionally scoped to current positions only; a delay-weighted heatmap
-built from accumulated historical readings is a separate, not-yet-built
-feature.
+weighting, no historical data, just point density right now.
+
+DENSITY HEATMAP (historical): a second toggleable layer, pulling position
+data from the separate GTFS-R scraper repo (Joey-Hain/gtfs-r-scrape on
+GitHub — a GitHub Actions job that polls the feeds and commits daily CSVs
+to data/YYYY-MM-DD.csv; currently running hourly rather than every 5 min).
+/api/heatmap fetches the raw CSVs for whatever daily files fall inside the
+requested time window (?window=1|24|168 hours), filters rows to that
+window, and returns [lat, lon] points — pure density, no delay weighting
+yet (same scope as the live heatmap). The frontend lets you pick "Last
+hour / Last 24h / Last 7 days" and re-fetches on change. Both heat layers
+share a custom low-to-high gradient (yellow #e9d022 to red #e60b09).
 
 NOTE: an earlier version of this file also drew GTFS route-shape polylines
 under the bus markers. That feature has been removed (scope cut) — schedule
@@ -89,6 +95,11 @@ SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.g
 # is the trip-update feed above. Vehicle positions are a separate GTFS-RT
 # product on the TfNSW developer portal with their own subscription.
 VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
+
+# --- Historical scrape repo (GitHub Actions collector, see collector.py) ---
+SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
+SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
+HEATMAP_WINDOW_CACHE_TTL_SECONDS = 120  # historical data changes slowly — cache longer than the live 12s TTL
 
 # --- Colour scheme: single blue fill, delay status carried by outline ---
 COLOR_FILL = "#00B3F0"          # every marker's pill background, regardless of status
@@ -392,6 +403,7 @@ CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
+_heatmap_cache: dict[int, dict] = {}  # window_hours -> {"points": [...], "error": ..., "fetched_at": datetime}
 
 
 def get_all_rows_cached():
@@ -427,6 +439,77 @@ def get_vehicles_cached(agency_names, trip_headsigns):
     vehicles = extract_vehicles(vfeed, agency_names, trip_headsigns)
     _vehicles_cache.update(vehicles=vehicles, fetched_at=now)
     return [dict(v) for v in vehicles]
+
+
+def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None]:
+    """Fetch [lat, lon] points from the gtfs-r-scrape repo's daily CSVs,
+    covering whatever files fall inside the requested time window.
+
+    Each day's data lives in its own raw CSV on GitHub (data/YYYY-MM-DD.csv,
+    written by collector.py via GitHub Actions). We fetch each day's file
+    that could contain rows in range, then filter rows by timestamp in
+    Python — the raw CSV has no server-side query capability. Fine at this
+    data volume: even a week of hourly collection is only a few thousand
+    rows total across up to 7 small daily files.
+    """
+    now = datetime.now(tz=SYDNEY_TZ)
+    cutoff = now - timedelta(hours=window_hours)
+
+    # Which daily files could contain rows >= cutoff: every date from
+    # cutoff's date through today (handles windows spanning midnight).
+    dates_needed = []
+    d = cutoff.date()
+    while d <= now.date():
+        dates_needed.append(d)
+        d += timedelta(days=1)
+
+    points = []
+    last_error = None
+    any_fetched = False
+    for d in dates_needed:
+        url = f"{SCRAPE_RAW_BASE}/{d.isoformat()}.csv"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 404:
+                continue  # no data collected that day — not an error, just nothing to show
+            resp.raise_for_status()
+            any_fetched = True
+        except requests.RequestException as e:
+            last_error = str(e)
+            continue
+
+        reader = csv.DictReader(io.StringIO(resp.text))
+        for row in reader:
+            try:
+                ts = datetime.fromisoformat(row["timestamp"])
+            except (KeyError, ValueError):
+                continue
+            if ts < cutoff:
+                continue
+            try:
+                lat = float(row["lat"])
+                lon = float(row["lon"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            points.append([lat, lon])
+
+    if not points and not any_fetched:
+        return [], last_error or "No historical data files found for this time window yet"
+    return points, None
+
+
+def get_heatmap_points_cached(window_hours: int):
+    """Cache historical heatmap points per window size — new scrape data only
+    lands hourly, so there's no need to re-fetch/re-parse the daily CSVs on
+    every request the way the live 12s vehicle cache does."""
+    now = datetime.now(tz=SYDNEY_TZ)
+    cached = _heatmap_cache.get(window_hours)
+    if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
+        return cached["points"], cached["error"]
+
+    points, error = fetch_historical_heatmap_points(window_hours)
+    _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
+    return points, error
 
 
 def compute_delay_data(args):
@@ -645,10 +728,17 @@ PAGE = """
     box-shadow: none;
   }
 
-  /* Layer-switcher control (Bus markers / Vehicle density heatmap) */
+  /* Layer-switcher control (Bus markers / live density / historical density) */
   .leaflet-control-layers {
     font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important;
   }
+
+  /* Historical-window picker, shown inside the layer control's overlay list */
+  #histWindowPicker {
+    font: 12px/1.4 -apple-system, Helvetica, Arial, sans-serif;
+    margin: 4px 0 2px 22px;
+  }
+  #histWindowPicker select { font: inherit; }
 </style>
 </head>
 <body>
@@ -681,7 +771,8 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_late }}"></span>Late</span>
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
-    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show Opal network</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">Opal network, restrict to 10km of CBD</a>{% endif %}</span>
+    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered to match route/stop/operator above){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
+    <span>Use the layer switcher (top-right of the map) to toggle the density heatmaps.</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
@@ -738,24 +829,54 @@ PAGE = """
 
     const markers = new Map(); // trip_id/vehicle_id -> Leaflet marker
 
-    // --- Density heatmap (real-time, positions only — no delay weighting,
-    // no historical data). Two toggleable layers via the layer control:
-    // the existing bus-marker pills, and a leaflet.heat point-density layer
-    // built from the exact same vehicle positions each poll. ---
+    // Shared low-to-high gradient for BOTH heat layers: yellow (#e9d022)
+    // at low density up through red (#e60b09) at high density.
+    const HEAT_GRADIENT = { 0.2: '#e9d022', 0.6: '#f2650f', 1.0: '#e60b09' };
+
+    // --- Live density heatmap (positions only, no delay weighting) ---
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.35, gradient: {
-                                                                                                            0.10: '#ff9f43',
-                                                                                                            0.30: '#ff7b25',
-                                                                                                            0.50: '#ff5e00',
-                                                                                                            0.70: '#ffcc33',
-                                                                                                            0.90: '#fff176',
-                                                                                                            1.00: '#ffffff'
-                                                                                                            }
-});
-    L.control.layers(null, {
+    const heatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.35, gradient: HEAT_GRADIENT });
+
+    // --- Historical density heatmap, from the gtfs-r-scrape repo ---
+    const histHeatLayer = L.heatLayer([], { radius: 22, blur: 18, maxZoom: 16, minOpacity: 0.25, gradient: HEAT_GRADIENT });
+
+    const layersControl = L.control.layers(null, {
       'Bus markers': markersLayer,
-      'Vehicle density heatmap': heatLayer
+      'Vehicle density heatmap (live)': heatLayer,
+      'Vehicle density heatmap (historical)': histHeatLayer
     }, { collapsed: false }).addTo(map);
+
+    // Inject a small time-window picker under the layer control, only
+    // relevant to the historical layer.
+    const pickerDiv = document.createElement('div');
+    pickerDiv.id = 'histWindowPicker';
+    pickerDiv.innerHTML = `
+      Historical window:
+      <select id="histWindowSelect">
+        <option value="1">Last hour</option>
+        <option value="24" selected>Last 24 hours</option>
+        <option value="168">Last 7 days</option>
+      </select>
+    `;
+    layersControl.getContainer().appendChild(pickerDiv);
+    // Stop map drag/zoom from hijacking clicks on the picker
+    L.DomEvent.disableClickPropagation(pickerDiv);
+
+    async function loadHistoricalHeatmap() {
+      const windowHours = document.getElementById('histWindowSelect').value;
+      try {
+        const res = await fetch('/api/heatmap?window=' + windowHours);
+        const data = await res.json();
+        histHeatLayer.setLatLngs(data.points || []);
+        if (data.error) {
+          console.warn('Historical heatmap:', data.error);
+        }
+      } catch (e) {
+        console.warn('Historical heatmap fetch failed', e);
+      }
+    }
+    document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
+    loadHistoricalHeatmap(); // initial load — independent of the live 15s poll cycle
 
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90; // glyph points right by default; GTFS bearing is clockwise from north
@@ -853,6 +974,7 @@ PAGE = """
     // reloading the tables below.
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
+    setInterval(loadHistoricalHeatmap, 120000); // refresh historical layer every 2 min — matches server cache TTL
   </script>
 </body>
 </html>
@@ -924,6 +1046,21 @@ def api_vehicles():
     data = compute_delay_data(request.args)
     vehicles, map_error = compute_vehicles(data)
     return jsonify({"vehicles": vehicles, "error": map_error})
+
+
+@app.route("/api/heatmap")
+def api_heatmap():
+    """Historical density heatmap points, sourced from the gtfs-r-scrape
+    repo's daily CSVs. ?window=1|24|168 (hours) — defaults to 24."""
+    try:
+        window_hours = int(request.args.get("window", 24))
+    except ValueError:
+        window_hours = 24
+    if window_hours not in (1, 24, 168):
+        window_hours = 24  # guard against arbitrary values hammering GitHub with odd date ranges
+
+    points, error = get_heatmap_points_cached(window_hours)
+    return jsonify({"points": points, "window_hours": window_hours, "error": error})
 
 
 if __name__ == "__main__":
