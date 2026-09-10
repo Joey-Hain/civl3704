@@ -27,40 +27,57 @@ live buses are currently clustered.
 DENSITY HEATMAP (historical): a second toggleable layer, pulling position
 data from the gtfs-r-scrape repo.
 
-HEATMAP ZOOM-LOCK: both heat layers define their radius/blur in METRES and
-recompute the pixel equivalent on every zoom change so the apparent
-geographic scale stays constant. But pure metre-based sizing means that at
-low zoom (a whole-Sydney view) a 220m blob becomes ~3px and dissolves into
-pixel noise — you lose all structure. To fix that, the metre-based radius
-is FLOORED at HEAT_MIN_RADIUS_PX pixels: below the crossover zoom, blobs
-stay at a fixed pixel size so dense corridors remain visible and readable
-when zoomed out. Above the crossover zoom, metre-based sizing takes over
-and blobs represent a real geographic area. Same floor applies to both
-layers so live and historical look consistent at every zoom level.
+HEATMAP ZOOM-LOCK: both heat layers size their radius/blur in METRES,
+converted to screen pixels on every zoom change so the apparent geographic
+scale stays constant. Because pure metre-based sizing collapses to invisible
+sub-pixel dots at low zoom (220m ≈ 3px at a whole-Sydney view), the pixel
+radius is FLOORED at HEAT_MIN_RADIUS_PX. Below the crossover zoom (~14 in
+Sydney), blobs sit at a fixed pixel size so dense corridors stay readable.
+Above it, metre-based sizing takes over. Both layers share the same sizing
+so live and historical look identical at every zoom level.
 
 TRIP HEADSIGNS: enabled. Set ENABLE_TRIP_HEADSIGNS=0 in Render's env to
 disable (frees ~60-80MB on the free tier).
 
 === MEMORY: WHY THIS FILE IS SHAPED THE WAY IT IS ===
 
-The Render free tier gives 512MB RAM. Two things have historically blown it:
+The Render free tier gives 512MB RAM. Three distinct things have historically
+blown it. All three are now fixed, and none of them are obvious from reading
+any single function — the fixes are spread across the file.
 
-  1. Schedule bundle download. Fixed by streaming the schedule zip to disk
-     instead of resp.content. See _download_to_path() and
-     load_schedule_lookups().
+  1. Schedule bundle DOWNLOAD. Fixed by streaming the schedule zip to disk
+     instead of resp.content. See _download_to_path().
 
-  2. Historical heatmap fetch. Fixed by streaming each daily CSV
-     line-by-line via requests(stream=True) + iter_lines + csv.reader,
-     aggregating rows into a local grid dict as they arrive. Peak RSS per
-     worker is one line, not the whole file. Concurrency is capped at 3 so
-     peak RSS across all workers stays in the low MB range. A wall-clock
-     deadline (HEATMAP_DEADLINE_SEC) also stops consuming new futures if
-     the total fetch is running long, and returns whatever was collected —
-     a partial heat layer is infinitely better than a truncated JSON body.
+  2. Schedule bundle REPARSE ON EVERY REQUEST. This was the sneaky one. The
+     row cache has a 12s TTL, and get_all_rows_cached() called
+     load_schedule_lookups() on every expiry. That function read the 60-
+     150MB agency_names.json off disk and re-built the dicts, every 12
+     seconds, while the previous dicts were still referenced by the row
+     cache. That's tens-of-MB churn per tick — enough on a 512MB instance
+     to coincide with a heatmap fetch and get the worker OOM-killed.
+     Fixed by caching the parsed schedule IN MEMORY (_schedule_cache) so it
+     is loaded at most ONCE per process. The disk JSON is now only read on
+     cold start. See load_schedule_lookups().
 
-Also: only ONE gunicorn worker (each worker is a separate process with its
-own copy of every module-level cache). Threads are the right concurrency
-tool here — the workload is HTTP-bound, not CPU-bound.
+  3. Historical heatmap fetch. Fixed by streaming each daily CSV line-by-
+     line via requests(stream=True) + iter_lines + csv.reader, aggregating
+     rows into a local grid dict as they arrive. Peak RSS per worker is one
+     line, not the whole file. See _fetch_one_day_into().
+
+Additionally:
+
+  * A global _heatmap_fetch_lock ensures only one historical fetch runs at
+    a time. Without it, quickly switching the window dropdown (1h → 24h →
+    168h) could stack up 3 concurrent multi-file fetches, each opening 2
+    files, which was another way to reach the memory ceiling.
+
+  * A wall-clock deadline (HEATMAP_DEADLINE_SEC) caps the multi-day fetch:
+    partial data with a note is infinitely better than a truncated JSON
+    body.
+
+  * Only ONE gunicorn worker (each worker is a separate process with its
+    own copy of every cache). Threads are the right concurrency tool — the
+    workload is HTTP-bound, not CPU-bound.
 
 === RENDER SETTINGS THAT MUST BE SET ===
 
@@ -128,7 +145,11 @@ ON_TIME_LATE_SEC = 300
 
 GRID_DECIMALS = 4
 
-HEATMAP_FETCH_CONCURRENCY = 3
+# Historical heatmap fetch tuning. Concurrency=2 (was 3): each worker opens
+# one CSV and streams it line-by-line, but 3 parallel streams plus the rest
+# of the app was occasionally tight on 512MB. 2 is plenty fast and leaves
+# headroom.
+HEATMAP_FETCH_CONCURRENCY = 2
 HEATMAP_DEADLINE_SEC = 45
 
 load_dotenv()
@@ -202,6 +223,22 @@ def parse_ts(raw):
 app = Flask(__name__)
 
 _schedule_lock = threading.Lock()
+_heatmap_fetch_lock = threading.Lock()
+
+# IN-MEMORY cache of the parsed schedule. This is the single most important
+# memory fix in the file. Prior to this, load_schedule_lookups() re-read and
+# re-parsed the 60-150MB agency_names.json off disk every time the row cache
+# (12s TTL) expired, while the old dicts were still referenced by the row
+# cache. On a 512MB instance that churn was the intermittent OOM trigger.
+#
+# Now: the schedule is parsed at most ONCE per process (on cold start), and
+# every subsequent call returns the same object references. Disk JSON is a
+# cold-start fallback only.
+_schedule_cache = {
+    "agency_names": None,
+    "trip_headsigns": None,
+    "error": None,
+}
 
 
 def _download_to_path(url, headers, dest_path, timeout=60):
@@ -244,18 +281,38 @@ def _parse_csv_member(zf, member, key_col, val_col):
 
 
 def load_schedule_lookups():
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error)."""
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
+
+    Returns the SAME in-memory dicts on every call after the first successful
+    load. Never re-reads or re-parses the JSON cache file within a process
+    lifetime. See the module docstring: repeated re-parsing was the primary
+    cause of the intermittent OOM on the free tier.
+    """
     with _schedule_lock:
+        # Fast path: already loaded in this process. This is what every call
+        # after the first one hits, and it's the whole point of the fix.
+        if _schedule_cache["agency_names"] is not None:
+            return (_schedule_cache["agency_names"],
+                    _schedule_cache["trip_headsigns"],
+                    _schedule_cache["error"])
+
+        # Cold start: read the disk cache if it exists and is fresh. This
+        # runs at most once per process lifetime.
         if AGENCY_CACHE_FILE.exists():
             try:
                 with open(AGENCY_CACHE_FILE) as f:
                     cached = json.load(f)
                 fetched_at = datetime.fromisoformat(cached["fetched_at"])
                 if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
+                    _schedule_cache["agency_names"] = cached["agencies"]
+                    _schedule_cache["trip_headsigns"] = cached.get("trip_headsigns", {})
+                    _schedule_cache["error"] = None
+                    _log_rss("schedule-loaded-from-disk")
                     return cached["agencies"], cached.get("trip_headsigns", {}), None
             except Exception:
                 pass
 
+        # Cache miss / stale: download from TfNSW and rebuild.
         tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
         try:
             outer_path = os.path.join(tmpdir, "schedule.zip")
@@ -307,16 +364,26 @@ def load_schedule_lookups():
                     "trip_headsigns": trip_headsigns,
                 }, f)
 
+            _schedule_cache["agency_names"] = agencies
+            _schedule_cache["trip_headsigns"] = trip_headsigns
+            _schedule_cache["error"] = None
             _log_rss("after-cache-write")
             return agencies, trip_headsigns, None
         except Exception as e:
+            # If the download failed but a stale disk cache exists, use it.
             if AGENCY_CACHE_FILE.exists():
                 try:
                     with open(AGENCY_CACHE_FILE) as f:
                         cached = json.load(f)
-                    return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
+                    _schedule_cache["agency_names"] = cached["agencies"]
+                    _schedule_cache["trip_headsigns"] = cached.get("trip_headsigns", {})
+                    _schedule_cache["error"] = f"Using stale cached names ({e})"
+                    return cached["agencies"], cached.get("trip_headsigns", {}), _schedule_cache["error"]
                 except Exception:
                     pass
+            _schedule_cache["agency_names"] = {}
+            _schedule_cache["trip_headsigns"] = {}
+            _schedule_cache["error"] = str(e)
             return {}, {}, str(e)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -564,11 +631,10 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
 def fetch_historical_heatmap_points(window_hours):
     """Fetch density points from the gtfs-r-scrape repo's daily CSVs.
 
-    Each day is fetched and aggregated in a worker thread, but never held
-    as a whole file. Each worker writes into its own local grid dict; the
-    dicts are merged at the end. A wall-clock deadline caps the whole
-    operation: a partial heat layer is infinitely better than a truncated
-    JSON body.
+    Serialised by _heatmap_fetch_lock: only one historical fetch runs at a
+    time across all threads. Without this, rapidly switching the window
+    dropdown (1h → 24h → 168h) could stack up 3 concurrent multi-file
+    fetches, which was another way to reach the memory ceiling.
     """
     start = time.monotonic()
     now = datetime.now(tz=SYDNEY_TZ)
@@ -589,26 +655,27 @@ def fetch_historical_heatmap_points(window_hours):
     last_error = None
     deadline_hit = False
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_fetch_one_day_into, ds, cutoff, local_dicts[i % workers])
-            for i, ds in enumerate(dates_needed)
-        ]
-        for future in as_completed(futures):
-            if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
-                deadline_hit = True
-                print(f"[heatmap] deadline {HEATMAP_DEADLINE_SEC}s hit; "
-                      f"returning partial results from {files_fetched} file(s)", flush=True)
-                break
-            date_str, rows_seen, points_added, error = future.result()
-            if error is not None:
-                last_error = error
-                continue
-            if rows_seen == 0 and points_added == 0:
-                continue
-            files_fetched += 1
-            rows_seen_total += rows_seen
-            points_added_total += points_added
+    with _heatmap_fetch_lock:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_fetch_one_day_into, ds, cutoff, local_dicts[i % workers])
+                for i, ds in enumerate(dates_needed)
+            ]
+            for future in as_completed(futures):
+                if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
+                    deadline_hit = True
+                    print(f"[heatmap] deadline {HEATMAP_DEADLINE_SEC}s hit; "
+                          f"returning partial results from {files_fetched} file(s)", flush=True)
+                    break
+                date_str, rows_seen, points_added, error = future.result()
+                if error is not None:
+                    last_error = error
+                    continue
+                if rows_seen == 0 and points_added == 0:
+                    continue
+                files_fetched += 1
+                rows_seen_total += rows_seen
+                points_added_total += points_added
 
     cells = defaultdict(lambda: [0.0, 0.0, 0])
     for ld in local_dicts:
@@ -780,7 +847,7 @@ PAGE = """
   .flag { color: var(--muted); font-size: 0.75rem; }
   .toggle { color: var(--text); text-decoration: underline; font-size: 0.85rem; }
 
-  #dashmap { height: 700px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
+  #dashmap { height: 600px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
   .map-legend {
     display: flex; gap: 16px; align-items: center;
     font-size: 0.8rem; color: var(--muted); margin-top: 8px; flex-wrap: wrap;
@@ -951,25 +1018,20 @@ PAGE = """
     // --- Zoom-locked heat sizing -----------------------------------------
     //
     // Both heat layers size their radius/blur in METRES, converted to
-    // screen pixels at the current zoom (below), so at high zoom a blob
-    // represents a fixed geographic area (~220m diameter) regardless of
-    // zoom level.
+    // screen pixels at the current zoom, so at high zoom a blob represents
+    // a fixed geographic area (~220m diameter) regardless of zoom level.
     //
     // But pure metre-based sizing breaks at LOW zoom: at a whole-Sydney
-    // view (zoom ~11), 220m is only ~3px on screen, so every cell collapses
-    // into pixel noise and you lose all structure. The fix is a FLOOR on
-    // the computed pixel radius: below the crossover zoom, blobs stay at a
+    // view, 220m is only ~3px on screen, so every cell collapses into
+    // pixel noise and you lose all structure. The fix is a FLOOR on the
+    // computed pixel radius: below the crossover zoom, blobs stay at a
     // fixed pixel size (HEAT_MIN_RADIUS_PX) so dense corridors remain
-    // visible and readable. Above the crossover zoom, metre-based sizing
-    // takes over and the "real geographic area" semantics are preserved.
-    //
-    // The crossover zoom (where metre→pixel equals the floor) is roughly
-    // zoom 14 in Sydney. Below it, pixel radius is constant; above it,
-    // pixel radius grows with zoom.
+    // visible. Above the crossover zoom, metre-based sizing takes over.
     //
     // Tune HEAT_MIN_RADIUS_PX up for chunkier blobs when zoomed out, down
-    // for finer structure. HEAT_MIN_BLUR_PX controls the softness of the
-    // edges at low zoom.
+    // for finer structure. HEAT_MIN_BLUR_PX controls edge softness at low
+    // zoom. Both layers share the same sizing so live and historical look
+    // identical at every zoom level.
     const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
     const HEAT_MIN_RADIUS_PX = 12, HEAT_MIN_BLUR_PX = 10;
 
@@ -985,8 +1047,6 @@ PAGE = """
     function updateHeatRadii() {
       const zoom = map.getZoom();
       const lat = map.getCenter().lat;
-      // Metre-based sizing, floored at a minimum pixel radius so low-zoom
-      // views keep their detail instead of collapsing to point noise.
       const radius = Math.max(metresToPixels(HEAT_RADIUS_M, zoom, lat), HEAT_MIN_RADIUS_PX);
       const blur = Math.max(metresToPixels(HEAT_BLUR_M, zoom, lat), HEAT_MIN_BLUR_PX);
       heatLayer.setOptions({ radius: radius, blur: blur });
@@ -1023,11 +1083,6 @@ PAGE = """
       statusDiv.style.color = '#666';
       try {
         const res = await fetch('/api/heatmap?window=' + windowHours);
-        // Read the body as text FIRST, then JSON.parse it. If the response
-        // was truncated (proxy timeout, worker OOM mid-response), fetch
-        // would normally throw the unhelpful "Unexpected end of JSON"
-        // error; by reading text we can at least show what actually came
-        // back, which is usually an HTML error page from the proxy.
         const text = await res.text();
         let data;
         try {
