@@ -52,20 +52,41 @@ with a 20-second deadline, aggregating into rounded lat/lon grid cells
 size and memory regardless of how many readings a window covers. The
 frontend auto-loads it on page view and every 5 minutes after.
 
-Each cell's heat WEIGHT is mean lateness (seconds late, floored at 0 so
-early running never cancels out a late reading elsewhere), not raw ping
-count — a busy interchange with mostly on-time buses should not outrank a
-quiet corridor where buses are consistently 15 minutes late. See
-HEATMAP_SEVERITY_CAP_SEC for the value that saturates the gradient.
+/api/heatmap takes a &metric= of "delay" (default), "density", or "speed".
+Fetching and aggregating a window's CSVs into grid cells is the expensive
+part (network + parse), and is identical regardless of which metric the
+caller wants — so that work is cached per window_hours only
+(get_historical_cells_cached), independent of metric. Turning cached cells
+into a metric's weighted points (compute_metric_points) is cheap pure
+arithmetic done fresh on every request, so switching the metric dropdown
+client-side never triggers a re-fetch.
 
-Weight is also scaled by a confidence factor — min(n_delay_readings /
-HEATMAP_CONFIDENT_SAMPLES, 1) — so a cell backed by only one or two
-readings fades toward the cool end even if that one reading was severe,
-rather than painting a full-strength hotspot off a single noisy ping. A
-hard minimum-sample cutoff was tried first and rejected: the scrape
-cadence in practice is roughly every 2-3 hours (see gtfs-r-scrape), so
-"Last hour" would almost always have exactly one reading per cell and a
-cutoff of 2+ would leave that window essentially blank.
+Per-metric weighting:
+  - delay: mean lateness (seconds late, floored at 0 so early running never
+    cancels out a late reading elsewhere), not raw ping count — a busy
+    interchange with mostly on-time buses should not outrank a quiet
+    corridor where buses are consistently 15 minutes late. See
+    HEATMAP_SEVERITY_CAP_SEC for the value that saturates the gradient.
+  - speed: mean speed (km/h, from the collector's speed_kmh column),
+    normalised against HEATMAP_SPEED_CAP_KMH. Hotter = faster, not
+    slower — this is a "where do buses actually get to move" view, the
+    mirror image of the delay heatmap rather than a congestion map.
+  - density: raw ping count per cell, normalised against the busiest cell
+    in the window (no confidence scaling — the count itself IS the
+    sample size, unlike delay/speed which are means over however many
+    readings landed in a cell). This is deliberately the simplest of the
+    three: it exists mainly to prove the heatmap rendering pipeline is
+    correct independent of any weighting logic.
+
+delay and speed weight are both scaled by a confidence factor —
+min(n_readings / HEATMAP_CONFIDENT_SAMPLES, 1) — so a cell backed by only
+one or two readings fades toward the cool end even if that one reading was
+extreme, rather than painting a full-strength hotspot off a single noisy
+ping. A hard minimum-sample cutoff was tried first (for delay) and
+rejected: the scrape cadence in practice is roughly every 2-3 hours (see
+gtfs-r-scrape), so "Last hour" would almost always have exactly one
+reading per cell and a cutoff of 2+ would leave that window essentially
+blank.
 
 === RENDER SETTINGS ===
 
@@ -125,10 +146,16 @@ HEATMAP_DEADLINE_SEC = 20
 # well above ON_TIME_LATE_SEC (300s) so the ramp has room to distinguish
 # "mildly late" from "genuinely stuck" before it maxes out.
 HEATMAP_SEVERITY_CAP_SEC = 600
-# A cell needs this many delay-bearing readings to be shown at full
-# confidence; fewer readings fade its weight toward 0 (see
-# fetch_historical_heatmap_points) rather than being dropped outright.
+# A cell needs this many delay- or speed-bearing readings to be shown at
+# full confidence; fewer readings fade its weight toward 0 (see
+# compute_metric_points) rather than being dropped outright.
 HEATMAP_CONFIDENT_SAMPLES = 3
+# Speed (km/h) at which the speed-heatmap gradient saturates. Set above
+# typical arterial running speed for Sydney buses so genuinely fast runs
+# (clearways, motorway sections) stand out rather than the whole map
+# reading as "hot".
+HEATMAP_SPEED_CAP_KMH = 60.0
+VALID_HEATMAP_METRICS = ("delay", "density", "speed")
 
 PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
@@ -495,7 +522,10 @@ CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
-_heatmap_cache = {}
+# Keyed by window_hours only (NOT by metric) — see the module docstring's
+# "HISTORICAL HEATMAP" section for why the fetch/aggregate step is cached
+# independently of which metric the caller asked for.
+_heatmap_cells_cache = {}
 
 # Locks guarding each cache's fetch path. With threaded gunicorn workers,
 # several requests can hit a stale cache at the same instant — without a
@@ -556,14 +586,20 @@ def get_vehicles_cached(agency_names, trip_headsigns):
 def _fetch_one_day_into(date_str, cutoff, local_cells):
     """Aggregate one day's CSV into local_cells, keyed by rounded (lat, lon).
 
-    Each cell accumulates [lat_sum, lon_sum, n_total, late_sum_sec, n_delay]:
+    Each cell accumulates [lat_sum, lon_sum, n_total, late_sum_sec, n_delay,
+    speed_sum_kmh, n_speed]:
       - lat_sum/lon_sum/n_total: for the cell's plotted position (its mean
-        vehicle location), independent of whether delay data was present.
+        vehicle location) and its ping count, independent of whether delay
+        or speed data was present. n_total alone is what the density metric
+        weights by.
       - late_sum_sec/n_delay: for mean lateness, seconds late floored at 0
         (an early or on-time reading contributes 0, never a negative that
         would mask a late reading elsewhere in the same cell). Anomalous
         readings already arrive as an empty delay_sec from the collector,
         so they're naturally excluded here.
+      - speed_sum_kmh/n_speed: for mean speed. Zero and missing speed
+        readings are common (a bus stopped at a light, or a feed gap) —
+        zero is kept (it's a real reading), missing/unparseable is not.
     """
     url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
     rows_seen = 0
@@ -588,6 +624,7 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
             except ValueError:
                 return date_str, 0, 0, f"{date_str}: missing required columns"
             delay_idx = header.index("delay_sec") if "delay_sec" in header else None
+            speed_idx = header.index("speed_kmh") if "speed_kmh" in header else None
             max_idx = max(ts_idx, lat_idx, lon_idx)
             for i, row in enumerate(csv.reader(lines)):
                 if i % 2000 == 0:
@@ -616,13 +653,25 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
                     if delay_sec is not None:
                         c[3] += max(delay_sec, 0.0)
                         c[4] += 1
+                if speed_idx is not None and len(row) > speed_idx and row[speed_idx].strip():
+                    try:
+                        speed_kmh = float(row[speed_idx])
+                    except ValueError:
+                        speed_kmh = None
+                    if speed_kmh is not None and speed_kmh >= 0:
+                        c[5] += speed_kmh
+                        c[6] += 1
                 points_added += 1
             return date_str, rows_seen, points_added, None
     except requests.RequestException as e:
         return date_str, 0, 0, f"{date_str}: {e}"
 
 
-def fetch_historical_heatmap_points(window_hours):
+def fetch_historical_cells(window_hours):
+    """Fetch + aggregate a window's CSVs into grid cells. This is the
+    expensive, metric-independent half of building a historical heatmap —
+    see compute_metric_points() for turning these cells into a specific
+    metric's weighted points."""
     start = time.monotonic()
     now = datetime.now(tz=SYDNEY_TZ)
     cutoff = now - timedelta(hours=window_hours)
@@ -633,7 +682,7 @@ def fetch_historical_heatmap_points(window_hours):
         d += timedelta(days=1)
 
     workers = max(1, min(HEATMAP_FETCH_CONCURRENCY, len(dates_needed)))
-    local_dicts = [defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0]) for _ in range(workers)]
+    local_dicts = [defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0]) for _ in range(workers)]
 
     files_fetched = 0
     rows_seen_total = 0
@@ -660,7 +709,7 @@ def fetch_historical_heatmap_points(window_hours):
             rows_seen_total += rows_seen
             points_added_total += points_added
 
-    cells = defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0])
+    cells = defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0])
     for ld in local_dicts:
         for key, c in ld.items():
             tgt = cells[key]
@@ -669,26 +718,64 @@ def fetch_historical_heatmap_points(window_hours):
             tgt[2] += c[2]
             tgt[3] += c[3]
             tgt[4] += c[4]
+            tgt[5] += c[5]
+            tgt[6] += c[6]
 
     cells_with_delay = sum(1 for c in cells.values() if c[4] > 0)
+    cells_with_speed = sum(1 for c in cells.values() if c[6] > 0)
     print(f"[heatmap] window={window_hours}h files={files_fetched} "
           f"rows={rows_seen_total} points={points_added_total} cells={len(cells)} "
-          f"cells_with_delay={cells_with_delay} "
+          f"cells_with_delay={cells_with_delay} cells_with_speed={cells_with_speed} "
           f"elapsed={time.monotonic() - start:.1f}s deadline_hit={deadline_hit}", flush=True)
 
-    if not cells:
-        if files_fetched == 0:
-            return [], last_error or "No data files found for this window"
-        return [], f"Fetched {files_fetched} file(s) but no rows fell inside the window"
+    return {
+        "cells": cells,
+        "files_fetched": files_fetched,
+        "rows_seen_total": rows_seen_total,
+        "last_error": last_error,
+        "deadline_hit": deadline_hit,
+    }
 
-    # Weight is mean lateness (seconds late, floored at 0), normalised
-    # against HEATMAP_SEVERITY_CAP_SEC — NOT ping density. A cell with
-    # plenty of on-time traffic should stay cool; a cell with few but
-    # consistently very-late readings should still register as a hotspot.
-    # That severity is then scaled by a confidence factor so a cell backed
-    # by only one or two readings can't paint a full-strength hotspot off
-    # a single noisy ping (see HEATMAP_CONFIDENT_SAMPLES above). Cells with
-    # zero delay-bearing readings are dropped — there's nothing to weight.
+
+def compute_metric_points(cells, metric):
+    """Turn aggregated cells into [lat, lon, weight] points for one metric.
+    Pure/cheap — no network — so switching the metric dropdown client-side
+    never re-triggers a CSV fetch (see get_heatmap_points_cached)."""
+    if metric == "density":
+        # Raw ping count per cell, normalised against the busiest cell in
+        # the window. No confidence scaling: the count itself already IS
+        # the sample size, unlike the mean-based delay/speed metrics. This
+        # is the simplest of the three metrics by design — mainly useful
+        # for confirming the heatmap rendering pipeline itself is correct.
+        eligible = [c for c in cells.values() if c[2] > 0]
+        if not eligible:
+            return []
+        max_count = max(c[2] for c in eligible)
+        return [[c[0] / c[2], c[1] / c[2], c[2] / max_count] for c in eligible]
+
+    if metric == "speed":
+        # Weight is mean speed (km/h), normalised against
+        # HEATMAP_SPEED_CAP_KMH — hotter = faster, the mirror image of the
+        # delay metric. Scaled by the same confidence factor as delay so a
+        # single fast/slow ping can't paint a full-strength cell.
+        points = []
+        for c in cells.values():
+            if c[6] <= 0:
+                continue
+            mean_speed = c[5] / c[6]
+            norm = min(mean_speed / HEATMAP_SPEED_CAP_KMH, 1.0)
+            confidence = min(c[6] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
+            points.append([c[0] / c[2], c[1] / c[2], norm * confidence])
+        return points
+
+    # metric == "delay" (default/fallback): mean lateness (seconds late,
+    # floored at 0), normalised against HEATMAP_SEVERITY_CAP_SEC — NOT ping
+    # density. A cell with plenty of on-time traffic should stay cool; a
+    # cell with few but consistently very-late readings should still
+    # register as a hotspot. Scaled by the confidence factor so a cell
+    # backed by only one or two readings can't paint a full-strength
+    # hotspot off a single noisy ping. Cells with zero delay-bearing
+    # readings are dropped — there's nothing to weight.
     points = []
     for c in cells.values():
         if c[4] <= 0:
@@ -696,29 +783,52 @@ def fetch_historical_heatmap_points(window_hours):
         severity = min((c[3] / c[4]) / HEATMAP_SEVERITY_CAP_SEC, 1.0)
         confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
         points.append([c[0] / c[2], c[1] / c[2], severity * confidence])
-    note = None
-    if deadline_hit:
-        note = f"Partial data (deadline hit after {HEATMAP_DEADLINE_SEC}s)"
-    elif not points:
-        note = f"Fetched {files_fetched} file(s) but no rows had delay data yet"
-    return points, note
+    return points
 
 
-def get_heatmap_points_cached(window_hours):
+_METRIC_LABELS = {"delay": "delay", "density": "vehicle", "speed": "speed"}
+
+
+def get_historical_cells_cached(window_hours):
     now = datetime.now(tz=SYDNEY_TZ)
-    cached = _heatmap_cache.get(window_hours)
+    cached = _heatmap_cells_cache.get(window_hours)
     if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
-        return cached["points"], cached["error"]
+        return cached
 
     with _heatmap_lock:
         now = datetime.now(tz=SYDNEY_TZ)
-        cached = _heatmap_cache.get(window_hours)
+        cached = _heatmap_cells_cache.get(window_hours)
         if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
-            return cached["points"], cached["error"]
+            return cached
 
-        points, error = fetch_historical_heatmap_points(window_hours)
-        _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
-        return points, error
+        meta = fetch_historical_cells(window_hours)
+        meta["fetched_at"] = now
+        _heatmap_cells_cache[window_hours] = meta
+        return meta
+
+
+def get_heatmap_points_cached(window_hours, metric):
+    if metric not in VALID_HEATMAP_METRICS:
+        metric = "delay"
+
+    meta = get_historical_cells_cached(window_hours)
+    cells = meta["cells"]
+
+    if not cells:
+        if meta["files_fetched"] == 0:
+            return [], meta["last_error"] or "No data files found for this window"
+        return [], f"Fetched {meta['files_fetched']} file(s) but no rows fell inside the window"
+
+    points = compute_metric_points(cells, metric)
+
+    if meta["deadline_hit"]:
+        note = f"Partial data (deadline hit after {HEATMAP_DEADLINE_SEC}s)"
+    elif not points:
+        label = _METRIC_LABELS.get(metric, metric)
+        note = f"Fetched {meta['files_fetched']} file(s) but no rows had {label} data yet"
+    else:
+        note = None
+    return points, note
 
 
 def compute_delay_data(args):
@@ -898,21 +1008,54 @@ PAGE = """
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
     const markers = new Map();
 
-    // Two hue families, one per layer, so live and historical read as
-    // distinct even when both are switched on together. Both are
-    // ColorBrewer sequential, colorblind-safe ramps — not the rainbow-like
-    // Plasma scale this used to share across both layers, which made "how
-    // late" hard to read at a glance and gave no visual cue for which
-    // layer you were looking at.
-    //   Live   = warm (YlOrRd): "how late is traffic right now"
-    //   Historical = cool/violet (BuPu): "how late has this spot been, on average"
-    const LIVE_GRADIENT = { 0.0:'#ffffb2', 0.25:'#fecc5c', 0.5:'#fd8d3c', 0.75:'#f03b20', 1.0:'#bd0026' };
-    const HIST_GRADIENT = { 0.0:'#edf8fb', 0.25:'#b3cde3', 0.5:'#8c96c6', 0.75:'#8856a7', 1.0:'#810f7c' };
-    // Both layers' weight is "minutes late" (0 = on time/early, capped at
-    // the value below), not raw ping density — see /api/heatmap and
-    // renderVehicles(). Keep this in sync with HEATMAP_SEVERITY_CAP_SEC
-    // server-side so the live and historical legends mean the same thing.
+    // One metric dropdown drives both heat layers at once, rather than a
+    // separate live+historical toggle pair per metric (6 checkboxes for
+    // density/delay/speed × live/historical was unmanageable). Each metric
+    // still gets its own live/historical colour-family pair — same idea as
+    // the original delay-only scheme — so the two active layers read as
+    // distinct from each other, but only one metric's pair is ever visible
+    // at a time. All gradients are ColorBrewer sequential, colorblind-safe
+    // ramps (not a shared rainbow scale, which made "how much" hard to
+    // read at a glance and gave no visual cue for which layer/metric you
+    // were looking at).
+    const METRICS = {
+      delay: {
+        label: 'Delay',
+        liveGradient:  { 0.0:'#ffffb2', 0.25:'#fecc5c', 0.5:'#fd8d3c', 0.75:'#f03b20', 1.0:'#bd0026' }, // YlOrRd
+        histGradient:  { 0.0:'#edf8fb', 0.25:'#b3cde3', 0.5:'#8c96c6', 0.75:'#8856a7', 1.0:'#810f7c' }, // BuPu
+        liveTitle: 'Live snapshot — current lateness',
+        histTitle: 'Historical window — mean lateness',
+        ticks: ['0 min late', 'SEVERITY_CAP+ min late'],
+      },
+      density: {
+        label: 'Density',
+        liveGradient:  { 0.0:'#f7fbff', 0.25:'#c6dbef', 0.5:'#6baed6', 0.75:'#3182bd', 1.0:'#08519c' }, // Blues
+        histGradient:  { 0.0:'#fcfbfd', 0.25:'#dadaeb', 0.5:'#9e9ac8', 0.75:'#807dba', 1.0:'#54278f' }, // Purples
+        liveTitle: 'Live snapshot — vehicle density',
+        histTitle: 'Historical window — vehicle density',
+        ticks: ['fewer pings', 'more pings'],
+      },
+      speed: {
+        label: 'Speed',
+        liveGradient:  { 0.0:'#ffffe5', 0.25:'#c7e9b4', 0.5:'#78c679', 0.75:'#31a354', 1.0:'#006837' }, // YlGn
+        histGradient:  { 0.0:'#feedde', 0.25:'#fdbe85', 0.5:'#fd8d3c', 0.75:'#e6550d', 1.0:'#a63603' }, // Oranges
+        liveTitle: 'Live snapshot — current speed',
+        histTitle: 'Historical window — mean speed',
+        ticks: ['0 km/h', 'SPEED_CAP+ km/h'],
+      },
+    };
+    const DEFAULT_METRIC = 'delay';
+    let currentMetric = DEFAULT_METRIC;
+    let lastVehicles = [];
+
+    // Keep these two in sync with their server-side counterparts
+    // (HEATMAP_SEVERITY_CAP_SEC, HEATMAP_SPEED_CAP_KMH) so the live and
+    // historical legends mean the same thing for the same metric.
     const SEVERITY_CAP_MIN = 10;
+    const SPEED_CAP_KMH = 60;
+    METRICS.delay.ticks[1] = `${SEVERITY_CAP_MIN}+ min late`;
+    METRICS.speed.ticks[1] = `${SPEED_CAP_KMH}+ km/h`;
+
     const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
     const HEAT_MIN_RADIUS_PX = 12, HEAT_MIN_BLUR_PX = 10;
 
@@ -921,8 +1064,8 @@ PAGE = """
       return metres / mpp;
     }
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:15, minOpacity:0.12, gradient:LIVE_GRADIENT });
-    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:14, minOpacity:0.12, gradient:HIST_GRADIENT });
+    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:15, minOpacity:0.12, gradient:METRICS[DEFAULT_METRIC].liveGradient });
+    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, maxZoom:14, minOpacity:0.12, gradient:METRICS[DEFAULT_METRIC].histGradient });
 
     function updateHeatRadii() {
       const zoom = map.getZoom();
@@ -935,8 +1078,8 @@ PAGE = """
     map.on('zoomend', updateHeatRadii);
     updateHeatRadii();
 
-    const LIVE_LAYER_NAME = 'Delay heatmap (live)';
-    const HIST_LAYER_NAME = 'Delay heatmap (historical)';
+    const LIVE_LAYER_NAME = 'Heatmap (live)';
+    const HIST_LAYER_NAME = 'Heatmap (historical)';
     const layersControl = L.control.layers(null, {
       'Bus markers': markersLayer,
       [LIVE_LAYER_NAME]: heatLayer,
@@ -948,19 +1091,19 @@ PAGE = """
         .map(k => `${gradient[k]} ${Math.round(k * 100)}%`);
       return `linear-gradient(to right, ${stops.join(', ')})`;
     }
-    function makeHeatLegend(id, title, gradient) {
+    function makeHeatLegend(id) {
       const div = document.createElement('div');
       div.className = 'heat-legend';
       div.id = id;
       div.hidden = true;
-      div.innerHTML = `<div class="heat-legend-title">${title}</div>
-        <div class="heat-legend-bar" style="background:${gradientCss(gradient)}"></div>
-        <div class="heat-legend-ticks"><span>0 min late</span><span>${SEVERITY_CAP_MIN}+ min late</span></div>`;
+      div.innerHTML = `<div class="heat-legend-title"></div>
+        <div class="heat-legend-bar"></div>
+        <div class="heat-legend-ticks"><span></span><span></span></div>`;
       layersControl.getContainer().appendChild(div);
       return div;
     }
-    const liveLegend = makeHeatLegend('liveHeatLegend', 'Live snapshot — current lateness', LIVE_GRADIENT);
-    const histLegend = makeHeatLegend('histHeatLegend', 'Historical window — mean lateness', HIST_GRADIENT);
+    const liveLegend = makeHeatLegend('liveHeatLegend');
+    const histLegend = makeHeatLegend('histHeatLegend');
     map.on('overlayadd', e => {
       if (e.name === LIVE_LAYER_NAME) liveLegend.hidden = false;
       if (e.name === HIST_LAYER_NAME) histLegend.hidden = false;
@@ -969,6 +1112,24 @@ PAGE = """
       if (e.name === LIVE_LAYER_NAME) liveLegend.hidden = true;
       if (e.name === HIST_LAYER_NAME) histLegend.hidden = true;
     });
+
+    function fillLegend(div, gradient, title, ticks) {
+      div.querySelector('.heat-legend-title').textContent = title;
+      div.querySelector('.heat-legend-bar').style.background = gradientCss(gradient);
+      const [t0, t1] = div.querySelectorAll('.heat-legend-ticks span');
+      t0.textContent = ticks[0];
+      t1.textContent = ticks[1];
+    }
+
+    const metricPickerDiv = document.createElement('div');
+    metricPickerDiv.id = 'heatMetricPicker';
+    metricPickerDiv.innerHTML = `Heatmap metric: <select id="heatMetricSelect">
+        <option value="delay" selected>Delay</option>
+        <option value="density">Density</option>
+        <option value="speed">Speed</option>
+      </select>`;
+    layersControl.getContainer().appendChild(metricPickerDiv);
+    L.DomEvent.disableClickPropagation(metricPickerDiv);
 
     const pickerDiv = document.createElement('div');
     pickerDiv.id = 'histWindowPicker';
@@ -984,11 +1145,12 @@ PAGE = """
       statusDiv.textContent = 'Loading…';
       statusDiv.style.color = '#666';
       try {
-        const res = await fetch('/api/heatmap?window=' + wh);
+        const res = await fetch(`/api/heatmap?window=${wh}&metric=${currentMetric}`);
         const text = await res.text();
         let data;
         try { data = JSON.parse(text); }
         catch (e) { statusDiv.textContent = `Bad response (HTTP ${res.status})`; statusDiv.style.color = '#b3261e'; return; }
+        if (data.metric && data.metric !== currentMetric) return; // stale response from a metric switch mid-flight
         const points = data.points || [];
         histHeatLayer.setLatLngs(points);
         if (data.error) { statusDiv.textContent = data.error; statusDiv.style.color = '#b3261e'; }
@@ -997,7 +1159,56 @@ PAGE = """
       } catch (e) { statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e'; }
     }
     document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
-    loadHistoricalHeatmap();
+
+    // Per-vehicle live heat weight for the current metric. Returns null to
+    // exclude a vehicle from the live layer entirely (no data for that
+    // metric), vs 0 which is a real "no heat contribution" reading.
+    function liveWeightFor(v, metric) {
+      if (metric === 'density') {
+        // Every reporting vehicle counts equally — overlapping pings are
+        // what create hot spots, via the heat layer's own additive
+        // rendering. Deliberately the simplest metric (see server docstring).
+        return 1;
+      }
+      if (metric === 'speed') {
+        if (v.speed == null) return null;
+        const kmh = v.speed * 3.6;
+        if (kmh < 0) return null;
+        return Math.min(kmh / SPEED_CAP_KMH, 1);
+      }
+      // delay (default): weight by this vehicle's own lateness, not by
+      // 1-per-vehicle — otherwise the heat layer just draws the route
+      // network (wherever buses happen to be) rather than where they're
+      // currently running late. Vehicles with no delay reading or a
+      // flagged anomaly don't contribute a heat point (still shown as a
+      // marker), since we can't say whether they're a bottleneck or not.
+      if (v.delay_min == null || v.anomaly) return null;
+      return Math.min(Math.max(v.delay_min, 0) / SEVERITY_CAP_MIN, 1);
+    }
+
+    function updateLiveHeatFromVehicles(vehicles) {
+      const heatPoints = [];
+      vehicles.forEach(v => {
+        if (v.lat == null || v.lon == null) return;
+        const w = liveWeightFor(v, currentMetric);
+        if (w !== null) heatPoints.push([v.lat, v.lon, w]);
+      });
+      heatLayer.setLatLngs(heatPoints);
+    }
+
+    function applyMetric(metric) {
+      currentMetric = metric;
+      const cfg = METRICS[metric];
+      heatLayer.setOptions({ gradient: cfg.liveGradient });
+      histHeatLayer.setOptions({ gradient: cfg.histGradient });
+      fillLegend(liveLegend, cfg.liveGradient, cfg.liveTitle, cfg.ticks);
+      fillLegend(histLegend, cfg.histGradient, cfg.histTitle, cfg.ticks);
+      updateLiveHeatFromVehicles(lastVehicles);
+      loadHistoricalHeatmap();
+    }
+    document.getElementById('heatMetricSelect').addEventListener('change', e => applyMetric(e.target.value));
+
+    applyMetric(DEFAULT_METRIC);
 
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
@@ -1015,22 +1226,12 @@ PAGE = """
       return `<strong>${rl}</strong><br>${v.route_operator || 'Unknown operator'}<br>Trip ${v.trip_id ?? '?'}<br>${dt}<br>${sk}`;
     }
     function renderVehicles(vehicles) {
+      lastVehicles = vehicles;
       const seen = new Set();
-      const heatPoints = [];
       vehicles.forEach(v => {
         if (v.lat == null || v.lon == null) return;
         const key = v.vehicle_id || v.trip_id;
         seen.add(key);
-        // Weight by this vehicle's own lateness, not by 1-per-vehicle —
-        // otherwise the heat layer just draws the route network (wherever
-        // buses happen to be) rather than where they're currently running
-        // late. Vehicles with no delay reading or a flagged anomaly don't
-        // contribute a heat point (still shown as a marker), since we
-        // can't say whether they're a bottleneck or not.
-        if (v.delay_min != null && !v.anomaly) {
-          const weight = Math.min(Math.max(v.delay_min, 0) / SEVERITY_CAP_MIN, 1);
-          if (weight > 0) heatPoints.push([v.lat, v.lon, weight]);
-        }
         const rl = v.route_num || v.route_id || '?';
         const icon = makeIcon(rl, v.bearing, v.outline_color || '#888');
         const popup = popupContent(v);
@@ -1047,7 +1248,7 @@ PAGE = """
         }
       });
       for (const [key, m] of markers) { if (!seen.has(key)) { markersLayer.removeLayer(m); markers.delete(key); } }
-      heatLayer.setLatLngs(heatPoints);
+      updateLiveHeatFromVehicles(vehicles);
     }
     async function pollVehicles() {
       try { const res = await fetch('/api/vehicles' + window.location.search); const data = await res.json(); renderVehicles(data.vehicles || []); }
@@ -1075,10 +1276,11 @@ def health():
 @app.route("/status")
 def status():
     heatmap_state = {}
-    for wh, entry in _heatmap_cache.items():
+    for wh, entry in _heatmap_cells_cache.items():
         heatmap_state[str(wh)] = {
-            "points": len(entry["points"]),
-            "error": entry["error"],
+            "cells": len(entry["cells"]),
+            "files_fetched": entry["files_fetched"],
+            "error": entry["last_error"],
             "age_seconds": (datetime.now(tz=SYDNEY_TZ) - entry["fetched_at"]).total_seconds(),
         }
     agencies = _schedule_cache["agency_names"]
@@ -1161,10 +1363,13 @@ def api_heatmap():
             window_hours = 24
         if window_hours not in (1, 24, 168):
             window_hours = 24
-        points, error = get_heatmap_points_cached(window_hours)
-        return jsonify({"points": points, "window_hours": window_hours, "error": error})
+        metric = request.args.get("metric", "delay")
+        if metric not in VALID_HEATMAP_METRICS:
+            metric = "delay"
+        points, error = get_heatmap_points_cached(window_hours, metric)
+        return jsonify({"points": points, "window_hours": window_hours, "metric": metric, "error": error})
     except Exception as e:
-        return jsonify({"points": [], "window_hours": None, "error": f"Server error: {e}"}), 200
+        return jsonify({"points": [], "window_hours": None, "metric": None, "error": f"Server error: {e}"}), 200
 
 
 if __name__ == "__main__":
