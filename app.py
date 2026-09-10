@@ -66,8 +66,13 @@ MEMORY NOTES (why this file is shaped the way it is):
     TfNSW, HTTP to GitHub), so threads are the right tool and keep the
     caches singular.
 
-  * A dedicated /health route exists so Render's health check doesn't hit
-    the expensive / route. See "DEPLOYMENT" below.
+  * The schedule prewarm (a 30-second download + CPU-heavy CSV parse) is
+    started LAZILY on the first dashboard request, NOT from /health and
+    NOT at import time. Render's HTTP health check requires a 2xx response
+    within 5 seconds; if the prewarm thread holds the GIL during parsing,
+    the health check can't run, Render marks the service unhealthy, and it
+    enters a restart loop that surfaces as "No open HTTP ports detected on
+    0.0.0.0" and a 502 to clients.
 
 NOTE: an earlier version of this file also drew GTFS route-shape polylines
 under the bus markers. That feature has been removed (scope cut) — schedule
@@ -93,13 +98,13 @@ DEPLOYMENT (Render):
 
     Health Check Path: /health  (Settings -> Health Checks)
 
-    Render's default health check hits /, which does a lot of work (fetches
-    both TfNSW feeds, joins them, renders a template). If that takes longer
-    than Render's 30s health-check timeout — which it will on a cold cache —
-    Render marks the port as unresponsive and enters a restart loop, which
-    surfaces as "No open HTTP ports detected on 0.0.0.0" in the logs and a
-    502/503 to clients. Pointing the health check at /health (which returns
-    instantly and starts the schedule prewarm in the background) fixes it.
+    Render's HTTP health check must receive a 2xx/3xx response within 5
+    seconds. /health returns "ok" instantly with zero side effects — it
+    does NOT start the schedule prewarm, because that would hold the GIL
+    during parsing and starve the health check of CPU. The prewarm runs
+    lazily on the first dashboard request instead, by which point the
+    user is already waiting and Render's health check tolerance (15s
+    before traffic stops, 60s before restart) absorbs the parse window.
 """
 
 import codecs
@@ -109,6 +114,7 @@ import json
 import os
 import statistics
 import threading
+import time
 import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -138,6 +144,11 @@ ON_TIME_LATE_SEC = 300    # 5 min late — standard industry on-time window
 # GPS readings from the same stop/street collapse into one cell. See the
 # MEMORY NOTES in the module docstring.
 GRID_DECIMALS = 4
+
+# Yield the GIL every N rows while parsing the schedule CSVs. Without this,
+# a single CPU-bound parsing thread can starve gunicorn's other threads
+# (including Render's HTTP health check) for the whole parse duration.
+GIL_YIELD_EVERY = 2000
 
 load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
@@ -227,10 +238,10 @@ app = Flask(__name__)
 # memory spike.
 _schedule_lock = threading.Lock()
 
-# Prewarm is started on the first request rather than at import time. Running
-# it at import meant a 30s network download competed with Render's health
-# check during worker boot, which was contributing to the "No open HTTP
-# ports detected" restart loop.
+# Prewarm is started on the first dashboard request, NOT on /health and NOT
+# at import time. /health must return instantly and with zero side effects
+# so Render's 5-second HTTP health check always passes. See the MEMORY
+# NOTES / DEPLOYMENT sections in the module docstring.
 _prewarm_started = False
 _prewarm_lock = threading.Lock()
 
@@ -247,8 +258,10 @@ def _prewarm_schedule_cache():
 
 
 def _start_prewarm_once():
-    """Start the schedule prewarm thread exactly once, on first request.
-    Called from /health and /."""
+    """Start the schedule prewarm thread exactly once. Called from the
+    dashboard route only — NOT from /health, because starting a CPU-heavy
+    parse during a health check starves the health check of the GIL and
+    causes Render to mark the service unhealthy."""
     global _prewarm_started
     if _prewarm_started:
         return
@@ -266,8 +279,10 @@ def _parse_csv_member(zf: zipfile.ZipFile, member: str, key_col: str, value_col:
     into memory first. The previous version did zf.read(...).decode(...)
     followed by list(csv.reader(...)), which held the raw bytes, the decoded
     string, and a list-of-lists of every row in memory simultaneously — for
-    a statewide trips.txt that was a 100-200 MB transient peak right during
-    Render's health-check window.
+    a statewide trips.txt that was a 100-200 MB transient peak.
+
+    Yields the GIL every GIL_YIELD_EVERY rows so gunicorn's other threads
+    (including Render's HTTP health check) can run during the parse.
     """
     result = {}
     if member not in zf.namelist():
@@ -282,7 +297,9 @@ def _parse_csv_member(zf: zipfile.ZipFile, member: str, key_col: str, value_col:
             return result
         key_idx = header.index(key_col)
         val_idx = header.index(value_col)
-        for row in reader:
+        for i, row in enumerate(reader):
+            if i % GIL_YIELD_EVERY == 0:
+                time.sleep(0)  # release GIL so other threads can run
             if len(row) > max(key_idx, val_idx) and row[val_idx].strip():
                 result[row[key_idx].strip()] = row[val_idx].strip()
     return result
@@ -1219,12 +1236,16 @@ PAGE = """
 
 @app.route("/health")
 def health():
-    """Render health-check target. Must respond instantly — does not touch
-    the TfNSW APIs or the schedule cache. Starting the prewarm thread here
-    (rather than at import time) means the schedule download happens in the
-    background while Render is already satisfied the service is up, instead
-    of competing with the health check during worker boot."""
-    _start_prewarm_once()
+    """Render health-check target. Returns instantly with ZERO side effects.
+
+    Deliberately does NOT start the schedule prewarm: that prewarm does a
+    30-second download plus a CPU-heavy CSV parse, and if it's running
+    while Render sends its health check, the GIL contention means the
+    health check can't respond within Render's 5-second timeout. Render
+    then marks the service unhealthy and enters a restart loop, which
+    surfaces as "No open HTTP ports detected on 0.0.0.0" in the logs and
+    a 502 to clients. The prewarm starts lazily on the first dashboard
+    request instead — see dashboard() below."""
     return "ok", 200
 
 
