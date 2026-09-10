@@ -22,13 +22,21 @@ COLOUR SCHEME: every bus marker has the same blue fill, with delay status
 shown via the marker's OUTLINE colour.
 
 DENSITY HEATMAP (live): a toggleable layer (via leaflet.heat) showing where
-live buses are currently clustered. Uses the SAME radius/blur in metres as
-the historical layer so the two look consistent when toggled.
+live buses are currently clustered.
 
 DENSITY HEATMAP (historical): a second toggleable layer, pulling position
-data from the gtfs-r-scrape repo. /api/heatmap fetches the daily CSVs for
-whatever files fall inside the requested time window, filters rows to that
-window, and returns density-weighted [lat, lon, intensity] triples.
+data from the gtfs-r-scrape repo.
+
+HEATMAP ZOOM-LOCK: both heat layers define their radius/blur in METRES and
+recompute the pixel equivalent on every zoom change so the apparent
+geographic scale stays constant. But pure metre-based sizing means that at
+low zoom (a whole-Sydney view) a 220m blob becomes ~3px and dissolves into
+pixel noise — you lose all structure. To fix that, the metre-based radius
+is FLOORED at HEAT_MIN_RADIUS_PX pixels: below the crossover zoom, blobs
+stay at a fixed pixel size so dense corridors remain visible and readable
+when zoomed out. Above the crossover zoom, metre-based sizing takes over
+and blobs represent a real geographic area. Same floor applies to both
+layers so live and historical look consistent at every zoom level.
 
 TRIP HEADSIGNS: enabled. Set ENABLE_TRIP_HEADSIGNS=0 in Render's env to
 disable (frees ~60-80MB on the free tier).
@@ -37,28 +45,18 @@ disable (frees ~60-80MB on the free tier).
 
 The Render free tier gives 512MB RAM. Two things have historically blown it:
 
-  1. Schedule bundle download. Fixed in a previous revision by streaming
-     the schedule zip to disk instead of resp.content. See
-     _download_to_path() and load_schedule_lookups().
+  1. Schedule bundle download. Fixed by streaming the schedule zip to disk
+     instead of resp.content. See _download_to_path() and
+     load_schedule_lookups().
 
-  2. Historical heatmap fetch. THIS revision fixes it. The previous version
-     fetched every daily CSV with resp.text (whole file into RAM as a
-     string) and ran up to 8 of those in parallel. A single day's hourly
-     vehicle positions across all NSW buses can be tens of MB; 8 in
-     parallel was several hundred MB, and the OOM-kill mid-response
-     surfaced in the browser as "Unexpected end of JSON" because the
-     connection was cut after the headers had been sent.
-
-     The fix: _fetch_one_day_into() streams each CSV line-by-line via
-     requests(stream=True) + iter_lines + csv.reader, aggregating rows into
-     a local grid dict as they arrive. Peak RSS per worker is one line
-     (a few hundred bytes), not the whole file. Concurrency is capped at 3
-     so peak RSS across all workers stays in the low MB range.
-
-     A wall-clock deadline (HEATMAP_DEADLINE_SEC) also stops consuming new
-     futures if the total fetch is running long, and returns whatever was
-     collected — a partial heat layer is infinitely better than a truncated
-     JSON body.
+  2. Historical heatmap fetch. Fixed by streaming each daily CSV
+     line-by-line via requests(stream=True) + iter_lines + csv.reader,
+     aggregating rows into a local grid dict as they arrive. Peak RSS per
+     worker is one line, not the whole file. Concurrency is capped at 3 so
+     peak RSS across all workers stays in the low MB range. A wall-clock
+     deadline (HEATMAP_DEADLINE_SEC) also stops consuming new futures if
+     the total fetch is running long, and returns whatever was collected —
+     a partial heat layer is infinitely better than a truncated JSON body.
 
 Also: only ONE gunicorn worker (each worker is a separate process with its
 own copy of every module-level cache). Threads are the right concurrency
@@ -130,16 +128,6 @@ ON_TIME_LATE_SEC = 300
 
 GRID_DECIMALS = 4
 
-# Historical heatmap fetch tuning.
-#
-# HEATMAP_FETCH_CONCURRENCY = 3: number of daily CSVs fetched in parallel.
-#   Previously 8; each file was loaded whole into RAM. At 3 we stay well
-#   inside the free tier's memory even when a day's CSV is tens of MB.
-#
-# HEATMAP_DEADLINE_SEC = 45: wall-clock budget for the whole multi-day
-#   fetch. If we're still fetching when this expires, stop consuming new
-#   futures and return whatever we have. Prevents the proxy timeout that
-#   was truncating the JSON response.
 HEATMAP_FETCH_CONCURRENCY = 3
 HEATMAP_DEADLINE_SEC = 45
 
@@ -217,12 +205,7 @@ _schedule_lock = threading.Lock()
 
 
 def _download_to_path(url, headers, dest_path, timeout=60):
-    """Stream a URL to a local file, returning bytes written.
-
-    Streaming (instead of requests.get().content) is essential: the TfNSW
-    bus schedule bundle is 60-150MB compressed, and holding that in RAM on
-    a 512MB Render instance was one of the OOM triggers.
-    """
+    """Stream a URL to a local file, returning bytes written."""
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
@@ -261,13 +244,7 @@ def _parse_csv_member(zf, member, key_col, val_col):
 
 
 def load_schedule_lookups():
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
-
-    Tries the 24h disk cache first. On a miss, streams the schedule bundle
-    to a temp file on disk, opens the zip from disk, streams any inner zips
-    to disk too, parses each CSV, writes the resulting JSON cache to disk,
-    and cleans up. No stage holds the raw zip bytes in memory.
-    """
+    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error)."""
     with _schedule_lock:
         if AGENCY_CACHE_FILE.exists():
             try:
@@ -530,14 +507,10 @@ def get_vehicles_cached(agency_names, trip_headsigns):
 def _fetch_one_day_into(date_str, cutoff, local_cells):
     """Stream one day's CSV and aggregate qualifying rows into local_cells.
 
-    Returns (date_str, rows_seen, points_added, error_or_None).
-
-    The whole CSV is NEVER held in memory. requests(stream=True) +
-    iter_lines + csv.reader means we parse line-by-line as bytes arrive off
-    the socket, and each parsed row is folded straight into the grid dict
-    before the next line is read. Peak RSS per worker is one line
-    (a few hundred bytes), which is what keeps a 7-day statewide fetch
-    inside the free tier's memory budget.
+    The whole CSV is never held in memory. requests(stream=True) +
+    iter_lines + csv.reader parses line-by-line as bytes arrive off the
+    socket, and each row is folded into the grid dict before the next line
+    is read. Peak RSS per worker is one line, not the whole file.
     """
     url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
     rows_seen = 0
@@ -592,15 +565,10 @@ def fetch_historical_heatmap_points(window_hours):
     """Fetch density points from the gtfs-r-scrape repo's daily CSVs.
 
     Each day is fetched and aggregated in a worker thread, but never held
-    as a whole file — see _fetch_one_day_into. Each worker writes into its
-    own local grid dict; the dicts are merged at the end. This avoids any
-    per-row locking and keeps peak RSS bounded by (workers × one line).
-
-    A wall-clock deadline (HEATMAP_DEADLINE_SEC) caps the whole operation:
-    if we're still waiting on futures when it expires, we stop consuming
-    and return whatever we've aggregated so far. A partial heat layer is
-    far better than a truncated JSON body, which is what the browser sees
-    when the worker is killed mid-response.
+    as a whole file. Each worker writes into its own local grid dict; the
+    dicts are merged at the end. A wall-clock deadline caps the whole
+    operation: a partial heat layer is infinitely better than a truncated
+    JSON body.
     """
     start = time.monotonic()
     now = datetime.now(tz=SYDNEY_TZ)
@@ -612,8 +580,6 @@ def fetch_historical_heatmap_points(window_hours):
         dates_needed.append(d.isoformat())
         d += timedelta(days=1)
 
-    # Each worker gets its own dict — merged at the end, no lock on the hot
-    # path. dict merge below is O(cells), trivial.
     workers = max(1, min(HEATMAP_FETCH_CONCURRENCY, len(dates_needed)))
     local_dicts = [defaultdict(lambda: [0.0, 0.0, 0]) for _ in range(workers)]
 
@@ -639,7 +605,6 @@ def fetch_historical_heatmap_points(window_hours):
                 last_error = error
                 continue
             if rows_seen == 0 and points_added == 0:
-                # 404 or empty file — not an error
                 continue
             files_fetched += 1
             rows_seen_total += rows_seen
@@ -668,8 +633,6 @@ def fetch_historical_heatmap_points(window_hours):
     for c in cells.values():
         points.append([c[0] / c[2], c[1] / c[2], c[2] / max_count])
 
-    # If we hit the deadline, prepend a note to the error field so the UI
-    # can show "partial data" without losing the points we did get.
     note = None
     if deadline_hit:
         note = (f"Partial data: fetch exceeded {HEATMAP_DEADLINE_SEC}s. "
@@ -817,7 +780,7 @@ PAGE = """
   .flag { color: var(--muted); font-size: 0.75rem; }
   .toggle { color: var(--text); text-decoration: underline; font-size: 0.85rem; }
 
-  #dashmap { height: 600px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
+  #dashmap { height: 700px; border: 1px solid var(--line); margin-top: 10px; background: #e5e3dc; }
   .map-legend {
     display: flex; gap: 16px; align-items: center;
     font-size: 0.8rem; color: var(--muted); margin-top: 8px; flex-wrap: wrap;
@@ -985,9 +948,30 @@ PAGE = """
 
     const HEAT_GRADIENT = { 0.0: '#0d0887', 0.3: '#7e03a8', 0.55: '#cc4778', 0.75: '#f89441', 1.0: '#f0f921' };
 
-    // Shared radius/blur for both heat layers — same visual scale whether
-    // you're looking at live density or historical density.
+    // --- Zoom-locked heat sizing -----------------------------------------
+    //
+    // Both heat layers size their radius/blur in METRES, converted to
+    // screen pixels at the current zoom (below), so at high zoom a blob
+    // represents a fixed geographic area (~220m diameter) regardless of
+    // zoom level.
+    //
+    // But pure metre-based sizing breaks at LOW zoom: at a whole-Sydney
+    // view (zoom ~11), 220m is only ~3px on screen, so every cell collapses
+    // into pixel noise and you lose all structure. The fix is a FLOOR on
+    // the computed pixel radius: below the crossover zoom, blobs stay at a
+    // fixed pixel size (HEAT_MIN_RADIUS_PX) so dense corridors remain
+    // visible and readable. Above the crossover zoom, metre-based sizing
+    // takes over and the "real geographic area" semantics are preserved.
+    //
+    // The crossover zoom (where metre→pixel equals the floor) is roughly
+    // zoom 14 in Sydney. Below it, pixel radius is constant; above it,
+    // pixel radius grows with zoom.
+    //
+    // Tune HEAT_MIN_RADIUS_PX up for chunkier blobs when zoomed out, down
+    // for finer structure. HEAT_MIN_BLUR_PX controls the softness of the
+    // edges at low zoom.
     const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
+    const HEAT_MIN_RADIUS_PX = 12, HEAT_MIN_BLUR_PX = 10;
 
     function metresToPixels(metres, zoom, lat) {
       const metresPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
@@ -995,16 +979,18 @@ PAGE = """
     }
 
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius: 45, blur: 32, maxZoom: 15, minOpacity: 0.25, gradient: HEAT_GRADIENT });
-    const histHeatLayer = L.heatLayer([], { radius: 45, blur: 32, maxZoom: 14, minOpacity: 0.25, gradient: HEAT_GRADIENT });
+    const heatLayer = L.heatLayer([], { radius: HEAT_MIN_RADIUS_PX, blur: HEAT_MIN_BLUR_PX, maxZoom: 15, minOpacity: 0.25, gradient: HEAT_GRADIENT });
+    const histHeatLayer = L.heatLayer([], { radius: HEAT_MIN_RADIUS_PX, blur: HEAT_MIN_BLUR_PX, maxZoom: 14, minOpacity: 0.25, gradient: HEAT_GRADIENT });
 
     function updateHeatRadii() {
       const zoom = map.getZoom();
       const lat = map.getCenter().lat;
-      const px = metresToPixels(HEAT_RADIUS_M, zoom, lat);
-      const blur = metresToPixels(HEAT_BLUR_M, zoom, lat);
-      heatLayer.setOptions({ radius: px, blur: blur });
-      histHeatLayer.setOptions({ radius: px, blur: blur });
+      // Metre-based sizing, floored at a minimum pixel radius so low-zoom
+      // views keep their detail instead of collapsing to point noise.
+      const radius = Math.max(metresToPixels(HEAT_RADIUS_M, zoom, lat), HEAT_MIN_RADIUS_PX);
+      const blur = Math.max(metresToPixels(HEAT_BLUR_M, zoom, lat), HEAT_MIN_BLUR_PX);
+      heatLayer.setOptions({ radius: radius, blur: blur });
+      histHeatLayer.setOptions({ radius: radius, blur: blur });
     }
     map.on('zoomend', updateHeatRadii);
     updateHeatRadii();
@@ -1266,9 +1252,6 @@ def api_heatmap():
         points, error = get_heatmap_points_cached(window_hours)
         return jsonify({"points": points, "window_hours": window_hours, "error": error})
     except Exception as e:
-        # Always return valid JSON, even on unexpected failure — an HTML
-        # error page here was what produced the "Unexpected end of JSON"
-        # message in the browser.
         return jsonify({"points": [], "window_hours": None, "error": f"Server error: {e}"}), 200
 
 
