@@ -5,21 +5,33 @@ A live map fed by the GTFS-realtime VEHICLE POSITION feed, joined to the
 trip-update feed by trip_id so markers reflect current delay. Density
 heatmaps for live and historical vehicle positions.
 
-=== THE ACTUAL FIX IN THIS VERSION ===
+=== HOW IT AVOIDS THE RENDER HEALTH-CHECK KILL LOOP ===
 
-Render's port scanner hits the app with a 5-second timeout during deploy.
-If the response takes longer, Render marks the port as closed and restarts
-the container in a loop. That was happening here because / blocked on a
-105MB schedule download plus a ~30s parse of 94,000 trip headsigns.
+Render hits / with a 5-second timeout during deploy. If it doesn't get a
+response, it marks the port as closed and restarts the container. That
+was happening here because / originally blocked on a 105MB schedule
+download + a ~30s parse of 94,000 trip headsigns.
 
-The schedule now loads in a BACKGROUND THREAD started at import time.
-Every request handler returns immediately with whatever's available:
-empty headsigns on the first few requests, full data once the background
-thread finishes (about 30 seconds after container start). The port scan
-passes on the first try because / returns in milliseconds regardless.
+Two things fix it:
 
-Memory stays at ~63MB RSS once the schedule is parsed. No blocking
-anywhere on the request path.
+  1. The schedule loads in a BACKGROUND DAEMON THREAD started at import
+     time. Every request handler returns immediately with whatever is
+     available. Headsigns are empty for the first ~30 seconds after
+     container start, then suddenly appear.
+
+  2. The background thread YIELDS THE CPU periodically via
+     time.sleep(0.001) — not time.sleep(0), which yields the GIL but not
+     the CPU on Render's 0.1-CPU free tier. Without a real sleep, the
+     parse thread monopolises the single CPU and health checks time out
+     even though the request path itself is instant.
+
+=== HISTORICAL HEATMAP ===
+
+/api/heatmap fetches daily CSVs from the gtfs-r-scrape repo. The fetch
+runs with a short wall-clock deadline (20s) because Cloudflare kills any
+proxied response longer than ~30s — the previous 45s deadline was causing
+502s on the 7-day window. Concurrency is 1 to avoid CPU contention with
+the background schedule parse.
 
 === RENDER SETTINGS ===
 
@@ -27,12 +39,6 @@ anywhere on the request path.
       gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65
 
   Health Check Path: /ping
-
-=== RENDER DEBUG LOG LINES ===
-
-  [schedule] loaded from disk cache         - found a local JSON, skipped download
-  [schedule] starting background download   - no cache, downloading 105MB in a thread
-  [schedule] background load complete ...   - thread finished, headsigns are now live
 
 Setup:
     pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
@@ -76,8 +82,19 @@ ON_TIME_EARLY_SEC = -60
 ON_TIME_LATE_SEC = 300
 
 GRID_DECIMALS = 4
-HEATMAP_FETCH_CONCURRENCY = 2
-HEATMAP_DEADLINE_SEC = 45
+# Historical heatmap fetch: single worker, short deadline. Cloudflare kills
+# any proxied response longer than ~30s; 20s keeps us safely inside that.
+# Concurrency is 1 because the free tier has 0.1 CPU and we don't want the
+# fetch competing with the background schedule parse.
+HEATMAP_FETCH_CONCURRENCY = 1
+HEATMAP_DEADLINE_SEC = 20
+
+# Yield frequency in _parse_csv_member. Every 500 rows, sleep 1ms. For 94k
+# rows that's ~0.19s added total — negligible — but it gives the OS
+# scheduler a chance to run gunicorn's acceptor thread so Render's health
+# check lands during the parse.
+PARSE_YIELD_EVERY = 500
+PARSE_YIELD_SEC = 0.001
 
 load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
@@ -145,21 +162,15 @@ def parse_ts(raw):
 
 
 app = Flask(__name__)
-
 _heatmap_fetch_lock = threading.Lock()
 
-# --- Non-blocking schedule cache ------------------------------------------
-#
-# _schedule_cache holds the parsed schedule. A background thread populates
-# it at import time. Requests NEVER block on it — they read whatever's
-# there and return immediately. _schedule_ready signals completion so
-# callers can distinguish "still loading" from "failed".
 _schedule_cache = {"agency_names": {}, "trip_headsigns": {}, "error": None}
 _schedule_ready = threading.Event()
-_schedule_lock = threading.Lock()
 
 
 def _download_to_path(url, headers, dest_path, timeout=120):
+    """Stream a URL to a local file. Yields the CPU between chunks so the
+    download doesn't monopolise the single-CPU free tier."""
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
@@ -172,13 +183,20 @@ def _download_to_path(url, headers, dest_path, timeout=120):
                 if chunk:
                     f.write(chunk)
                     total += len(chunk)
+                    time.sleep(0)  # tiny yield between chunks
     return total
 
 
 def _parse_csv_member(zf, member, key_col, val_col):
     """Stream-parse one CSV member of an open ZipFile into {key: value}.
-    Yields the GIL every 2000 rows so a background parse doesn't starve
-    gunicorn's other threads on a 0.1-CPU instance."""
+
+    Yields the CPU every PARSE_YIELD_EVERY rows with a real 1ms sleep
+    (not time.sleep(0), which only yields the GIL and on a single-CPU
+    instance is rescheduled to the same thread immediately). Without this
+    the parse thread starves gunicorn's acceptor and Render's health
+    check times out — which then restarts the container, killing the
+    parse before it finishes, so headsigns never load.
+    """
     result = {}
     if member not in zf.namelist():
         return result
@@ -193,15 +211,14 @@ def _parse_csv_member(zf, member, key_col, val_col):
         key_idx = header.index(key_col)
         val_idx = header.index(val_col)
         for i, row in enumerate(reader):
-            if i % 2000 == 0:
-                time.sleep(0)
+            if i % PARSE_YIELD_EVERY == 0:
+                time.sleep(PARSE_YIELD_SEC)
             if len(row) > max(key_idx, val_idx) and row[val_idx].strip():
                 result[row[key_idx].strip()] = row[val_idx].strip()
     return result
 
 
 def _do_schedule_download():
-    """Download + parse. Returns (agencies, trip_headsigns, error_or_None)."""
     tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
     try:
         outer_path = os.path.join(tmpdir, "schedule.zip")
@@ -255,8 +272,6 @@ def _do_schedule_download():
 
 
 def _background_schedule_load():
-    """Runs at import time in a daemon thread. Populates _schedule_cache and
-    sets _schedule_ready when finished. Never raises."""
     try:
         if AGENCY_CACHE_FILE.exists():
             try:
@@ -271,7 +286,6 @@ def _background_schedule_load():
                     print(f"[schedule] loaded from disk cache ({len(cached['agencies'])} agencies, "
                           f"{len(cached.get('trip_headsigns', {}))} headsigns)", flush=True)
                     _log_rss("schedule-ready")
-                    _schedule_ready.set()
                     return
                 else:
                     print(f"[schedule] disk cache stale ({age}), re-downloading", flush=True)
@@ -292,17 +306,10 @@ def _background_schedule_load():
         _schedule_ready.set()
 
 
-# Start the load immediately. Requests never wait for this.
 threading.Thread(target=_background_schedule_load, daemon=True).start()
 
 
 def get_schedule_lookups():
-    """Non-blocking. Returns whatever's loaded so far.
-
-    While loading, returns ({}, {}, "loading"). Once the background thread
-    finishes it returns the real dicts. Handlers must tolerate empty dicts
-    on the first few requests after container start.
-    """
     if not _schedule_ready.is_set():
         return {}, {}, "loading"
     return (_schedule_cache["agency_names"],
@@ -495,7 +502,7 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
     rows_seen = 0
     points_added = 0
     try:
-        with requests.get(url, timeout=60, stream=True) as resp:
+        with requests.get(url, timeout=30, stream=True) as resp:
             print(f"[heatmap] GET {url} -> HTTP {resp.status_code}", flush=True)
             if resp.status_code == 404:
                 return date_str, 0, 0, None
@@ -514,7 +521,9 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
             except ValueError:
                 return date_str, 0, 0, f"{date_str}: missing required columns"
             max_idx = max(ts_idx, lat_idx, lon_idx)
-            for row in csv.reader(lines):
+            for i, row in enumerate(csv.reader(lines)):
+                if i % 2000 == 0:
+                    time.sleep(PARSE_YIELD_SEC)
                 rows_seen += 1
                 if len(row) <= max_idx:
                     continue
@@ -586,7 +595,7 @@ def fetch_historical_heatmap_points(window_hours):
 
     print(f"[heatmap] window={window_hours}h files={files_fetched} "
           f"rows={rows_seen_total} points={points_added_total} cells={len(cells)} "
-          f"elapsed={time.monotonic() - start:.1f}s", flush=True)
+          f"elapsed={time.monotonic() - start:.1f}s deadline_hit={deadline_hit}", flush=True)
 
     if not cells:
         if files_fetched == 0:
@@ -597,7 +606,7 @@ def fetch_historical_heatmap_points(window_hours):
     points = [[c[0] / c[2], c[1] / c[2], c[2] / max_count] for c in cells.values()]
     note = None
     if deadline_hit:
-        note = f"Partial data: fetch exceeded {HEATMAP_DEADLINE_SEC}s"
+        note = f"Partial data (deadline hit after {HEATMAP_DEADLINE_SEC}s)"
     return points, note
 
 
