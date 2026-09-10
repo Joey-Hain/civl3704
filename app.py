@@ -1,41 +1,35 @@
 """
 Web dashboard for TfNSW GTFS-realtime delay/variance data.
 
-A live map fed by the GTFS-realtime VEHICLE POSITION feed, joined to the
-trip-update feed by trip_id so markers reflect current delay. Density
-heatmaps for live and historical vehicle positions.
+Loads everything from live sources — no committed cache files, no SQLite,
+no local JSON dependency:
 
-=== HOW IT AVOIDS THE RENDER HEALTH-CHECK KILL LOOP ===
+  * Operators + trip headsigns come from the TfNSW schedule bundle
+    (SCHEDULE_URL), downloaded in a BACKGROUND THREAD at import time.
+  * Live vehicle positions come from the TfNSW vehiclepos feed.
+  * Historical vehicle positions come from the gtfs-r-scrape repo on GitHub
+    (data/YYYY-MM-DD.csv).
 
-Render hits / with a 5-second timeout during deploy. If it doesn't get a
-response, it marks the port as closed and restarts the container. That
-was happening here because / originally blocked on a 105MB schedule
-download + a ~30s parse of 94,000 trip headsigns.
+Why the background thread: Render's health check hits the app with a
+5-second timeout during deploy. If / blocks on a ~30-second schedule
+download + parse of 94,000 trip headsigns, Render marks the port closed
+and enters a restart loop. The background thread does the fetch off the
+request path, so /ping returns instantly and the container stays up. Once
+the thread finishes (about 30s after boot), operators and headsigns appear
+in every subsequent request.
 
-Two things fix it:
+The CSV parse yields the CPU every 500 rows via time.sleep(0.001). This is
+essential on a 0.1-CPU instance: without it, the parse thread starves
+gunicorn's acceptor thread and the health check times out anyway. The
+1ms sleep × ~190 yields = ~0.2s total added cost for the whole parse.
 
-  1. The schedule loads in a BACKGROUND DAEMON THREAD started at import
-     time. Every request handler returns immediately with whatever is
-     available. Headsigns are empty for the first ~30 seconds after
-     container start, then suddenly appear.
-
-  2. The background thread YIELDS THE CPU periodically via
-     time.sleep(0.001) — not time.sleep(0), which yields the GIL but not
-     the CPU on Render's 0.1-CPU free tier. Without a real sleep, the
-     parse thread monopolises the single CPU and health checks time out
-     even though the request path itself is instant.
-
-=== HISTORICAL HEATMAP ===
-
-/api/heatmap fetches daily CSVs from the gtfs-r-scrape repo. The fetch
-runs with a short wall-clock deadline (20s) because Cloudflare kills any
-proxied response longer than ~30s — the previous 45s deadline was causing
-502s on the 7-day window. Concurrency is 1 to avoid CPU contention with
-the background schedule parse.
+/api/heatmap is non-blocking: returns whatever is cached (or empty), and
+kicks off a background fetch to refresh. This keeps the request path
+under Render's 5s timeout no matter what GitHub is doing.
 
 === RENDER SETTINGS ===
 
-  Start Command (single line, no backslashes):
+  Start Command (single line):
       gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65
 
   Health Check Path: /ping
@@ -75,24 +69,16 @@ UTC_TZ = ZoneInfo("UTC")
 DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
-AGENCY_CACHE_FILE = DATA_DIR / "agency_names.json"
-AGENCY_CACHE_MAX_AGE = timedelta(days=90)
 ANOMALY_ABS_SEC = 3600
 ON_TIME_EARLY_SEC = -60
 ON_TIME_LATE_SEC = 300
 
 GRID_DECIMALS = 4
-# Historical heatmap fetch: single worker, short deadline. Cloudflare kills
-# any proxied response longer than ~30s; 20s keeps us safely inside that.
-# Concurrency is 1 because the free tier has 0.1 CPU and we don't want the
-# fetch competing with the background schedule parse.
 HEATMAP_FETCH_CONCURRENCY = 1
 HEATMAP_DEADLINE_SEC = 20
 
-# Yield frequency in _parse_csv_member. Every 500 rows, sleep 1ms. For 94k
-# rows that's ~0.19s added total — negligible — but it gives the OS
-# scheduler a chance to run gunicorn's acceptor thread so Render's health
-# check lands during the parse.
+# CSV parse yield rate. Every 500 rows we sleep 1ms to give the OS scheduler
+# a chance to run gunicorn's acceptor thread on the single-CPU free tier.
 PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
 
@@ -162,15 +148,18 @@ def parse_ts(raw):
 
 
 app = Flask(__name__)
-_heatmap_fetch_lock = threading.Lock()
 
+# Populated by a background thread at import time. Requests read whatever
+# is there; empty dicts until the thread finishes.
 _schedule_cache = {"agency_names": {}, "trip_headsigns": {}, "error": None}
 _schedule_ready = threading.Event()
 
+# Non-blocking historical heatmap state.
+_heatmap_bg_lock = threading.Lock()
+_heatmap_bg = {"running": False, "window": None}
+
 
 def _download_to_path(url, headers, dest_path, timeout=120):
-    """Stream a URL to a local file. Yields the CPU between chunks so the
-    download doesn't monopolise the single-CPU free tier."""
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
@@ -183,20 +172,11 @@ def _download_to_path(url, headers, dest_path, timeout=120):
                 if chunk:
                     f.write(chunk)
                     total += len(chunk)
-                    time.sleep(0)  # tiny yield between chunks
+                    time.sleep(0)
     return total
 
 
 def _parse_csv_member(zf, member, key_col, val_col):
-    """Stream-parse one CSV member of an open ZipFile into {key: value}.
-
-    Yields the CPU every PARSE_YIELD_EVERY rows with a real 1ms sleep
-    (not time.sleep(0), which only yields the GIL and on a single-CPU
-    instance is rescheduled to the same thread immediately). Without this
-    the parse thread starves gunicorn's acceptor and Render's health
-    check times out — which then restarts the container, killing the
-    parse before it finishes, so headsigns never load.
-    """
     result = {}
     if member not in zf.namelist():
         return result
@@ -219,6 +199,8 @@ def _parse_csv_member(zf, member, key_col, val_col):
 
 
 def _do_schedule_download():
+    """Download the schedule bundle to disk, parse it, return (agencies,
+    trip_headsigns, error). Nothing is held in memory beyond the final dicts."""
     tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
     try:
         outer_path = os.path.join(tmpdir, "schedule.zip")
@@ -236,6 +218,7 @@ def _do_schedule_download():
                 if ENABLE_TRIP_HEADSIGNS:
                     trip_headsigns.update(_parse_csv_member(outer, "trips.txt", "trip_id", "trip_headsign"))
             else:
+                # zip-of-zips, one per contract region
                 for i, name in enumerate(names):
                     if not name.endswith(".zip"):
                         continue
@@ -258,14 +241,6 @@ def _do_schedule_download():
 
         if not agencies:
             raise RuntimeError("Downloaded bundle but no agency rows found")
-
-        with open(AGENCY_CACHE_FILE, "w") as f:
-            json.dump({
-                "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
-                "agencies": agencies,
-                "trip_headsigns": trip_headsigns,
-            }, f)
-        _log_rss("after-cache-write")
         return agencies, trip_headsigns, None
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -273,26 +248,7 @@ def _do_schedule_download():
 
 def _background_schedule_load():
     try:
-        if AGENCY_CACHE_FILE.exists():
-            try:
-                with open(AGENCY_CACHE_FILE) as f:
-                    cached = json.load(f)
-                fetched_at = datetime.fromisoformat(cached["fetched_at"])
-                age = datetime.now(tz=SYDNEY_TZ) - fetched_at
-                if age < AGENCY_CACHE_MAX_AGE:
-                    _schedule_cache["agency_names"] = cached["agencies"]
-                    _schedule_cache["trip_headsigns"] = cached.get("trip_headsigns", {})
-                    _schedule_cache["error"] = None
-                    print(f"[schedule] loaded from disk cache ({len(cached['agencies'])} agencies, "
-                          f"{len(cached.get('trip_headsigns', {}))} headsigns)", flush=True)
-                    _log_rss("schedule-ready")
-                    return
-                else:
-                    print(f"[schedule] disk cache stale ({age}), re-downloading", flush=True)
-            except Exception as e:
-                print(f"[schedule] disk cache unreadable: {e}", flush=True)
-
-        print("[schedule] starting background download", flush=True)
+        print("[schedule] background load starting", flush=True)
         agencies, trip_headsigns, err = _do_schedule_download()
         _schedule_cache["agency_names"] = agencies
         _schedule_cache["trip_headsigns"] = trip_headsigns
@@ -306,12 +262,14 @@ def _background_schedule_load():
         _schedule_ready.set()
 
 
+# Start at import time, before gunicorn binds the port. The thread is a
+# daemon so it doesn't block shutdown. Requests never wait for it.
 threading.Thread(target=_background_schedule_load, daemon=True).start()
 
 
 def get_schedule_lookups():
-    if not _schedule_ready.is_set():
-        return {}, {}, "loading"
+    """Returns ({agencies}, {headsigns}, error). Empty dicts until the
+    background thread finishes loading from TfNSW."""
     return (_schedule_cache["agency_names"],
             _schedule_cache["trip_headsigns"],
             _schedule_cache["error"])
@@ -565,25 +523,24 @@ def fetch_historical_heatmap_points(window_hours):
     last_error = None
     deadline_hit = False
 
-    with _heatmap_fetch_lock:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(_fetch_one_day_into, ds, cutoff, local_dicts[i % workers])
-                for i, ds in enumerate(dates_needed)
-            ]
-            for future in as_completed(futures):
-                if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
-                    deadline_hit = True
-                    break
-                date_str, rows_seen, points_added, error = future.result()
-                if error is not None:
-                    last_error = error
-                    continue
-                if rows_seen == 0 and points_added == 0:
-                    continue
-                files_fetched += 1
-                rows_seen_total += rows_seen
-                points_added_total += points_added
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_fetch_one_day_into, ds, cutoff, local_dicts[i % workers])
+            for i, ds in enumerate(dates_needed)
+        ]
+        for future in as_completed(futures):
+            if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
+                deadline_hit = True
+                break
+            date_str, rows_seen, points_added, error = future.result()
+            if error is not None:
+                last_error = error
+                continue
+            if rows_seen == 0 and points_added == 0:
+                continue
+            files_fetched += 1
+            rows_seen_total += rows_seen
+            points_added_total += points_added
 
     cells = defaultdict(lambda: [0.0, 0.0, 0])
     for ld in local_dicts:
@@ -610,14 +567,44 @@ def fetch_historical_heatmap_points(window_hours):
     return points, note
 
 
+def _background_heatmap_fetch(window_hours):
+    try:
+        points, error = fetch_historical_heatmap_points(window_hours)
+        _heatmap_cache[window_hours] = {"points": points, "error": error,
+                                        "fetched_at": datetime.now(tz=SYDNEY_TZ)}
+    except Exception as e:
+        print(f"[heatmap] bg fetch failed: {e}", flush=True)
+        _heatmap_cache[window_hours] = {"points": [], "error": str(e),
+                                        "fetched_at": datetime.now(tz=SYDNEY_TZ)}
+    finally:
+        with _heatmap_bg_lock:
+            _heatmap_bg["running"] = False
+            _heatmap_bg["window"] = None
+
+
+def _kick_heatmap_fetch(window_hours):
+    with _heatmap_bg_lock:
+        if _heatmap_bg["running"] and _heatmap_bg["window"] == window_hours:
+            return False
+        _heatmap_bg["running"] = True
+        _heatmap_bg["window"] = window_hours
+    threading.Thread(target=_background_heatmap_fetch, args=(window_hours,), daemon=True).start()
+    return True
+
+
 def get_heatmap_points_cached(window_hours):
+    """Non-blocking. Returns whatever's cached, kicks off background refresh
+    if stale. Request handler is never held for more than a few ms."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached = _heatmap_cache.get(window_hours)
-    if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
-        return cached["points"], cached["error"]
-    points, error = fetch_historical_heatmap_points(window_hours)
-    _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
-    return points, error
+    if cached is not None:
+        age = (now - cached["fetched_at"]).total_seconds()
+        if age < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
+            return cached["points"], cached["error"]
+        _kick_heatmap_fetch(window_hours)
+        return cached["points"], (cached["error"] or "Refreshing in background — reload in ~15s")
+    _kick_heatmap_fetch(window_hours)
+    return [], "Fetching in background — reload in ~15 seconds"
 
 
 def compute_delay_data(args):
@@ -751,7 +738,7 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
     <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
-    <span>Use the layer switcher (top-right) to toggle the heatmaps.</span>
+    <span>Historical heatmap loads when you change the window dropdown.</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
@@ -848,7 +835,6 @@ PAGE = """
       } catch (e) { statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e'; }
     }
     document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
-    loadHistoricalHeatmap();
 
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
@@ -897,7 +883,6 @@ PAGE = """
     }
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
-    setInterval(loadHistoricalHeatmap, 300000);
   </script>
 </body>
 </html>
@@ -914,6 +899,26 @@ def health():
     return "ok", 200
 
 
+@app.route("/status")
+def status():
+    heatmap_state = {}
+    for wh, entry in _heatmap_cache.items():
+        heatmap_state[str(wh)] = {
+            "points": len(entry["points"]),
+            "error": entry["error"],
+            "age_seconds": (datetime.now(tz=SYDNEY_TZ) - entry["fetched_at"]).total_seconds(),
+        }
+    return jsonify({
+        "schedule_ready": _schedule_ready.is_set(),
+        "schedule_agencies": len(_schedule_cache["agency_names"]),
+        "schedule_headsigns": len(_schedule_cache["trip_headsigns"]),
+        "schedule_error": _schedule_cache["error"],
+        "heatmap_bg_running": _heatmap_bg["running"],
+        "heatmap_bg_window": _heatmap_bg["window"],
+        "heatmap_cache": heatmap_state,
+    })
+
+
 @app.route("/")
 def dashboard():
     if not API_KEY:
@@ -927,7 +932,7 @@ def dashboard():
     agency_names = data["agency_names"]
 
     if not _schedule_ready.is_set():
-        agency_debug = "Loading operator names and trip headsigns in the background — will appear within a minute."
+        agency_debug = "Loading operator names and trip headsigns from TfNSW in the background — reload in ~30 seconds."
     else:
         observed_prefixes = sorted({r["route_id"].split("_")[0] for r in all_rows if r["route_id"]})[:10]
         agency_debug = (f"Loaded {len(agency_names)} operator names. "
