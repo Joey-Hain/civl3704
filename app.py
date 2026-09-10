@@ -10,25 +10,59 @@ request has full data immediately.
 
 Why not a background thread: with gunicorn's worker model, a thread started
 at module import time doesn't reliably share state with the process that
-handles requests. The logs showed the thread finishing (35 agencies, 93,947
-headsigns) while /status simultaneously showed empty dicts — they were
-running in different processes. Loading synchronously in the request handler
-eliminates the whole class of problem.
+handles requests. Loading synchronously in the request handler eliminates
+that whole class of problem.
+
+RETRY-ON-FAILURE FIX: the cache is only considered "successfully loaded"
+when agency_names is a non-empty dict (checked via truthiness, not `is not
+None`). A prior version stored {} on failure and checked `is not None`,
+which is true for {} too — so one transient failure permanently blanked
+operator names and headsigns for the rest of the process's life. Failures
+now retry after SCHEDULE_RETRY_BACKOFF_SEC instead of being cached forever.
 
 Render's health check hits /ping, which never touches the schedule, so it
 always returns "pong" in microseconds and never times out.
 
+=== CONCURRENCY / MEMORY ===
+
+get_all_rows_cached(), get_vehicles_cached(), and get_heatmap_points_cached()
+are each guarded by a lock with double-checked locking. Without this, under
+a threaded gunicorn worker (--threads N > 1), several requests can hit a
+stale cache at the exact same instant — each one would then independently
+re-fetch and re-parse the full feed (tens of thousands of trip-update rows,
+~15MB+ per copy), multiplying peak memory by however many threads raced in
+at once. This was the direct cause of an out-of-memory crash after
+threading was enabled without these locks. The lock ensures only the first
+thread to arrive does the actual fetch; everyone else waits briefly and
+reuses its result.
+
+Recommended Render start command (see render.yaml):
+    gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 6 --worker-class gthread --timeout 120
+
+--threads 32 (or even 8) is excessive for a 512MB instance even WITH the
+locks restored — 6 is plenty of concurrency for page loads + the 15s
+vehicle poll + occasional heatmap requests without inviting further memory
+pressure from thread stacks and per-thread working memory.
+
 === HISTORICAL HEATMAP ===
 
 /api/heatmap fetches daily CSVs from the gtfs-r-scrape repo synchronously
-with a 20-second deadline. The frontend auto-loads it on page view.
+with a 20-second deadline, aggregating into rounded lat/lon grid cells
+(GRID_DECIMALS) rather than keeping every raw point — this bounds output
+size and memory regardless of how many readings a window covers. The
+frontend auto-loads it on page view and every 5 minutes after.
 
 === RENDER SETTINGS ===
 
   Start Command (single line, no backslashes):
-      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --keep-alive 65
+      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 6 --worker-class gthread --timeout 120
 
   Health Check Path: /ping
+
+  IMPORTANT: if you deploy via render.yaml (Blueprint), that file is the
+  source of truth and can silently overwrite anything set manually in the
+  dashboard on the next sync. Keep the Start Command in render.yaml, not
+  just in the dashboard field, or your changes there may not stick.
 
 Setup:
     pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
@@ -97,6 +131,12 @@ SYDNEY_RADIUS_KM = 10
 
 ENABLE_TRIP_HEADSIGNS = os.getenv("ENABLE_TRIP_HEADSIGNS", "1") == "1"
 
+# How long to wait before retrying a FAILED schedule download. Without this,
+# a single transient failure (timeout, temporary OOM, TfNSW hiccup) used to
+# be cached forever as "loaded successfully with zero agencies" — this is
+# the fix for "headsigns and operator codes missing" persisting indefinitely.
+SCHEDULE_RETRY_BACKOFF_SEC = 300
+
 
 def _log_rss(tag):
     try:
@@ -144,8 +184,7 @@ def parse_ts(raw):
 app = Flask(__name__)
 
 _schedule_lock = threading.Lock()
-_schedule_cache = {"agency_names": None, "trip_headsigns": None, "error": None}
-_heatmap_cache = {}
+_schedule_cache = {"agency_names": None, "trip_headsigns": None, "error": None, "last_attempt": None}
 
 
 def _download_to_path(url, headers, dest_path, timeout=90):
@@ -236,27 +275,38 @@ def get_schedule_lookups():
     """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
 
     Downloads and parses the TfNSW schedule bundle on the first call,
-    blocking until done. Subsequent calls return the cached dicts
-    immediately. A lock ensures only one download happens even if
+    blocking until done. Subsequent successful calls return the cached
+    dicts immediately. A lock ensures only one download happens even if
     multiple requests arrive concurrently.
 
-    The first request after a cold start takes ~30 seconds. Render's
-    health check hits /ping, not /, so the container doesn't get killed
-    during the download.
+    SUCCESS is determined by truthiness (a non-empty agencies dict), not
+    `is not None` — {} is "not None" but is NOT success, and treating it
+    as success is what previously caused one failed attempt to permanently
+    blank operator names/headsigns. On failure, we retry after
+    SCHEDULE_RETRY_BACKOFF_SEC rather than either hammering the endpoint
+    on every single request or never retrying again.
     """
-    if _schedule_cache["agency_names"] is not None:
+    if _schedule_cache["agency_names"]:  # truthy = non-empty dict = genuine success
         return (_schedule_cache["agency_names"],
                 _schedule_cache["trip_headsigns"],
                 _schedule_cache["error"])
 
     with _schedule_lock:
-        if _schedule_cache["agency_names"] is not None:
+        if _schedule_cache["agency_names"]:
             return (_schedule_cache["agency_names"],
                     _schedule_cache["trip_headsigns"],
                     _schedule_cache["error"])
 
-        print("[schedule] first request — downloading + parsing, this takes ~30s", flush=True)
+        now = time.monotonic()
+        last_attempt = _schedule_cache["last_attempt"]
+        if last_attempt is not None and (now - last_attempt) < SCHEDULE_RETRY_BACKOFF_SEC:
+            # Still within the backoff window after a previous failure —
+            # return the empty state without hammering the endpoint again.
+            return {}, {}, _schedule_cache["error"]
+
+        print("[schedule] loading — downloading + parsing, this takes ~30s", flush=True)
         t0 = time.monotonic()
+        _schedule_cache["last_attempt"] = now
         try:
             agencies, trip_headsigns, err = _do_schedule_download()
         except Exception as e:
@@ -422,6 +472,19 @@ CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
+_heatmap_cache = {}
+
+# Locks guarding each cache's fetch path. With threaded gunicorn workers,
+# several requests can hit a stale cache at the same instant — without a
+# lock, EACH ONE independently triggers its own full fetch+parse (trip-
+# update rows, vehicle positions, or heatmap CSVs) at the same time,
+# multiplying peak memory by however many threads raced in. This was the
+# direct cause of the out-of-memory crash. Double-checked locking: only
+# the first thread to acquire the lock actually fetches; everyone else
+# re-checks the (now-fresh) cache after acquiring and reuses it.
+_rows_lock = threading.Lock()
+_vehicles_lock = threading.Lock()
+_heatmap_lock = threading.Lock()
 
 
 def get_all_rows_cached():
@@ -431,15 +494,22 @@ def get_all_rows_cached():
         return (_rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"],
                 _rows_cache["agency_error"])
 
-    agency_names, trip_headsigns, agency_error = get_schedule_lookups()
-    feed = fetch_feed()
-    all_rows = extract_rows(feed, agency_names)
-    if all_rows:
-        append_to_log(all_rows)
+    with _rows_lock:
+        now = datetime.now(tz=SYDNEY_TZ)
+        cached_at = _rows_cache["fetched_at"]
+        if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
+            return (_rows_cache["all_rows"], _rows_cache["agency_names"], _rows_cache["trip_headsigns"],
+                    _rows_cache["agency_error"])
 
-    _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
-                       agency_error=agency_error, fetched_at=now)
-    return all_rows, agency_names, trip_headsigns, agency_error
+        agency_names, trip_headsigns, agency_error = get_schedule_lookups()
+        feed = fetch_feed()
+        all_rows = extract_rows(feed, agency_names)
+        if all_rows:
+            append_to_log(all_rows)
+
+        _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
+                            agency_error=agency_error, fetched_at=now)
+        return all_rows, agency_names, trip_headsigns, agency_error
 
 
 def get_vehicles_cached(agency_names, trip_headsigns):
@@ -448,10 +518,16 @@ def get_vehicles_cached(agency_names, trip_headsigns):
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
         return [dict(v) for v in _vehicles_cache["vehicles"]]
 
-    vfeed = fetch_vehicle_feed()
-    vehicles = extract_vehicles(vfeed, agency_names, trip_headsigns)
-    _vehicles_cache.update(vehicles=vehicles, fetched_at=now)
-    return [dict(v) for v in vehicles]
+    with _vehicles_lock:
+        now = datetime.now(tz=SYDNEY_TZ)
+        cached_at = _vehicles_cache["fetched_at"]
+        if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
+            return [dict(v) for v in _vehicles_cache["vehicles"]]
+
+        vfeed = fetch_vehicle_feed()
+        vehicles = extract_vehicles(vfeed, agency_names, trip_headsigns)
+        _vehicles_cache.update(vehicles=vehicles, fetched_at=now)
+        return [dict(v) for v in vehicles]
 
 
 def _fetch_one_day_into(date_str, cutoff, local_cells):
@@ -571,9 +647,16 @@ def get_heatmap_points_cached(window_hours):
     cached = _heatmap_cache.get(window_hours)
     if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
         return cached["points"], cached["error"]
-    points, error = fetch_historical_heatmap_points(window_hours)
-    _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
-    return points, error
+
+    with _heatmap_lock:
+        now = datetime.now(tz=SYDNEY_TZ)
+        cached = _heatmap_cache.get(window_hours)
+        if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
+            return cached["points"], cached["error"]
+
+        points, error = fetch_historical_heatmap_points(window_hours)
+        _heatmap_cache[window_hours] = {"points": points, "error": error, "fetched_at": now}
+        return points, error
 
 
 def compute_delay_data(args):
@@ -882,10 +965,14 @@ def status():
     agencies = _schedule_cache["agency_names"]
     headsigns = _schedule_cache["trip_headsigns"]
     return jsonify({
-        "schedule_loaded": agencies is not None,
+        "schedule_loaded": bool(agencies),
         "schedule_agencies": len(agencies) if agencies else 0,
         "schedule_headsigns": len(headsigns) if headsigns else 0,
         "schedule_error": _schedule_cache["error"],
+        "schedule_last_attempt_age_sec": (
+            (time.monotonic() - _schedule_cache["last_attempt"])
+            if _schedule_cache["last_attempt"] is not None else None
+        ),
         "heatmap_cache": heatmap_state,
     })
 

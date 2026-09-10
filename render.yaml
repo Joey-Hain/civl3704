@@ -3,7 +3,7 @@ services:
     name: civl3704
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120 --no-control-socket
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 6 --worker-class gthread --timeout 120
     healthCheckPath: /ping
     envVars:
       - key: TFNSW_API_KEY
