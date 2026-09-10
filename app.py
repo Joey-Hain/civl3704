@@ -100,7 +100,7 @@ VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 # --- Historical scrape repo (GitHub Actions collector, see collector.py) ---
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
-HEATMAP_WINDOW_CACHE_TTL_SECONDS = 120  # historical data changes slowly — cache longer than the live 12s TTL
+HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300  # historical data changes slowly (hourly collection) — cache well beyond the live 12s TTL
 
 # --- Colour scheme: single blue fill, delay status carried by outline ---
 COLOR_FILL = "#00B3F0"          # every marker's pill background, regardless of status
@@ -856,8 +856,8 @@ PAGE = """
     // Instead we define each layer's desired radius/blur in METRES and
     // recompute the pixel equivalent on every zoom change, so the apparent
     // level of detail stays constant regardless of zoom level.
-    const LIVE_RADIUS_M = 120, LIVE_BLUR_M = 90;
-    const HIST_RADIUS_M = 220, HIST_BLUR_M = 160; // larger — hourly collection means sparser points to blend
+    const LIVE_RADIUS_M = 120, LIVE_BLUR_M = 110;
+    const HIST_RADIUS_M = 220, HIST_BLUR_M = 200; // larger — hourly collection means sparser points to blend
 
     function metresToPixels(metres, zoom, lat) {
       const metresPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
@@ -1034,7 +1034,7 @@ PAGE = """
     // reloading the tables below.
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
-    setInterval(loadHistoricalHeatmap, 120000); // refresh historical layer every 2 min — matches server cache TTL
+    setInterval(loadHistoricalHeatmap, 300000); // refresh historical layer every 5 min — matches server cache TTL
   </script>
 </body>
 </html>
@@ -1111,16 +1111,26 @@ def api_vehicles():
 @app.route("/api/heatmap")
 def api_heatmap():
     """Historical density heatmap points, sourced from the gtfs-r-scrape
-    repo's daily CSVs. ?window=1|24|168 (hours) — defaults to 24."""
-    try:
-        window_hours = int(request.args.get("window", 24))
-    except ValueError:
-        window_hours = 24
-    if window_hours not in (1, 24, 168):
-        window_hours = 24  # guard against arbitrary values hammering GitHub with odd date ranges
+    repo's daily CSVs. ?window=1|24|168 (hours) — defaults to 24.
 
-    points, error = get_heatmap_points_cached(window_hours)
-    return jsonify({"points": points, "window_hours": window_hours, "error": error})
+    Wrapped in try/except so ANY failure here — including ones we didn't
+    anticipate — still returns valid JSON rather than falling through to
+    Flask's default HTML error page. A raw HTML error page is what was
+    causing the frontend's "Unexpected token '<'" parse failure: the
+    browser was trying to JSON.parse() an error page, not actual JSON.
+    """
+    try:
+        try:
+            window_hours = int(request.args.get("window", 24))
+        except ValueError:
+            window_hours = 24
+        if window_hours not in (1, 24, 168):
+            window_hours = 24  # guard against arbitrary values hammering GitHub with odd date ranges
+
+        points, error = get_heatmap_points_cached(window_hours)
+        return jsonify({"points": points, "window_hours": window_hours, "error": error})
+    except Exception as e:
+        return jsonify({"points": [], "window_hours": None, "error": f"Server error: {e}"}), 200
 
 
 if __name__ == "__main__":
