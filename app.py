@@ -67,6 +67,7 @@ import statistics
 import threading
 import zipfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -441,16 +442,31 @@ def get_vehicles_cached(agency_names, trip_headsigns):
     return [dict(v) for v in vehicles]
 
 
+def _fetch_one_day(date_str: str) -> tuple[str, str | None, str | None]:
+    """Fetch one day's raw CSV. Returns (date_str, csv_text_or_None, error_or_None)."""
+    url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
+    try:
+        resp = requests.get(url, timeout=8)
+        if resp.status_code == 404:
+            return date_str, None, None  # no data collected that day — not an error
+        resp.raise_for_status()
+        return date_str, resp.text, None
+    except requests.RequestException as e:
+        return date_str, None, str(e)
+
+
 def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None]:
     """Fetch [lat, lon] points from the gtfs-r-scrape repo's daily CSVs,
     covering whatever files fall inside the requested time window.
 
     Each day's data lives in its own raw CSV on GitHub (data/YYYY-MM-DD.csv,
-    written by collector.py via GitHub Actions). We fetch each day's file
-    that could contain rows in range, then filter rows by timestamp in
-    Python — the raw CSV has no server-side query capability. Fine at this
-    data volume: even a week of hourly collection is only a few thousand
-    rows total across up to 7 small daily files.
+    written by collector.py via GitHub Actions). Days are fetched IN
+    PARALLEL (not sequentially) — a 7-day window touches up to 7 files, and
+    fetching them one after another risked the whole request exceeding
+    Render/Cloudflare's proxy timeout (seen as an HTML timeout page instead
+    of JSON — "Unexpected token '<'" in the browser). Rows outside the
+    window are filtered by timestamp in Python after fetching, since the
+    raw CSV has no server-side query capability — fine at this data volume.
     """
     now = datetime.now(tz=SYDNEY_TZ)
     cutoff = now - timedelta(hours=window_hours)
@@ -460,38 +476,38 @@ def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None
     dates_needed = []
     d = cutoff.date()
     while d <= now.date():
-        dates_needed.append(d)
+        dates_needed.append(d.isoformat())
         d += timedelta(days=1)
 
     points = []
     last_error = None
     any_fetched = False
-    for d in dates_needed:
-        url = f"{SCRAPE_RAW_BASE}/{d.isoformat()}.csv"
-        try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 404:
-                continue  # no data collected that day — not an error, just nothing to show
-            resp.raise_for_status()
-            any_fetched = True
-        except requests.RequestException as e:
-            last_error = str(e)
-            continue
 
-        reader = csv.DictReader(io.StringIO(resp.text))
-        for row in reader:
-            try:
-                ts = datetime.fromisoformat(row["timestamp"])
-            except (KeyError, ValueError):
+    with ThreadPoolExecutor(max_workers=min(8, len(dates_needed))) as pool:
+        futures = [pool.submit(_fetch_one_day, ds) for ds in dates_needed]
+        for future in as_completed(futures):
+            date_str, text, error = future.result()
+            if error is not None:
+                last_error = error
                 continue
-            if ts < cutoff:
+            if text is None:
                 continue
-            try:
-                lat = float(row["lat"])
-                lon = float(row["lon"])
-            except (KeyError, ValueError, TypeError):
-                continue
-            points.append([lat, lon])
+            any_fetched = True
+
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                try:
+                    ts = datetime.fromisoformat(row["timestamp"])
+                except (KeyError, ValueError):
+                    continue
+                if ts < cutoff:
+                    continue
+                try:
+                    lat = float(row["lat"])
+                    lon = float(row["lon"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                points.append([lat, lon])
 
     if not points and not any_fetched:
         return [], last_error or "No historical data files found for this time window yet"
@@ -830,22 +846,45 @@ PAGE = """
 
     const markers = new Map(); // trip_id/vehicle_id -> Leaflet marker
 
-    // Shared low-to-high gradient for BOTH heat layers: yellow (#e9d022)
-    // at low density up through red (#e60b09) at high density.
-    const HEAT_GRADIENT = { 0.2: '#e9d022', 0.6: '#f2650f', 1.0: '#e60b09' };
+    // Perceptually-uniform "plasma"-style gradient: purple (low) through
+    // pink/orange to yellow (high) — reads clearly as a heat scale without
+    // the harsh traffic-light red/yellow look.
+    const HEAT_GRADIENT = { 0.0: '#0d0887', 0.3: '#7e03a8', 0.55: '#cc4778', 0.75: '#f89441', 1.0: '#f0f921' };
 
-    // --- Live density heatmap (positions only, no delay weighting).
-    // radius/blur are in SCREEN PIXELS at the current zoom, not metres —
-    // small values leave visible gaps between points ("discrete blobs")
-    // rather than a smooth continuous field. Bumped up substantially. ---
+    // leaflet.heat's radius/blur are fixed SCREEN PIXELS, not real-world
+    // distance — so a fixed value looks tiny zoomed in and huge zoomed out.
+    // Instead we define each layer's desired radius/blur in METRES and
+    // recompute the pixel equivalent on every zoom change, so the apparent
+    // level of detail stays constant regardless of zoom level.
+    const LIVE_RADIUS_M = 120, LIVE_BLUR_M = 90;
+    const HIST_RADIUS_M = 220, HIST_BLUR_M = 160; // larger — hourly collection means sparser points to blend
+
+    function metresToPixels(metres, zoom, lat) {
+      const metresPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+      return metres / metresPerPixel;
+    }
+
+    // --- Live density heatmap (positions only, no delay weighting) ---
     const markersLayer = L.layerGroup().addTo(map);
-    const heatLayer = L.heatLayer([], { radius: 32, blur: 24, maxZoom: 15, minOpacity: 0.35, gradient: HEAT_GRADIENT });
+    const heatLayer = L.heatLayer([], { radius: 30, blur: 22, maxZoom: 15, minOpacity: 0.35, gradient: HEAT_GRADIENT });
 
-    // --- Historical density heatmap, from the gtfs-r-scrape repo. Even
-    // larger radius than the live layer: hourly collection means far fewer
-    // total points than 15s live polling, so more per-point spread is
-    // needed for those sparser points to visually merge into regions. ---
-    const histHeatLayer = L.heatLayer([], { radius: 48, blur: 34, maxZoom: 14, minOpacity: 0.25, gradient: HEAT_GRADIENT });
+    // --- Historical density heatmap, from the gtfs-r-scrape repo ---
+    const histHeatLayer = L.heatLayer([], { radius: 45, blur: 32, maxZoom: 14, minOpacity: 0.25, gradient: HEAT_GRADIENT });
+
+    function updateHeatRadii() {
+      const zoom = map.getZoom();
+      const lat = map.getCenter().lat;
+      heatLayer.setOptions({
+        radius: metresToPixels(LIVE_RADIUS_M, zoom, lat),
+        blur: metresToPixels(LIVE_BLUR_M, zoom, lat)
+      });
+      histHeatLayer.setOptions({
+        radius: metresToPixels(HIST_RADIUS_M, zoom, lat),
+        blur: metresToPixels(HIST_BLUR_M, zoom, lat)
+      });
+    }
+    map.on('zoomend', updateHeatRadii);
+    updateHeatRadii(); // set correct radius for the initial zoom level immediately
 
     const layersControl = L.control.layers(null, {
       'Bus markers': markersLayer,
