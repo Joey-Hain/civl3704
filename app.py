@@ -33,51 +33,54 @@ weighting, no historical data, just point density right now.
 
 DENSITY HEATMAP (historical): a second toggleable layer, pulling position
 data from the separate GTFS-R scraper repo (Joey-Hain/gtfs-r-scrape on
-GitHub — a GitHub Actions job that polls the feeds and commits daily CSVs
-to data/YYYY-MM-DD.csv; currently running hourly rather than every 5 min).
-/api/heatmap fetches the raw CSVs for whatever daily files fall inside the
-requested time window (?window=1|24|168 hours), filters rows to that
-window, and returns density-weighted [lat, lon, intensity] triples — pure
-density, no delay weighting. The frontend lets you pick "Last hour /
-Last 24h / Last 7 days" and re-fetches on change. Both heat layers share a
-custom low-to-high gradient (yellow #e9d022 to red #e60b09).
+GitHub). /api/heatmap fetches the raw CSVs for whatever daily files fall
+inside the requested time window (?window=1|24|168 hours), filters rows to
+that window, and returns density-weighted [lat, lon, intensity] triples.
+Both heat layers share a custom low-to-high gradient.
 
-MEMORY NOTES (why this file is shaped the way it is):
+DEPLOYMENT NOTES (READ THESE — they explain why the file is shaped this
+way after a long debugging session with Render):
 
-  * Historical heatmap points are AGGREGATED into a fixed-precision lat/lon
-    grid as they're parsed (see GRID_DECIMALS), not kept as a raw list. At
-    hourly collection across all NSW buses, a 7-day window is ~800k rows;
-    keeping every raw [lat, lon] list in the per-window cache was 100-150 MB,
-    which is what was OOMing Render. Grid cells collapse that to a few
-    thousand entries (a few hundred KB) with an almost identical visual
-    because leaflet.heat blends nearby points anyway.
+  * THERE IS NO BACKGROUND PREWARM. The schedule bundle (operator names +
+    trip headsigns) is downloaded lazily on the first dashboard request,
+    inside get_all_rows_cached(). There are no module-level threads, no
+    import-time network calls, no locks around the schedule. The previous
+    versions all had some form of prewarm that either ran at import time or
+    was kicked off from a route; both caused the worker to hang during
+    Render's health check window, which surfaced as "No open HTTP ports
+    detected on 0.0.0.0" followed by a restart loop. Removing it entirely
+    is the only reliable fix.
 
-  * The TfNSW schedule bundle is STREAM-PARSED from inside the zip rather
-    than read+decode+list()'d whole. The old approach held the raw bytes,
-    the decoded string, and a list-of-lists of every row in memory
-    simultaneously — a 100-200 MB transient peak right during Render's
-    health-check window.
+  * /health and /ping return immediately with ZERO side effects. They do
+    not touch TfNSW, they do not touch the schedule, they do not start any
+    threads. They are safe to hammer as often as Render wants.
 
-  * Deployment runs ONE gunicorn worker with 8 threads, not multiple
-    workers. Each worker is a separate process with its own copy of every
-    module-level cache (_rows_cache, _vehicles_cache, _heatmap_cache) and
-    its own copy of the parsed schedule dicts. Four workers meant four
-    copies of everything. The workload here is entirely I/O-bound (HTTP to
-    TfNSW, HTTP to GitHub), so threads are the right tool and keep the
+  * Point the Render health check at /ping (Settings -> Health Checks).
+
+  * Start command must include --no-control-socket. Gunicorn 25+ creates a
+    UNIX control socket at /opt/render/.gunicorn/gunicorn.ctl by default;
+    in our logs this appeared right before the port scan gave up, and the
+    --no-control-socket flag disables it. It is not needed for a single-
+    worker deployment.
+
+  * ONE worker, MANY threads. Each extra gunicorn worker is a separate
+    process with its own copy of every module-level cache and its own copy
+    of the parsed schedule dicts. The workload is entirely I/O-bound (HTTP
+    to TfNSW, HTTP to GitHub), so threads are the right tool and keep the
     caches singular.
 
-  * The schedule prewarm (a 30-second download + CPU-heavy CSV parse) is
-    started LAZILY on the first dashboard request, NOT from /health and
-    NOT at import time. Render's HTTP health check requires a 2xx response
-    within 5 seconds; if the prewarm thread holds the GIL during parsing,
-    the health check can't run, Render marks the service unhealthy, and it
-    enters a restart loop that surfaces as "No open HTTP ports detected on
-    0.0.0.0" and a 502 to clients.
+  * Historical heatmap points are AGGREGATED into a fixed-precision lat/lon
+    grid (see GRID_DECIMALS), not kept as a raw list. A 7-day statewide
+    window was ~800k rows; keeping every raw [lat, lon] list in the
+    per-window cache was 100-150 MB, which is what was OOMing Render. Grid
+    cells collapse that to a few thousand entries.
+
+  * Schedule CSVs are STREAM-PARSED from inside the zip via
+    _parse_csv_member, avoiding the 100-200 MB transient peak of
+    read+decode+list()'ing a statewide trips.txt.
 
 NOTE: an earlier version of this file also drew GTFS route-shape polylines
-under the bus markers. That feature has been removed (scope cut) — schedule
-lookups now only fetch what's needed for operator names and trip headsigns,
-not shape_id/shapes.txt.
+under the bus markers. That feature has been removed (scope cut).
 
 Setup:
     pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
@@ -89,22 +92,6 @@ Setup:
 Usage:
     python app.py
     then open http://localhost:5000
-
-DEPLOYMENT (Render):
-    Start command (single line, no backslashes — Render's Start Command
-    field is a single-line input and will mangle multi-line commands):
-
-        gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --worker-class gthread --timeout 120
-
-    Health Check Path: /health  (Settings -> Health Checks)
-
-    Render's HTTP health check must receive a 2xx/3xx response within 5
-    seconds. /health returns "ok" instantly with zero side effects — it
-    does NOT start the schedule prewarm, because that would hold the GIL
-    during parsing and starve the health check of CPU. The prewarm runs
-    lazily on the first dashboard request instead, by which point the
-    user is already waiting and Render's health check tolerance (15s
-    before traffic stops, 60s before restart) absorbs the parse window.
 """
 
 import codecs
@@ -113,8 +100,6 @@ import io
 import json
 import os
 import statistics
-import threading
-import time
 import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -134,57 +119,42 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
 AGENCY_CACHE_FILE = DATA_DIR / "agency_names.json"
 AGENCY_CACHE_MAX_AGE = timedelta(hours=24)
-ANOMALY_ABS_SEC = 3600  # readings beyond this magnitude are flagged as likely stale/broken
-ON_TIME_EARLY_SEC = -60   # 1 min early
-ON_TIME_LATE_SEC = 300    # 5 min late — standard industry on-time window
+ANOMALY_ABS_SEC = 3600
+ON_TIME_EARLY_SEC = -60
+ON_TIME_LATE_SEC = 300
 
-# Historical heatmap grid resolution. 4 decimals ≈ 11 m at Sydney's
-# latitude, which is fine enough that leaflet.heat's blur produces the same
-# visual as plotting every raw point, but coarse enough that thousands of
-# GPS readings from the same stop/street collapse into one cell. See the
-# MEMORY NOTES in the module docstring.
+# Historical heatmap grid resolution. 4 decimals ~= 11 m at Sydney's
+# latitude. See the DEPLOYMENT NOTES in the module docstring.
 GRID_DECIMALS = 4
-
-# Yield the GIL every N rows while parsing the schedule CSVs. Without this,
-# a single CPU-bound parsing thread can starve gunicorn's other threads
-# (including Render's HTTP health check) for the whole parse duration.
-GIL_YIELD_EVERY = 2000
 
 load_dotenv()
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
 
-# Deliberately hardcoded — NOT sourced from .env's TFNSW_GTFS_RT_URL, which
-# is the trip-update feed above. Vehicle positions are a separate GTFS-RT
-# product on the TfNSW developer portal with their own subscription.
+# Deliberately hardcoded — NOT sourced from .env's TFNSW_GTFS_RT_URL.
 VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 
 # --- Historical scrape repo (GitHub Actions collector, see collector.py) ---
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
-HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300  # historical data changes slowly (hourly collection) — cache well beyond the live 12s TTL
+HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
 
 # --- Colour scheme: single blue fill, delay status carried by outline ---
-COLOR_FILL = "#00B3F0"          # every marker's pill background, regardless of status
+COLOR_FILL = "#00B3F0"
 OUTLINE_ON_TIME = "#ffffff"
 OUTLINE_LATE = "#B3261E"
 OUTLINE_EARLY = "#1E6B3C"
 OUTLINE_NO_DATA = "#888888"
 
-# Default radius filter for the map/API — the vehiclepos/buses feed is
-# STATEWIDE (thousands of vehicles across all NSW bus contract regions),
-# and shipping all of them as JSON on every request/poll produces
-# multi-hundred-KB payloads that are slow on weak connections and heavy
-# to render as markers. Restrict to within SYDNEY_RADIUS_KM of the CBD by
-# default; pass ?bounds=0 to disable and see the full unfiltered feed.
-SYDNEY_CBD = (-33.8688, 151.2093)  # lat, lon
+# Default radius filter for the map/API.
+SYDNEY_CBD = (-33.8688, 151.2093)
 SYDNEY_RADIUS_KM = 10
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, asin, sqrt
-    r = 6371.0  # Earth radius, km
+    r = 6371.0
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
@@ -194,17 +164,8 @@ def haversine_km(lat1, lon1, lat2, lon2):
 def parse_ts(raw):
     """Parse a timestamp from the scraper's CSV into a Sydney-aware datetime.
 
-    Handles the shapes the collector might produce and that were tripping up
-    the previous comparison against an aware `cutoff`:
-
-      1. ISO-8601, with or without a trailing 'Z', with or without an
-         offset (e.g. "2026-09-10T13:00:00Z" or "2026-09-10T13:00:00").
-         If there's no tzinfo we assume UTC — that's what a GH-Actions
-         cron job almost always writes.
-      2. Unix epoch (seconds). Only used if the value is a bare number
-         that looks like a real epoch (>= 1e9), to avoid accidentally
-         treating a date-like integer string as seconds-since-1970.
-
+    Handles ISO-8601 with/without 'Z' or offset, and Unix epoch seconds.
+    Naive ISO strings are assumed UTC (what a GH-Actions cron job writes).
     Returns a tz-aware datetime in Australia/Sydney, or None if unparseable.
     """
     if raw is None:
@@ -233,56 +194,16 @@ def parse_ts(raw):
 
 app = Flask(__name__)
 
-# Guards the schedule download/parse so the prewarm thread and a user
-# request can't both fire a concurrent 30s schedule fetch and double the
-# memory spike.
-_schedule_lock = threading.Lock()
 
-# Prewarm is started on the first dashboard request, NOT on /health and NOT
-# at import time. /health must return instantly and with zero side effects
-# so Render's 5-second HTTP health check always passes. See the MEMORY
-# NOTES / DEPLOYMENT sections in the module docstring.
-_prewarm_started = False
-_prewarm_lock = threading.Lock()
-
-
-def _prewarm_schedule_cache():
-    """Pre-fetch and cache the GTFS schedule bundle in the background so the
-    first real browser request doesn't block on a 30s+ download. Runs in a
-    daemon thread — if it fails, the first request will try again inline as
-    before, just with a cold cache."""
-    try:
-        load_schedule_lookups()
-    except Exception:
-        pass  # non-fatal — first real request will retry inline
-
-
-def _start_prewarm_once():
-    """Start the schedule prewarm thread exactly once. Called from the
-    dashboard route only — NOT from /health, because starting a CPU-heavy
-    parse during a health check starves the health check of the GIL and
-    causes Render to mark the service unhealthy."""
-    global _prewarm_started
-    if _prewarm_started:
-        return
-    with _prewarm_lock:
-        if _prewarm_started:
-            return
-        _prewarm_started = True
-        threading.Thread(target=_prewarm_schedule_cache, daemon=True).start()
-
-
-def _parse_csv_member(zf: zipfile.ZipFile, member: str, key_col: str, value_col: str) -> dict:
-    """Stream-parse one CSV from inside a zipfile into {key: value}.
+def _parse_csv_member(zf, member, key_col, val_col):
+    """Stream-parse one CSV member of a zipfile into {key: value}.
 
     Reads row-by-row from the zip entry instead of loading the whole file
-    into memory first. The previous version did zf.read(...).decode(...)
-    followed by list(csv.reader(...)), which held the raw bytes, the decoded
-    string, and a list-of-lists of every row in memory simultaneously — for
-    a statewide trips.txt that was a 100-200 MB transient peak.
-
-    Yields the GIL every GIL_YIELD_EVERY rows so gunicorn's other threads
-    (including Render's HTTP health check) can run during the parse.
+    into memory first, so a statewide trips.txt doesn't produce a 100-200 MB
+    transient peak. No GIL-yield sleep calls — those were removed because
+    they added complexity without solving the actual issue (a hanging
+    worker), and gthread's scheduler handles cooperative yielding fine for
+    this workload.
     """
     result = {}
     if member not in zf.namelist():
@@ -293,94 +214,83 @@ def _parse_csv_member(zf: zipfile.ZipFile, member: str, key_col: str, value_col:
             header = [h.strip() for h in next(reader)]
         except StopIteration:
             return result
-        if key_col not in header or value_col not in header:
+        if key_col not in header or val_col not in header:
             return result
         key_idx = header.index(key_col)
-        val_idx = header.index(value_col)
-        for i, row in enumerate(reader):
-            if i % GIL_YIELD_EVERY == 0:
-                time.sleep(0)  # release GIL so other threads can run
+        val_idx = header.index(val_col)
+        for row in reader:
             if len(row) > max(key_idx, val_idx) and row[val_idx].strip():
                 result[row[key_idx].strip()] = row[val_idx].strip()
     return result
 
 
-def load_schedule_lookups() -> tuple[dict, dict, str | None]:
+def load_schedule_lookups():
     """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error_or_None).
 
-    Tries the static GTFS schedule bundle, which may come back either as a
-    flat GTFS zip (agency.txt/trips.txt at top level) or a zip-of-zips (one
-    nested zip per contract region, each with its own agency.txt/trips.txt)
-    — TfNSW has changed this shape before, so we handle both. Caches
-    successful results for 24h. If the fetch fails, we surface why (e.g.
-    401/403 usually means the API key isn't subscribed to the "Timetables
-    Complete GTFS" / bus schedule product separately from the realtime
-    product) instead of silently falling back to numeric IDs.
+    No lock, no background thread, no import-time call. Called lazily from
+    get_all_rows_cached() on the first dashboard request. If two requests
+    race, they'll both download the schedule — that's an acceptable cost
+    for removing the lock that was blocking the health check. The 24h disk
+    cache means this race happens at most once per day per process.
 
-    trip_headsign (from trips.txt) is what's physically shown on the bus's
-    destination sign — e.g. "Bondi Beach" — and is direction-specific,
-    unlike routes.txt's route_long_name which is usually a fixed "A to B"
-    description that doesn't tell you which way a given trip is currently
-    headed.
+    Handles both flat GTFS zips (agency.txt/trips.txt at top level) and
+    zip-of-zips (one nested zip per contract region).
     """
-    with _schedule_lock:
+    if AGENCY_CACHE_FILE.exists():
+        try:
+            cached = json.loads(AGENCY_CACHE_FILE.read_text())
+            fetched_at = datetime.fromisoformat(cached["fetched_at"])
+            if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
+                return cached["agencies"], cached.get("trip_headsigns", {}), None
+        except Exception:
+            pass
+
+    try:
+        resp = requests.get(SCHEDULE_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Schedule endpoint returned HTTP {resp.status_code}. "
+                f"This usually means the API key isn't subscribed to the bus schedule/timetable "
+                f"product (separate from GTFS Realtime) on the TfNSW developer portal."
+            )
+        outer = zipfile.ZipFile(io.BytesIO(resp.content))
+        names = outer.namelist()
+
+        agencies = {}
+        trip_headsigns = {}
+
+        def parse_bundle(zf):
+            agencies.update(_parse_csv_member(zf, "agency.txt", "agency_id", "agency_name"))
+            trip_headsigns.update(_parse_csv_member(zf, "trips.txt", "trip_id", "trip_headsign"))
+
+        if "agency.txt" in names or "trips.txt" in names:
+            parse_bundle(outer)
+        else:
+            for name in names:
+                if name.endswith(".zip"):
+                    inner = zipfile.ZipFile(io.BytesIO(outer.read(name)))
+                    parse_bundle(inner)
+
+        if not agencies:
+            raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
+
+        AGENCY_CACHE_FILE.write_text(json.dumps({
+            "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
+            "agencies": agencies,
+            "trip_headsigns": trip_headsigns,
+        }))
+        return agencies, trip_headsigns, None
+    except Exception as e:
         if AGENCY_CACHE_FILE.exists():
             try:
                 cached = json.loads(AGENCY_CACHE_FILE.read_text())
-                fetched_at = datetime.fromisoformat(cached["fetched_at"])
-                if datetime.now(tz=SYDNEY_TZ) - fetched_at < AGENCY_CACHE_MAX_AGE:
-                    return cached["agencies"], cached.get("trip_headsigns", {}), None
+                return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
             except Exception:
-                pass  # corrupt cache, refetch below
-
-        try:
-            resp = requests.get(SCHEDULE_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=30)
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Schedule endpoint returned HTTP {resp.status_code}. "
-                    f"This usually means the API key isn't subscribed to the bus schedule/timetable "
-                    f"product (separate from GTFS Realtime) on the TfNSW developer portal."
-                )
-            outer = zipfile.ZipFile(io.BytesIO(resp.content))
-            names = outer.namelist()
-
-            agencies: dict[str, str] = {}
-            trip_headsigns: dict[str, str] = {}
-
-            def parse_bundle(zf: zipfile.ZipFile) -> None:
-                agencies.update(_parse_csv_member(zf, "agency.txt", "agency_id", "agency_name"))
-                trip_headsigns.update(_parse_csv_member(zf, "trips.txt", "trip_id", "trip_headsign"))
-
-            if "agency.txt" in names or "trips.txt" in names:
-                # flat bundle
-                parse_bundle(outer)
-            else:
-                # zip-of-zips, one per contract region
-                for name in names:
-                    if name.endswith(".zip"):
-                        inner = zipfile.ZipFile(io.BytesIO(outer.read(name)))
-                        parse_bundle(inner)
-
-            if not agencies:
-                raise RuntimeError("Downloaded schedule bundle but found no agency.txt / no agency rows in it.")
-
-            AGENCY_CACHE_FILE.write_text(json.dumps({
-                "fetched_at": datetime.now(tz=SYDNEY_TZ).isoformat(),
-                "agencies": agencies,
-                "trip_headsigns": trip_headsigns,
-            }))
-            return agencies, trip_headsigns, None
-        except Exception as e:
-            if AGENCY_CACHE_FILE.exists():
-                try:
-                    cached = json.loads(AGENCY_CACHE_FILE.read_text())
-                    return cached["agencies"], cached.get("trip_headsigns", {}), f"Using stale cached names ({e})"
-                except Exception:
-                    pass
-            return {}, {}, str(e)
+                pass
+        return {}, {}, str(e)
 
 
-def fetch_feed() -> gtfs_realtime_pb2.FeedMessage:
+def fetch_feed():
     headers = {"Authorization": f"apikey {API_KEY}"}
     response = requests.get(FEED_URL, headers=headers, timeout=15)
     response.raise_for_status()
@@ -389,7 +299,7 @@ def fetch_feed() -> gtfs_realtime_pb2.FeedMessage:
     return feed
 
 
-def fetch_vehicle_feed() -> gtfs_realtime_pb2.FeedMessage:
+def fetch_vehicle_feed():
     headers = {"Authorization": f"apikey {API_KEY}"}
     response = requests.get(VEHICLE_POS_URL, headers=headers, timeout=15)
     response.raise_for_status()
@@ -398,7 +308,7 @@ def fetch_vehicle_feed() -> gtfs_realtime_pb2.FeedMessage:
     return feed
 
 
-def extract_rows(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict) -> list:
+def extract_rows(feed, agency_names):
     pulled_at = datetime.now(tz=SYDNEY_TZ).isoformat()
     rows = []
     for entity in feed.entity:
@@ -428,11 +338,8 @@ def extract_rows(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict) -> lis
     return rows
 
 
-def latest_reading_per_trip(rows: list) -> dict:
-    """Collapse to one reading per trip — the freshest, i.e. the stop with the
-    lowest stop_sequence still in the feed (TfNSW drops stops once a bus
-    passes them, so the lowest remaining sequence is the newest data point)."""
-    latest: dict = {}
+def latest_reading_per_trip(rows):
+    latest = {}
     for r in rows:
         existing = latest.get(r["trip_id"])
         if existing is None or r["stop_sequence"] < existing["stop_sequence"]:
@@ -440,8 +347,7 @@ def latest_reading_per_trip(rows: list) -> dict:
     return latest
 
 
-def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict,
-                      trip_headsigns: dict | None = None) -> list:
+def extract_vehicles(feed, agency_names, trip_headsigns=None):
     trip_headsigns = trip_headsigns or {}
     vehicles = []
     for entity in feed.entity:
@@ -459,7 +365,7 @@ def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict,
             "route_id": route_id,
             "route_num": route_num,
             "route_operator": route_operator,
-            "headsign": trip_headsigns.get(trip_id),  # e.g. "Bondi Beach" — None if not in the schedule bundle
+            "headsign": trip_headsigns.get(trip_id),
             "lat": v.position.latitude,
             "lon": v.position.longitude,
             "bearing": v.position.bearing if v.HasField("position") else None,
@@ -468,10 +374,7 @@ def extract_vehicles(feed: gtfs_realtime_pb2.FeedMessage, agency_names: dict,
     return vehicles
 
 
-def merge_vehicle_delays(vehicles: list, delay_by_trip: dict) -> None:
-    """Attach delay info to each vehicle dict in place, joined by trip_id.
-    Fill colour is always COLOR_FILL — only outline_color varies with
-    status — see module docstring on the colour scheme."""
+def merge_vehicle_delays(vehicles, delay_by_trip):
     for veh in vehicles:
         veh["fill_color"] = COLOR_FILL
         d = delay_by_trip.get(veh["trip_id"])
@@ -497,7 +400,7 @@ def merge_vehicle_delays(vehicles: list, delay_by_trip: dict) -> None:
             veh["outline_color"] = OUTLINE_EARLY
 
 
-def append_to_log(rows: list) -> None:
+def append_to_log(rows):
     file_exists = LOG_FILE.exists()
     with LOG_FILE.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["pulled_at", "operator", "route_id", "trip_id", "stop_id", "stop_sequence", "delay", "anomaly"])
@@ -506,7 +409,7 @@ def append_to_log(rows: list) -> None:
         writer.writerows(rows)
 
 
-def summarise(rows: list, key: str) -> list:
+def summarise(rows, key):
     grouped = defaultdict(list)
     for r in rows:
         grouped[r[key]].append(r["delay"])
@@ -525,8 +428,7 @@ def summarise(rows: list, key: str) -> list:
     return out
 
 
-def split_route(route_id: str, agency_names: dict) -> tuple[str, str]:
-    """Split '2504_601' into ('601', 'Transdev NSW') — route number and operator name."""
+def split_route(route_id, agency_names):
     if "_" not in route_id:
         return route_id, ""
     agency_id, route_num = route_id.split("_", 1)
@@ -535,29 +437,17 @@ def split_route(route_id: str, agency_names: dict) -> tuple[str, str]:
 
 
 # Short-TTL in-memory caches, shared between the dashboard page load and the
-# /api/vehicles poll. Without this, every 15s poll (from every open tab) was
-# independently re-fetching BOTH TfNSW feeds and re-appending the full
-# trip-update pull to delay_log.csv — the log growing unbounded on every
-# poll (not just page loads) was the main driver of the slowdown/timeouts.
-# TTL is kept just under the client's 15s poll interval so data still feels
-# live while bursts of concurrent requests (multiple tabs, page load + poll
-# landing close together) reuse one fetch instead of triggering their own.
-#
-# IMPORTANT: these dicts are per-process. Running multiple gunicorn WORKERS
-# (processes) means each one builds its own copy — with 4 workers you get
-# 4x the memory for identical data, which was causing the OOM on Render.
-# Use 1 worker with multiple THREADS instead (see module docstring).
+# /api/vehicles poll. See the DEPLOYMENT NOTES in the module docstring.
 CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
-_heatmap_cache: dict = {}  # window_hours -> {"points": [...], "error": ..., "fetched_at": datetime}
+_heatmap_cache = {}
 
 
 def get_all_rows_cached():
-    """Fetch+parse the trip-update feed, reusing a recent result if within
-    CACHE_TTL_SECONDS. Only logs to delay_log.csv when an actual fetch
-    happens, not on cache hits."""
+    """Fetch+parse the trip-update feed. Schedule lookups are loaded lazily
+    here on the first call (and cached for 24h on disk)."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _rows_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -567,17 +457,14 @@ def get_all_rows_cached():
     agency_names, trip_headsigns, agency_error = load_schedule_lookups()
     feed = fetch_feed()
     all_rows = extract_rows(feed, agency_names)
-    append_to_log(all_rows)  # only on an actual fetch, not every poll
+    append_to_log(all_rows)
 
     _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
-                        agency_error=agency_error, fetched_at=now)
+                       agency_error=agency_error, fetched_at=now)
     return all_rows, agency_names, trip_headsigns, agency_error
 
 
 def get_vehicles_cached(agency_names, trip_headsigns):
-    """Fetch+parse the vehicle-position feed, reusing a recent result if
-    within CACHE_TTL_SECONDS. Returns a fresh copy of dicts each call so
-    per-request delay-merging/filtering never mutates the cached objects."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _vehicles_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -589,24 +476,13 @@ def get_vehicles_cached(agency_names, trip_headsigns):
     return [dict(v) for v in vehicles]
 
 
-def _fetch_one_day(date_str: str) -> tuple:
-    """Fetch one day's raw CSV. Returns (date_str, csv_text_or_None, error_or_None).
-
-    404 is treated as "no file for that day" (not an error) — the collector
-    may not have run for a given date, or the repo may be brand new.
-    Anything else is surfaced verbatim (including the HTTP code) so the
-    frontend status line shows something actionable rather than just
-    "fetch failed".
-
-    A short line is also printed to stdout on every fetch so it shows up in
-    the Render log stream — hit /api/heatmap once and read the logs to see
-    exactly which URLs were requested and what came back."""
+def _fetch_one_day(date_str):
     url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
     try:
         resp = requests.get(url, timeout=8)
         print(f"[heatmap] GET {url} -> HTTP {resp.status_code} ({len(resp.content)} bytes)", flush=True)
         if resp.status_code == 404:
-            return date_str, None, None  # no data collected that day — not an error
+            return date_str, None, None
         resp.raise_for_status()
         return date_str, resp.text, None
     except requests.RequestException as e:
@@ -614,41 +490,23 @@ def _fetch_one_day(date_str: str) -> tuple:
         return date_str, None, f"{date_str}: {e}"
 
 
-def fetch_historical_heatmap_points(window_hours: int) -> tuple:
-    """Fetch density points from the gtfs-r-scrape repo's daily CSVs,
-    covering whatever files fall inside the requested time window.
+def fetch_historical_heatmap_points(window_hours):
+    """Fetch density points from the gtfs-r-scrape repo's daily CSVs.
 
     Rows are aggregated into a fixed-precision lat/lon grid as they're
     parsed, so a statewide 7-day window collapses from hundreds of
-    thousands of individual [lat, lon] lists into a few thousand cells
-    before anything is cached. Each cell is emitted as
-    [mean_lat, mean_lon, normalised_count] — leaflet.heat reads the third
-    element as intensity, so the visual is essentially unchanged from
-    plotting every raw point, but the memory footprint is ~100x smaller.
-
-    Days are fetched IN PARALLEL — a 7-day window touches up to 8 files,
-    and fetching them one after another risked the whole request exceeding
-    Render/Cloudflare's proxy timeout (seen as an HTML timeout page instead
-    of JSON — "Unexpected token '<'" in the browser).
-
-    Timestamps are parsed via parse_ts() above, which normalises naive /
-    Z-suffixed / offset-bearing / epoch values to Sydney-aware datetimes.
-    A naive-vs-aware comparison here previously raised TypeError, which
-    propagated up and killed the whole request — that's why the historical
-    layer never loaded.
+    thousands of individual [lat, lon] lists into a few thousand cells.
+    Each cell is emitted as [mean_lat, mean_lon, normalised_count].
     """
     now = datetime.now(tz=SYDNEY_TZ)
     cutoff = now - timedelta(hours=window_hours)
 
-    # Which daily files could contain rows >= cutoff: every date from
-    # cutoff's date through today (handles windows spanning midnight).
     dates_needed = []
     d = cutoff.date()
     while d <= now.date():
         dates_needed.append(d.isoformat())
         d += timedelta(days=1)
 
-    # cell -> [sum_lat, sum_lon, count]
     cells = defaultdict(lambda: [0.0, 0.0, 0])
     last_error = None
     files_fetched = 0
@@ -691,9 +549,6 @@ def fetch_historical_heatmap_points(window_hours: int) -> tuple:
         return [], (f"Fetched {files_fetched} file(s) and read {rows_seen} rows, but none fell "
                     f"inside the last {window_hours}h — check the 'timestamp' column name and format")
 
-    # Normalise counts to 0..1 so leaflet.heat reads the third element as
-    # intensity. The most-visited cell gets 1.0; a cell with half as many
-    # points gets 0.5; a cell with a single point gets 1/max_count.
     max_count = max(c[2] for c in cells.values())
     points = []
     for c in cells.values():
@@ -701,10 +556,7 @@ def fetch_historical_heatmap_points(window_hours: int) -> tuple:
     return points, None
 
 
-def get_heatmap_points_cached(window_hours: int):
-    """Cache historical heatmap points per window size — new scrape data only
-    lands hourly, so there's no need to re-fetch/re-parse the daily CSVs on
-    every request the way the live 12s vehicle cache does."""
+def get_heatmap_points_cached(window_hours):
     now = datetime.now(tz=SYDNEY_TZ)
     cached = _heatmap_cache.get(window_hours)
     if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
@@ -716,9 +568,6 @@ def get_heatmap_points_cached(window_hours: int):
 
 
 def compute_delay_data(args):
-    """Shared by the dashboard page and /api/vehicles: fetches the trip-update
-    feed (via the short-TTL cache above), applies the route/stop/operator/
-    hide_anomalies filters from the request, and returns everything both need."""
     hide_anomalies = args.get("hide_anomalies", "1") == "1"
     sort_key = args.get("sort", "stdev_min")
     ascending = args.get("asc") == "1"
@@ -736,18 +585,11 @@ def compute_delay_data(args):
     if q_operator:
         rows = [r for r in rows if q_operator in r["operator"].lower()]
     if q_stop:
-        # match against ALL stops each trip touches (past+upcoming in the feed),
-        # not just its most recent reading, then keep every row for those trips
-        # so the latest-per-trip dedupe below still finds their current status
         matching_trip_ids = {r["trip_id"] for r in rows if q_stop in r["stop_id"].lower()}
         rows = [r for r in rows if r["trip_id"] in matching_trip_ids]
 
     latest_by_trip = latest_reading_per_trip(rows)
     latest_rows = list(latest_by_trip.values())
-
-    # Unfiltered, freshest-per-trip delay lookup — used to colour/annotate
-    # every vehicle on the map, independent of which trips currently pass
-    # the route/stop/operator/hide_anomalies filters above.
     delay_by_trip_all = latest_reading_per_trip(all_rows)
 
     return {
@@ -770,10 +612,6 @@ def compute_delay_data(args):
 
 
 def compute_vehicles(data):
-    """Fetch vehicle positions (via the short-TTL cache above), join delays
-    by trip_id, apply the same route/stop/operator filters already resolved
-    in `data` (via latest_by_trip's trip_id set) so the map matches the
-    tables below it."""
     try:
         vehicles = get_vehicles_cached(data["agency_names"], data["trip_headsigns"])
     except requests.RequestException as e:
@@ -867,13 +705,10 @@ PAGE = """
     display: inline-block; width: 12px; height: 12px; border-radius: 50%;
     margin-right: 4px; vertical-align: middle;
     background: var(--fill-blue);
-    border: 2px solid #999; /* overridden inline per-swatch to show its ring colour */
+    border: 2px solid #999;
   }
   .map-error { color: var(--late); font-size: 0.85rem; margin-top: 8px; }
 
-  /* Bus marker: flat pill, arrow sits inline next to the route number.
-     Fill is always the brand blue; the ring (border-color) carries delay
-     status — see COLOUR SCHEME note in app.py. */
   .bus-marker { position: relative; width: 56px; height: 24px; }
   .bus-pill {
     position: absolute;
@@ -887,7 +722,7 @@ PAGE = """
     font: 600 11px/1 -apple-system, Helvetica, Arial, sans-serif;
     padding: 5px 7px;
     border-radius: 7px;
-    border: 2.5px solid #888; /* replaced inline with the status outline colour */
+    border: 2.5px solid #888;
     box-shadow: 0 1px 3px rgba(0,0,0,0.4);
     white-space: nowrap;
   }
@@ -900,10 +735,6 @@ PAGE = """
   }
   .leaflet-popup-content { font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
 
-  /* Frosted-glass chrome, shared by the hover tooltip and the click popup.
-     Leaflet's `className` option puts this class on .leaflet-tooltip for
-     tooltips but on the outer .leaflet-popup for popups, so both selector
-     forms below are needed. */
   .glass-tooltip {
     background: rgba(255, 255, 255, 0.55) !important;
     -webkit-backdrop-filter: blur(14px) saturate(180%);
@@ -915,7 +746,7 @@ PAGE = """
     font: 600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif;
     padding: 7px 11px;
   }
-  .glass-tooltip::before { display: none; } /* hide Leaflet's default solid-colour pointer arrow */
+  .glass-tooltip::before { display: none; }
 
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper {
     background: rgba(255, 255, 255, 0.55);
@@ -931,12 +762,10 @@ PAGE = """
     box-shadow: none;
   }
 
-  /* Layer-switcher control (Bus markers / live density / historical density) */
   .leaflet-control-layers {
     font: 13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important;
   }
 
-  /* Historical-window picker, shown inside the layer control's overlay list */
   #histWindowPicker {
     font: 12px/1.4 -apple-system, Helvetica, Arial, sans-serif;
     margin: 4px 0 2px 22px;
@@ -1026,36 +855,25 @@ PAGE = """
   </table>
 
   <script>
-    const map = L.map('dashmap').setView([-33.8688, 151.2093], 11); // Sydney
+    const map = L.map('dashmap').setView([-33.8688, 151.2093], 11);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
-    const markers = new Map(); // trip_id/vehicle_id -> Leaflet marker
+    const markers = new Map();
 
-    // Perceptually-uniform "plasma"-style gradient: purple (low) through
-    // pink/orange to yellow (high) — reads clearly as a heat scale without
-    // the harsh traffic-light red/yellow look.
     const HEAT_GRADIENT = { 0.0: '#0d0887', 0.3: '#7e03a8', 0.55: '#cc4778', 0.75: '#f89441', 1.0: '#f0f921' };
 
-    // leaflet.heat's radius/blur are fixed SCREEN PIXELS, not real-world
-    // distance — so a fixed value looks tiny zoomed in and huge zoomed out.
-    // Instead we define each layer's desired radius/blur in METRES and
-    // recompute the pixel equivalent on every zoom change, so the apparent
-    // level of detail stays constant regardless of zoom level.
     const LIVE_RADIUS_M = 120, LIVE_BLUR_M = 110;
-    const HIST_RADIUS_M = 220, HIST_BLUR_M = 200; // larger — hourly collection means sparser points to blend
+    const HIST_RADIUS_M = 220, HIST_BLUR_M = 200;
 
     function metresToPixels(metres, zoom, lat) {
       const metresPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
       return metres / metresPerPixel;
     }
 
-    // --- Live density heatmap (positions only, no delay weighting) ---
     const markersLayer = L.layerGroup().addTo(map);
     const heatLayer = L.heatLayer([], { radius: 30, blur: 22, maxZoom: 15, minOpacity: 0.35, gradient: HEAT_GRADIENT });
-
-    // --- Historical density heatmap, from the gtfs-r-scrape repo ---
     const histHeatLayer = L.heatLayer([], { radius: 45, blur: 32, maxZoom: 14, minOpacity: 0.25, gradient: HEAT_GRADIENT });
 
     function updateHeatRadii() {
@@ -1071,7 +889,7 @@ PAGE = """
       });
     }
     map.on('zoomend', updateHeatRadii);
-    updateHeatRadii(); // set correct radius for the initial zoom level immediately
+    updateHeatRadii();
 
     const layersControl = L.control.layers(null, {
       'Bus markers': markersLayer,
@@ -1079,10 +897,6 @@ PAGE = """
       'Vehicle density heatmap (historical)': histHeatLayer
     }, { collapsed: false }).addTo(map);
 
-    // Inject a small time-window picker + status line under the layer
-    // control, only relevant to the historical layer. The status line
-    // shows point count or the actual fetch/data error visibly, rather
-    // than only logging to the console where it's easy to miss.
     const pickerDiv = document.createElement('div');
     pickerDiv.id = 'histWindowPicker';
     pickerDiv.innerHTML = `
@@ -1097,7 +911,6 @@ PAGE = """
     const statusDiv = document.createElement('div');
     statusDiv.id = 'histWindowStatus';
     layersControl.getContainer().appendChild(statusDiv);
-    // Stop map drag/zoom from hijacking clicks on the picker
     L.DomEvent.disableClickPropagation(pickerDiv);
 
     async function loadHistoricalHeatmap() {
@@ -1113,9 +926,6 @@ PAGE = """
           statusDiv.textContent = data.error;
           statusDiv.style.color = '#b3261e';
         } else if (points.length === 0) {
-          // No error but no points either — surface this loudly, since a
-          // silent "0 points" was previously indistinguishable from "the
-          // fetch never ran" while debugging.
           statusDiv.textContent = 'No historical points in this window yet';
           statusDiv.style.color = '#b3261e';
         } else {
@@ -1129,10 +939,10 @@ PAGE = """
       }
     }
     document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
-    loadHistoricalHeatmap(); // initial load — independent of the live 15s poll cycle
+    loadHistoricalHeatmap();
 
     function makeIcon(routeLabel, bearing, outlineColor) {
-      const rot = (bearing != null ? bearing : 0) - 90; // glyph points right by default; GTFS bearing is clockwise from north
+      const rot = (bearing != null ? bearing : 0) - 90;
       return L.divIcon({
         className: '',
         iconSize: [56, 24],
@@ -1180,7 +990,7 @@ PAGE = """
         const key = v.vehicle_id || v.trip_id;
         seen.add(key);
 
-        heatPoints.push([v.lat, v.lon]); // density only — no delay weighting yet
+        heatPoints.push([v.lat, v.lon]);
 
         const routeLabel = v.route_num || v.route_id || '?';
         const icon = makeIcon(routeLabel, v.bearing, v.outline_color || '#888');
@@ -1222,30 +1032,30 @@ PAGE = """
       }
     }
 
-    // Initial paint uses the vehicles fetched at page-load (server-rendered),
-    // then polls independently every 15s so the map stays live without
-    // reloading the tables below.
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
-    setInterval(loadHistoricalHeatmap, 300000); // refresh historical layer every 5 min — matches server cache TTL
+    setInterval(loadHistoricalHeatmap, 300000);
   </script>
 </body>
 </html>
 """
 
 
+@app.route("/ping")
+def ping():
+    """Dead-simple liveness endpoint. Returns instantly, touches nothing.
+
+    Point Render's Health Check Path at /ping (Settings -> Health Checks).
+    This is deliberately separate from /health so that if /health ever
+    grows a side effect in a future edit, the health check doesn't break.
+    """
+    print("[ping] health check hit", flush=True)
+    return "pong", 200
+
+
 @app.route("/health")
 def health():
-    """Render health-check target. Returns instantly with ZERO side effects.
-
-    Deliberately does NOT start the schedule prewarm: that prewarm does a
-    30-second download plus a CPU-heavy CSV parse, and if it's running
-    while Render sends its health check, the GIL contention means the
-    health check can't respond within Render's 5-second timeout. Render
-    then marks the service unhealthy and enters a restart loop, which
-    surfaces as "No open HTTP ports detected on 0.0.0.0" in the logs and
-    a 502 to clients. The prewarm starts lazily on the first dashboard
-    request instead — see dashboard() below."""
+    """Minimal health endpoint. Returns instantly, touches nothing."""
     return "ok", 200
 
 
@@ -1253,8 +1063,6 @@ def health():
 def dashboard():
     if not API_KEY:
         return "TFNSW_API_KEY not set in .env", 500
-
-    _start_prewarm_once()
 
     data = compute_delay_data(request.args)
     vehicles, map_error = compute_vehicles(data)
@@ -1320,22 +1128,14 @@ def api_vehicles():
 
 @app.route("/api/heatmap")
 def api_heatmap():
-    """Historical density heatmap points, sourced from the gtfs-r-scrape
-    repo's daily CSVs. ?window=1|24|168 (hours) — defaults to 24.
-
-    Wrapped in try/except so ANY failure here — including ones we didn't
-    anticipate — still returns valid JSON rather than falling through to
-    Flask's default HTML error page. A raw HTML error page is what was
-    causing the frontend's "Unexpected token '<'" parse failure: the
-    browser was trying to JSON.parse() an error page, not actual JSON.
-    """
+    """Historical density heatmap points. ?window=1|24|168 (hours)."""
     try:
         try:
             window_hours = int(request.args.get("window", 24))
         except ValueError:
             window_hours = 24
         if window_hours not in (1, 24, 168):
-            window_hours = 24  # guard against arbitrary values hammering GitHub with odd date ranges
+            window_hours = 24
 
         points, error = get_heatmap_points_cached(window_hours)
         return jsonify({"points": points, "window_hours": window_hours, "error": error})
