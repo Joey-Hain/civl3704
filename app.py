@@ -57,6 +57,16 @@ Setup:
 Usage:
     python app.py
     then open http://localhost:5000
+
+Render deployment note: use ONE gunicorn worker with multiple threads, not
+multiple workers. Each worker is a separate process with its own copy of
+the module-level caches (_rows_cache, _vehicles_cache, _heatmap_cache) and
+the loaded TfNSW schedule bundle — with 4 workers you get 4x the memory for
+identical data, which is what was causing the OOM. Suggested start command:
+
+    gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 \
+        --worker-class gthread --timeout 120 \
+        --max-requests 500 --max-requests-jitter 100
 """
 
 import csv
@@ -78,6 +88,7 @@ from flask import Flask, jsonify, render_template_string, request
 from google.transit import gtfs_realtime_pb2
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
+UTC_TZ = ZoneInfo("UTC")
 DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
@@ -126,6 +137,49 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dlon = radians(lon2 - lon1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
     return 2 * r * asin(sqrt(a))
+
+
+def parse_ts(raw):
+    """Parse a timestamp from the scraper's CSV into a Sydney-aware datetime.
+
+    Handles the two formats that scrape jobs tend to produce and that were
+    tripping up the previous comparison against an aware `cutoff`:
+
+      1. ISO-8601, with or without a trailing 'Z', with or without an offset
+         (e.g. "2026-09-10T13:00:00Z" or "2026-09-10T13:00:00"). If there's
+         no tzinfo, we assume UTC — that's what a GH-Actions cron job
+         almost always writes.
+      2. Unix epoch (seconds). Only used if the value is a bare number that
+         looks like a real epoch (>= 1e9), to avoid accidentally treating
+         a date-like integer string as seconds-since-1970.
+
+    Returns a tz-aware datetime in Australia/Sydney, or None if unparseable.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    # Try ISO first (most likely, and unambiguous).
+    try:
+        ts = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC_TZ)
+        return ts.astimezone(SYDNEY_TZ)
+    except ValueError:
+        pass
+
+    # Fall back to Unix epoch seconds — only if it looks like a plausible
+    # post-2001 timestamp (>= 1e9 seconds).
+    try:
+        val = float(s)
+        if val >= 1e9:
+            return datetime.fromtimestamp(val, tz=UTC_TZ).astimezone(SYDNEY_TZ)
+    except (ValueError, OSError, OverflowError):
+        pass
+
+    return None
 
 
 app = Flask(__name__)
@@ -398,8 +452,13 @@ def split_route(route_id: str, agency_names: dict[str, str]) -> tuple[str, str]:
 # trip-update pull to delay_log.csv — the log growing unbounded on every
 # poll (not just page loads) was the main driver of the slowdown/timeouts.
 # TTL is kept just under the client's 15s poll interval so data still feels
-# live while bursts of concurrent requests (multiple tabs, page load +
-# poll landing close together) reuse one fetch instead of triggering their own.
+# live while bursts of concurrent requests (multiple tabs, page load + poll
+# landing close together) reuse one fetch instead of triggering their own.
+#
+# IMPORTANT: these dicts are per-process. Running multiple gunicorn WORKERS
+# (processes) means each one builds its own copy — with 4 workers you get
+# 4x the memory for identical data, which was causing the OOM on Render.
+# Use 1 worker with multiple THREADS instead (see module docstring).
 CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
@@ -443,16 +502,28 @@ def get_vehicles_cached(agency_names, trip_headsigns):
 
 
 def _fetch_one_day(date_str: str) -> tuple[str, str | None, str | None]:
-    """Fetch one day's raw CSV. Returns (date_str, csv_text_or_None, error_or_None)."""
+    """Fetch one day's raw CSV. Returns (date_str, csv_text_or_None, error_or_None).
+
+    404 is treated as "no file for that day" (not an error) — the collector
+    may not have run for a given date, or the repo may be brand new.
+    Anything else is surfaced verbatim (including the HTTP code) so the
+    frontend status line shows something actionable rather than just
+    "fetch failed".
+
+    A short line is also printed to stdout on every fetch so it shows up in
+    the Render log stream — hit /api/heatmap once and read the logs to see
+    exactly which URLs were requested and what came back."""
     url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
     try:
         resp = requests.get(url, timeout=8)
+        print(f"[heatmap] GET {url} -> HTTP {resp.status_code} ({len(resp.content)} bytes)")
         if resp.status_code == 404:
             return date_str, None, None  # no data collected that day — not an error
         resp.raise_for_status()
         return date_str, resp.text, None
     except requests.RequestException as e:
-        return date_str, None, str(e)
+        print(f"[heatmap] GET {url} -> FAILED: {e}")
+        return date_str, None, f"{date_str}: {e}"
 
 
 def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None]:
@@ -467,6 +538,13 @@ def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None
     of JSON — "Unexpected token '<'" in the browser). Rows outside the
     window are filtered by timestamp in Python after fetching, since the
     raw CSV has no server-side query capability — fine at this data volume.
+
+    Timestamps are parsed via parse_ts() above, which normalises naive /
+    Z-suffixed / offset-bearing / epoch values to Sydney-aware datetimes.
+    The previous inline datetime.fromisoformat() call returned a naive
+    datetime for naive inputs, which then raised TypeError when compared
+    against the aware `cutoff` — that exception propagated up and killed
+    the whole request, which is why the historical layer never loaded.
     """
     now = datetime.now(tz=SYDNEY_TZ)
     cutoff = now - timedelta(hours=window_hours)
@@ -481,7 +559,8 @@ def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None
 
     points = []
     last_error = None
-    any_fetched = False
+    files_fetched = 0
+    rows_seen = 0
 
     with ThreadPoolExecutor(max_workers=min(8, len(dates_needed))) as pool:
         futures = [pool.submit(_fetch_one_day, ds) for ds in dates_needed]
@@ -492,15 +571,13 @@ def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None
                 continue
             if text is None:
                 continue
-            any_fetched = True
+            files_fetched += 1
 
             reader = csv.DictReader(io.StringIO(text))
             for row in reader:
-                try:
-                    ts = datetime.fromisoformat(row["timestamp"])
-                except (KeyError, ValueError):
-                    continue
-                if ts < cutoff:
+                rows_seen += 1
+                ts = parse_ts(row.get("timestamp"))
+                if ts is None or ts < cutoff:
                     continue
                 try:
                     lat = float(row["lat"])
@@ -509,8 +586,19 @@ def fetch_historical_heatmap_points(window_hours: int) -> tuple[list, str | None
                     continue
                 points.append([lat, lon])
 
-    if not points and not any_fetched:
-        return [], last_error or "No historical data files found for this time window yet"
+    print(f"[heatmap] window={window_hours}h files_fetched={files_fetched} "
+          f"rows_seen={rows_seen} points_in_window={len(points)}")
+
+    if not points:
+        if files_fetched == 0:
+            return [], last_error or "No data files found for this window on GitHub"
+        # Files came back, but nothing fell inside the window. Most common
+        # cause: timestamp column name doesn't match ('time'/'ts'/'datetime'
+        # instead of 'timestamp'), or the column exists but holds a format
+        # parse_ts() can't read. The printed row count above tells you
+        # whether the CSV parsed at all.
+        return [], (f"Fetched {files_fetched} file(s) and read {rows_seen} rows, but none fell "
+                    f"inside the last {window_hours}h — check the 'timestamp' column name and format")
     return points, None
 
 
@@ -924,6 +1012,12 @@ PAGE = """
         histHeatLayer.setLatLngs(points);
         if (data.error) {
           statusDiv.textContent = data.error;
+          statusDiv.style.color = '#b3261e';
+        } else if (points.length === 0) {
+          // No error but no points either — surface this loudly, since a
+          // silent "0 points" was previously indistinguishable from "the
+          // fetch never ran" while debugging.
+          statusDiv.textContent = 'No historical points in this window yet';
           statusDiv.style.color = '#b3261e';
         } else {
           statusDiv.textContent = points.length + ' historical points loaded';
