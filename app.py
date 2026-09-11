@@ -180,11 +180,6 @@ HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
 # physical model itself is rebuilt.
 SMART_CITY_CORNER_NE = (-33.83512300658737, 151.27599316594075)
 SMART_CITY_CORNER_SW = (-33.894722633376766, 151.13296645445593)
-# model.width / model.height (mm) from the same params.json5 — used only to
-# give the locked map the physical table's aspect ratio (2:1) so it keeps
-# the same proportions as what actually gets projected onto it.
-SMART_CITY_MODEL_WIDTH_MM = 2400
-SMART_CITY_MODEL_HEIGHT_MM = 1200
 
 COLOR_FILL = "#00B3F0"
 OUTLINE_ON_TIME = "#ffffff"
@@ -1353,64 +1348,368 @@ PROJECT_PAGE = """
 <head>
 <meta charset="utf-8">
 <meta name="robots" content="noindex, nofollow">
-<title>smart-city project &mdash; locked map</title>
+<title>smart-city project map</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <style>
-  :root { --bg:#f7f6f2; --text:#111; --muted:#666; --line:#ccc; --sans: Helvetica, Arial, sans-serif; }
+  :root { --fill-blue: {{ color_fill }}; }
   * { box-sizing: border-box; }
   html, body { height:100%; }
-  body { background:var(--bg); color:var(--text); font-family:var(--sans); margin:0; padding:16px; display:flex; flex-direction:column; }
-  h1 { font-size:1.1rem; font-weight:bold; margin:0 0 4px; }
-  .meta { color:var(--muted); font-size:0.8rem; margin-bottom:12px; }
-  .meta a { color:var(--text); }
-  /* Locked to the smart-city model's physical aspect ratio (width:height,
-     see MODEL_WIDTH_MM/MODEL_HEIGHT_MM below) so the projected view keeps
-     the same proportions as the physical table it's projected onto,
-     regardless of browser window shape. */
-  #projectMapWrap { position:relative; width:100%; max-width:calc((100vh - 140px) * {{ model_aspect }}); aspect-ratio:{{ model_aspect }}; margin:0 auto; border:1px solid var(--line); background:#e5e3dc; flex:0 1 auto; }
-  #projectMap { position:absolute; inset:0; }
-  .corner-readout { position:absolute; z-index:1000; background:rgba(17,17,17,0.78); color:#fff; font:600 11px/1.5 -apple-system, Helvetica, Arial, sans-serif; padding:6px 10px; border-radius:4px; pointer-events:none; }
-  .corner-readout.ne { top:8px; right:8px; text-align:right; }
-  .corner-readout.sw { bottom:8px; left:8px; }
+  body { margin:0; background:#e5e3dc; }
+  #dashmap { position:absolute; inset:0; }
+  .bus-marker { position:relative; width:56px; height:24px; }
+  .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
+  .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
+  .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
+  .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
+  .glass-tooltip::before { display:none; }
+  .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
+  .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
+  .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
+  #histWindowPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
+  #histWindowPicker select { font:inherit; }
+  #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
+  .heat-legend { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:6px 22px 2px; color:#333; }
+  .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
+  .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
+  .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
+  #heatLoadingBanner { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:900; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
 </style>
 </head>
 <body>
-  <h1>smart-city project <a style="float:right; font-size:0.8rem; font-weight:normal;" href="/">&larr; Delay Board</a></h1>
-  <div class="meta">
-    Map locked to the real-world box TransportLab's smart-city rig projects onto its physical table model &middot;
-    corners hardcoded from <a href="https://github.com/TransportLab/smart-city/blob/main/params.json5" target="_blank" rel="noopener noreferrer">params.json5</a>'s <code>model.corners</code> &middot;
-    update the two constants in <code>app.py</code> if the physical model is ever rebuilt.
-  </div>
-  <div id="projectMapWrap">
-    <div id="projectMap"></div>
-    <div class="corner-readout ne">NE {{ ne_lat }}, {{ ne_lng }}</div>
-    <div class="corner-readout sw">SW {{ sw_lat }}, {{ sw_lng }}</div>
-  </div>
+  <div id="dashmap"></div>
   <script>
-    const NE = [{{ ne_lat }}, {{ ne_lng }}];
-    const SW = [{{ sw_lat }}, {{ sw_lng }}];
-    const bounds = L.latLngBounds(SW, NE);
-
-    const map = L.map('projectMap', {
-      // Fully non-interactive and locked — this view exists to be
-      // projected onto the physical model, not browsed, so it should
-      // never be able to drift off the calibrated box.
-      zoomControl: false, dragging: false, touchZoom: false, doubleClickZoom: false,
-      scrollWheelZoom: false, boxZoom: false, keyboard: false, tap: false,
-      attributionControl: true,
-    });
+    const map = L.map('dashmap');
+    const PROJECT_BOUNDS = L.latLngBounds([{{ sw_lat }}, {{ sw_lng }}], [{{ ne_lat }}, {{ ne_lng }}]);
+    map.fitBounds(PROJECT_BOUNDS);
+    // Same interactive map/options as the main dashboard — this just adds
+    // a hard boundary so the view can never be panned or zoomed out past
+    // the projector's real-world extent (params.json5's model.corners).
+    // Zooming IN and dragging within the box still work exactly as on /.
+    map.setMinZoom(map.getZoom());
+    map.setMaxBounds(PROJECT_BOUNDS);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
-    map.fitBounds(bounds);
-    // Hard-lock: pin min/max zoom to whatever fitBounds landed on, and pin
-    // maxBounds to the same box, so nothing (a stray API call, a future
-    // code change re-enabling interaction) can pan or zoom this away from
-    // the calibrated view.
-    const lockedZoom = map.getZoom();
-    map.setMinZoom(lockedZoom);
-    map.setMaxZoom(lockedZoom);
-    map.setMaxBounds(bounds);
-    window.addEventListener('resize', () => map.invalidateSize());
+    const markers = new Map();
+
+    // One metric dropdown drives both heat layers at once, rather than a
+    // separate live+historical toggle pair per metric (6 checkboxes for
+    // density/delay/speed × live/historical was unmanageable). Each metric
+    // still gets its own live/historical colour-family pair — same idea as
+    // the original delay-only scheme — so the two active layers read as
+    // distinct from each other, but only one metric's pair is ever visible
+    // at a time.
+    //
+    // Each ramp now has 7 stops instead of 5, spread with more resolution
+    // in the upper-middle range (0.55-0.85) rather than jumping straight
+    // from "medium" to "darkest" — that jump was most of why hot areas all
+    // read as one flat dark blob instead of showing gradation. Paired with
+    // HEAT_MAX below (which stops a couple of overlapping points from
+    // instantly maxing out the ramp), distinct severities now land on
+    // visibly distinct stops instead of all piling onto the top colour.
+    // Hue families unchanged from the previous pass (red/violet,
+    // blue/orange, green/magenta — each live/hist pair colourblind-safe).
+    const METRICS = {
+      delay: {
+        label: 'Delay',
+        liveGradient:  { 0.0:'#f7e9e9', 0.15:'#f0c9c8', 0.35:'#e69795', 0.55:'#dd6664', 0.7:'#cf3d3b', 0.85:'#b21f1d', 1.0:'#7a0f0e' }, // red
+        histGradient:  { 0.0:'#eeecf5', 0.15:'#d6d0ea', 0.35:'#b3a7d9', 0.55:'#8f7ec7', 0.7:'#6c58ad', 0.85:'#4c3a8a', 1.0:'#2c2160' }, // violet
+        liveTitle: 'Live snapshot — current lateness',
+        histTitle: 'Historical window — mean lateness',
+        ticks: ['0 min late', 'SEVERITY_CAP+ min late'],
+      },
+      density: {
+        label: 'Density',
+        liveGradient:  { 0.0:'#e3eefc', 0.15:'#c2ddf8', 0.35:'#93c1f0', 0.55:'#5da0e3', 0.7:'#2f7fd0', 0.85:'#1a5fa8', 1.0:'#0c3d73' }, // blue
+        histGradient:  { 0.0:'#fcece3', 0.15:'#f8d3bd', 0.35:'#f2af86', 0.55:'#ec8a57', 0.7:'#df662f', 0.85:'#b8481a', 1.0:'#7f2f0e' }, // orange
+        liveTitle: 'Live snapshot — vehicle density',
+        histTitle: 'Historical window — vehicle density',
+        ticks: ['fewer pings', 'more pings'],
+      },
+      speed: {
+        label: 'Speed',
+        liveGradient:  { 0.0:'#e6f7e6', 0.15:'#c5ecc5', 0.35:'#98d998', 0.55:'#69c069', 0.7:'#3c9e3c', 0.85:'#217a21', 1.0:'#0f4f0f' }, // green
+        histGradient:  { 0.0:'#f8e9f0', 0.15:'#f0c8dd', 0.35:'#e498bf', 0.55:'#d669a2', 0.7:'#c2417f', 0.85:'#9c235f', 1.0:'#671041' }, // magenta
+        liveTitle: 'Live snapshot — current speed',
+        histTitle: 'Historical window — mean speed',
+        ticks: ['0 km/h', 'SPEED_CAP+ km/h'],
+      },
+    };
+    const DEFAULT_METRIC = 'delay';
+    let currentMetric = DEFAULT_METRIC;
+    let lastVehicles = [];
+
+    // Keep these two in sync with their server-side counterparts
+    // (HEATMAP_SEVERITY_CAP_SEC, HEATMAP_SPEED_CAP_KMH) so the live and
+    // historical legends mean the same thing for the same metric.
+    const SEVERITY_CAP_MIN = 10;
+    const SPEED_CAP_KMH = 60;
+    METRICS.delay.ticks[1] = `${SEVERITY_CAP_MIN}+ min late`;
+    METRICS.speed.ticks[1] = `${SPEED_CAP_KMH}+ km/h`;
+
+    const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
+    const HEAT_MIN_RADIUS_PX = 12, HEAT_MIN_BLUR_PX = 10;
+
+    function metresToPixels(metres, zoom, lat) {
+      const mpp = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+      return metres / mpp;
+    }
+    const markersLayer = L.layerGroup().addTo(map);
+    // minOpacity nudged up from the original 0.12 — combined with the old
+    // pale gradient stops, low-weight points were nearly invisible against
+    // the map background, which was the other half of "switching metric
+    // doesn't seem to do anything".
+    const HEAT_MIN_OPACITY = 0.22;
+    // Leaflet.heat merges nearby points into a shared screen-space grid
+    // cell and SUMS their weights before mapping the total through
+    // options.max (default 1) to pick a gradient colour — so with max:1,
+    // just two or three overlapping vehicles/cells (extremely common
+    // anywhere buses share a corridor) instantly saturate to the topmost
+    // colour, which is what made hot areas render as one flat dark blob
+    // with no visible gradation between "somewhat busy/late" and
+    // "extremely busy/late". Raising max gives the ramp headroom: it now
+    // takes several stacked full-weight points to reach the darkest
+    // colour, so the intermediate stops actually get used.
+    const HEAT_MAX = 3.5;
+    const heatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, max:HEAT_MAX, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].liveGradient });
+    const histHeatLayer = L.heatLayer([], { radius:HEAT_MIN_RADIUS_PX, blur:HEAT_MIN_BLUR_PX, max:HEAT_MAX, minOpacity:HEAT_MIN_OPACITY, gradient:METRICS[DEFAULT_METRIC].histGradient });
+
+    function updateHeatRadii() {
+      const zoom = map.getZoom();
+      const lat = map.getCenter().lat;
+      const radius = Math.max(metresToPixels(HEAT_RADIUS_M, zoom, lat), HEAT_MIN_RADIUS_PX);
+      const blur = Math.max(metresToPixels(HEAT_BLUR_M, zoom, lat), HEAT_MIN_BLUR_PX);
+      // Leaflet.heat also silently scales every point's weight by
+      // 1 / 2^(options.maxZoom - currentZoom) — a "keep the same total
+      // heat energy visible regardless of zoom" trick meant for raw
+      // point-density heatmaps. Our weights are already a meaningful
+      // per-point severity/speed/density value, not a raw count, so that
+      // extra scaling just makes colours drift as you zoom (the exact
+      // "fidelity isn't preserved when zoomed out" symptom) rather than
+      // showing the same data consistently. Pinning maxZoom to the
+      // CURRENT zoom on every change forces that scale factor to
+      // 2^0 = 1 at all times, so intensity/colour no longer depends on
+      // zoom level at all — only radius/blur (real ground distance) does,
+      // which is the only zoom-dependence we actually want.
+      heatLayer.setOptions({ radius, blur, maxZoom: zoom });
+      histHeatLayer.setOptions({ radius, blur, maxZoom: zoom });
+    }
+    map.on('zoomend', updateHeatRadii);
+    updateHeatRadii();
+
+    const LIVE_LAYER_NAME = 'Heatmap (live)';
+    const HIST_LAYER_NAME = 'Heatmap (historical)';
+    const layersControl = L.control.layers(null, {
+      'Bus markers': markersLayer,
+      [LIVE_LAYER_NAME]: heatLayer,
+      [HIST_LAYER_NAME]: histHeatLayer
+    }, { collapsed:false }).addTo(map);
+
+    function gradientCss(gradient) {
+      const stops = Object.keys(gradient).sort((a, b) => a - b)
+        .map(k => `${gradient[k]} ${Math.round(k * 100)}%`);
+      return `linear-gradient(to right, ${stops.join(', ')})`;
+    }
+    function makeHeatLegend(id) {
+      const div = document.createElement('div');
+      div.className = 'heat-legend';
+      div.id = id;
+      div.hidden = true;
+      div.innerHTML = `<div class="heat-legend-title"></div>
+        <div class="heat-legend-bar"></div>
+        <div class="heat-legend-ticks"><span></span><span></span></div>`;
+      layersControl.getContainer().appendChild(div);
+      return div;
+    }
+    const liveLegend = makeHeatLegend('liveHeatLegend');
+    const histLegend = makeHeatLegend('histHeatLegend');
+    map.on('overlayadd', e => {
+      if (e.name === LIVE_LAYER_NAME) liveLegend.hidden = false;
+      if (e.name === HIST_LAYER_NAME) histLegend.hidden = false;
+    });
+    map.on('overlayremove', e => {
+      if (e.name === LIVE_LAYER_NAME) liveLegend.hidden = true;
+      if (e.name === HIST_LAYER_NAME) histLegend.hidden = true;
+    });
+
+    function fillLegend(div, gradient, title, ticks) {
+      div.querySelector('.heat-legend-title').textContent = title;
+      div.querySelector('.heat-legend-bar').style.background = gradientCss(gradient);
+      const [t0, t1] = div.querySelectorAll('.heat-legend-ticks span');
+      t0.textContent = ticks[0];
+      t1.textContent = ticks[1];
+    }
+
+    const metricPickerDiv = document.createElement('div');
+    metricPickerDiv.id = 'heatMetricPicker';
+    metricPickerDiv.innerHTML = `Heatmap metric: <select id="heatMetricSelect">
+        <option value="delay" selected>Delay</option>
+        <option value="density">Density</option>
+        <option value="speed">Speed</option>
+      </select>`;
+    layersControl.getContainer().appendChild(metricPickerDiv);
+    L.DomEvent.disableClickPropagation(metricPickerDiv);
+
+    const pickerDiv = document.createElement('div');
+    pickerDiv.id = 'histWindowPicker';
+    pickerDiv.innerHTML = `Historical window: <select id="histWindowSelect"><option value="1">Last hour</option><option value="24" selected>Last 24 hours</option><option value="168">Last 7 days</option></select>`;
+    layersControl.getContainer().appendChild(pickerDiv);
+    const statusDiv = document.createElement('div');
+    statusDiv.id = 'histWindowStatus';
+    layersControl.getContainer().appendChild(statusDiv);
+    L.DomEvent.disableClickPropagation(pickerDiv);
+
+    // Historical fetches can be slow (up to HEATMAP_DEADLINE_SEC on a cold
+    // per-window cache — see server docstring) and switching metric or
+    // window quickly fires overlapping requests. The old guard only
+    // compared the response's metric against currentMetric, so a stale
+    // response from a superseded WINDOW change (metric unchanged) could
+    // still land and silently overwrite newer data — one of the "switching
+    // sometimes doesn't seem to do anything" reports. histRequestSeq
+    // tracks the single most recent request regardless of what changed;
+    // any response that isn't for the latest request is dropped outright.
+    let histRequestSeq = 0;
+    const heatLoadingBanner = document.createElement('div');
+    heatLoadingBanner.id = 'heatLoadingBanner';
+    heatLoadingBanner.hidden = true;
+    document.getElementById('dashmap').appendChild(heatLoadingBanner);
+
+    async function loadHistoricalHeatmap() {
+      const seq = ++histRequestSeq;
+      const wh = document.getElementById('histWindowSelect').value;
+      const metricAtRequest = currentMetric;
+      statusDiv.textContent = 'Loading…';
+      statusDiv.style.color = '#666';
+      // Visible on the map itself (not just the collapsed layer control)
+      // so a slow cold-cache fetch reads as "still working" rather than
+      // "did switching this do anything?".
+      heatLoadingBanner.textContent = `Updating ${METRICS[metricAtRequest].label.toLowerCase()} heatmap…`;
+      heatLoadingBanner.hidden = false;
+      try {
+        const res = await fetch(`/api/heatmap?window=${wh}&metric=${metricAtRequest}`);
+        const text = await res.text();
+        if (seq !== histRequestSeq) return; // superseded by a newer window/metric change
+        let data;
+        try { data = JSON.parse(text); }
+        catch (e) { statusDiv.textContent = `Bad response (HTTP ${res.status})`; statusDiv.style.color = '#b3261e'; return; }
+        const points = data.points || [];
+        histHeatLayer.setLatLngs(points);
+        if (data.error) { statusDiv.textContent = data.error; statusDiv.style.color = '#b3261e'; }
+        else if (points.length === 0) { statusDiv.textContent = 'No historical points in this window yet'; statusDiv.style.color = '#b3261e'; }
+        else { statusDiv.textContent = points.length + ' historical cells loaded'; statusDiv.style.color = '#666'; }
+      } catch (e) {
+        if (seq !== histRequestSeq) return;
+        statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e';
+      } finally {
+        if (seq === histRequestSeq) heatLoadingBanner.hidden = true;
+      }
+    }
+    document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
+
+    // Per-vehicle live heat weight for the current metric. Returns null to
+    // exclude a vehicle from the live layer entirely (no data for that
+    // metric), vs 0 which is a real "no heat contribution" reading.
+    function liveWeightFor(v, metric) {
+      if (metric === 'density') {
+        // Every reporting vehicle counts equally — overlapping pings are
+        // what create hot spots, via the heat layer's own additive
+        // rendering. Deliberately the simplest metric (see server docstring).
+        return 1;
+      }
+      if (metric === 'speed') {
+        if (v.speed == null) return null;
+        const kmh = v.speed * 3.6;
+        if (kmh < 0) return null;
+        return Math.min(kmh / SPEED_CAP_KMH, 1);
+      }
+      // delay (default): weight by this vehicle's own lateness, not by
+      // 1-per-vehicle — otherwise the heat layer just draws the route
+      // network (wherever buses happen to be) rather than where they're
+      // currently running late. Vehicles with no delay reading or a
+      // flagged anomaly don't contribute a heat point (still shown as a
+      // marker), since we can't say whether they're a bottleneck or not.
+      if (v.delay_min == null || v.anomaly) return null;
+      return Math.min(Math.max(v.delay_min, 0) / SEVERITY_CAP_MIN, 1);
+    }
+
+    function updateLiveHeatFromVehicles(vehicles) {
+      const heatPoints = [];
+      vehicles.forEach(v => {
+        if (v.lat == null || v.lon == null) return;
+        const w = liveWeightFor(v, currentMetric);
+        if (w !== null) heatPoints.push([v.lat, v.lon, w]);
+      });
+      heatLayer.setLatLngs(heatPoints);
+    }
+
+    function applyMetric(metric) {
+      currentMetric = metric;
+      const cfg = METRICS[metric];
+      heatLayer.setOptions({ gradient: cfg.liveGradient });
+      histHeatLayer.setOptions({ gradient: cfg.histGradient });
+      // setOptions() is documented to trigger Leaflet.heat's own redraw,
+      // but the explicit redraw() calls here are cheap insurance against
+      // a canvas that doesn't repaint until the next unrelated map event —
+      // exactly what would look like "the dropdown changed but the map
+      // didn't" even though the new gradient/data was already applied.
+      heatLayer.redraw();
+      histHeatLayer.redraw();
+      fillLegend(liveLegend, cfg.liveGradient, cfg.liveTitle, cfg.ticks);
+      fillLegend(histLegend, cfg.histGradient, cfg.histTitle, cfg.ticks);
+      updateLiveHeatFromVehicles(lastVehicles);
+      loadHistoricalHeatmap();
+    }
+    document.getElementById('heatMetricSelect').addEventListener('change', e => applyMetric(e.target.value));
+
+    applyMetric(DEFAULT_METRIC);
+
+    function makeIcon(routeLabel, bearing, outlineColor) {
+      const rot = (bearing != null ? bearing : 0) - 90;
+      return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
+        html:`<div class="bus-marker"><div class="bus-pill" style="border-color:${outlineColor};"><div class="bus-arrow" style="transform:rotate(${rot}deg);">&#10148;</div><span>${routeLabel}</span></div></div>` });
+    }
+    function tooltipContent(v) {
+      const rl = v.route_num || v.route_id || '?';
+      return v.headsign ? `${rl} to ${v.headsign}` : `Route ${rl}`;
+    }
+    function popupContent(v) {
+      const dt = (v.delay_min != null) ? (v.anomaly ? `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min (flagged)` : `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min`) : 'No current delay data';
+      const sk = (v.speed != null) ? Math.round(v.speed * 3.6) + ' km/h' : 'Speed unavailable';
+      const rl = v.headsign ? `Route ${v.route_num || v.route_id || '?'} to ${v.headsign}` : `Route ${v.route_num || v.route_id || '?'}`;
+      return `<strong>${rl}</strong><br>${v.route_operator || 'Unknown operator'}<br>Trip ${v.trip_id ?? '?'}<br>${dt}<br>${sk}`;
+    }
+    function renderVehicles(vehicles) {
+      lastVehicles = vehicles;
+      const seen = new Set();
+      vehicles.forEach(v => {
+        if (v.lat == null || v.lon == null) return;
+        const key = v.vehicle_id || v.trip_id;
+        seen.add(key);
+        const rl = v.route_num || v.route_id || '?';
+        const icon = makeIcon(rl, v.bearing, v.outline_color || '#888');
+        const popup = popupContent(v);
+        const tooltip = tooltipContent(v);
+        if (markers.has(key)) {
+          const m = markers.get(key);
+          m.setLatLng([v.lat, v.lon]); m.setIcon(icon);
+          m.getPopup().setContent(popup); m.getTooltip().setContent(tooltip);
+        } else {
+          const m = L.marker([v.lat, v.lon], { icon }).addTo(markersLayer)
+            .bindPopup(popup, { className:'glass-popup' })
+            .bindTooltip(tooltip, { direction:'top', offset:[0,-20], className:'glass-tooltip' });
+          markers.set(key, m);
+        }
+      });
+      for (const [key, m] of markers) { if (!seen.has(key)) { markersLayer.removeLayer(m); markers.delete(key); } }
+      updateLiveHeatFromVehicles(vehicles);
+    }
+    async function pollVehicles() {
+      try { const res = await fetch('/api/vehicles' + window.location.search); const data = await res.json(); renderVehicles(data.vehicles || []); }
+      catch (e) { console.warn('Vehicle poll failed', e); }
+    }
+    renderVehicles({{ vehicles_json|safe }});
+    setInterval(pollVehicles, 15000);
+    setInterval(loadHistoricalHeatmap, 300000);
   </script>
 </body>
 </html>
@@ -1419,12 +1718,17 @@ PROJECT_PAGE = """
 
 @app.route("/project")
 def project():
+    if not API_KEY:
+        return "TFNSW_API_KEY not set in .env", 500
+    data = compute_delay_data(request.args)
+    vehicles, map_error = compute_vehicles(data)
     ne_lat, ne_lng = SMART_CITY_CORNER_NE
     sw_lat, sw_lng = SMART_CITY_CORNER_SW
     return render_template_string(
         PROJECT_PAGE,
+        vehicles=vehicles, vehicles_json=json.dumps(vehicles),
+        color_fill=COLOR_FILL,
         ne_lat=ne_lat, ne_lng=ne_lng, sw_lat=sw_lat, sw_lng=sw_lng,
-        model_aspect=round(SMART_CITY_MODEL_WIDTH_MM / SMART_CITY_MODEL_HEIGHT_MM, 6),
     )
 
 
