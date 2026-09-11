@@ -1452,6 +1452,15 @@ PROJECT_PAGE = """
       // only things on this page a viewer can ever interact with.
       zoomControl: false, dragging: false, touchZoom: false, doubleClickZoom: false,
       scrollWheelZoom: false, boxZoom: false, keyboard: false, tap: false,
+      // Leaflet only zooms in whole-number steps by default, so fitBounds()
+      // below would round DOWN to the nearest whole zoom that still fully
+      // contains PROJECT_BOUNDS — leaving a big chunk of the container
+      // unused (masked solid black) even when the browser/projector aspect
+      // ratio matches the physical box closely. Fractional zoom lets it
+      // lock to the exact zoom that fills the container, so the only
+      // black margin left is genuine letterboxing from an aspect mismatch.
+      zoomSnap: 0,
+      zoomDelta: 0,
     });
     const PROJECT_BOUNDS = L.latLngBounds([{{ sw_lat }}, {{ sw_lng }}], [{{ ne_lat }}, {{ ne_lng }}]);
     map.fitBounds(PROJECT_BOUNDS);
