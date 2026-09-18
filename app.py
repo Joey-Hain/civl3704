@@ -52,19 +52,14 @@ with a 20-second deadline, aggregating into rounded lat/lon grid cells
 size and memory regardless of how many readings a window covers. The
 frontend auto-loads it on page view and every 5 minutes after.
 
-/api/heatmap takes a &metric= of "delay" (default), "density", or "speed",
-and a &period= of "all" (default), "am_peak", "midday", "pm_peak", or
-"evening" — see TIME_PERIODS. Fetching and aggregating a window's CSVs
-into grid cells is the expensive part (network + parse), and is identical
-regardless of which metric OR period the caller wants — each CSV row's
-timestamp determines its period once, during that same aggregation pass,
-so cells end up bucketed by period (and duplicated into an "all" bucket)
-at no extra fetch cost. That work is still cached per window_hours only
-(get_historical_cells_cached), independent of both metric and period.
-Turning cached cells into a metric's weighted points (compute_metric_points)
-is cheap pure arithmetic done fresh on every request, so switching the
-metric or period dropdown client-side never triggers a re-fetch — it just
-picks a different already-cached bucket of cells.
+/api/heatmap takes a &metric= of "delay" (default), "density", or "speed".
+Fetching and aggregating a window's CSVs into grid cells is the expensive
+part (network + parse), and is identical regardless of which metric the
+caller wants — so that work is cached per window_hours only
+(get_historical_cells_cached), independent of metric. Turning cached cells
+into a metric's weighted points (compute_metric_points) is cheap pure
+arithmetic done fresh on every request, so switching the metric dropdown
+client-side never triggers a re-fetch.
 
 Per-metric weighting:
   - delay: mean lateness (seconds late, floored at 0 so early running never
@@ -141,14 +136,16 @@ DATA_DIR = Path("CIVL3704")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = DATA_DIR / "delay_log.csv"
 ANOMALY_ABS_SEC = 3600
-ON_TIME_EARLY_SEC = -60
-ON_TIME_LATE_SEC = 300
+# "On time" window: 0 (not early at all) through 5:59 late, inclusive.
+# A bus at exactly 6:00 late falls outside it, hence 359 rather than 360.
+ON_TIME_EARLY_SEC = 0
+ON_TIME_LATE_SEC = 359
 
 GRID_DECIMALS = 4
 HEATMAP_FETCH_CONCURRENCY = 1
 HEATMAP_DEADLINE_SEC = 20
 # Mean lateness (seconds) at which the heat gradient saturates. Chosen
-# well above ON_TIME_LATE_SEC (300s) so the ramp has room to distinguish
+# well above ON_TIME_LATE_SEC (359s) so the ramp has room to distinguish
 # "mildly late" from "genuinely stuck" before it maxes out.
 HEATMAP_SEVERITY_CAP_SEC = 600
 # A cell needs this many delay- or speed-bearing readings to be shown at
@@ -160,48 +157,7 @@ HEATMAP_CONFIDENT_SAMPLES = 3
 # (clearways, motorway sections) stand out rather than the whole map
 # reading as "hot".
 HEATMAP_SPEED_CAP_KMH = 60.0
-VALID_HEATMAP_METRICS = ("delay", "density", "speed", "frequency")
-
-# Time-of-day buckets for the historical heatmap. Averaged over a full
-# "Last 24 hours" window, a corridor that's terrible for one hour at 5pm
-# but fine the rest of the day reads as merely lukewarm — the bad hour
-# gets diluted by the many fine ones. Splitting the window into buckets
-# and letting the query isolate just one lets that kind of pattern show up
-# distinctly instead of averaging out. Boundaries are Sydney local time
-# (parse_ts already normalises every timestamp to SYDNEY_TZ) and
-# deliberately coarse — four buckets, not hourly — so each bucket still
-# collects enough readings to clear HEATMAP_CONFIDENT_SAMPLES rather than
-# fragmenting into mostly-empty slices. "evening" wraps past midnight.
-TIME_PERIODS = {
-    "am_peak": (6, 10),   # 6:00-10:00
-    "midday": (10, 15),   # 10:00-15:00
-    "pm_peak": (15, 19),  # 15:00-19:00
-    "evening": (19, 6),   # 19:00-6:00, wraps past midnight
-}
-# "all" is the un-bucketed whole-window view — the original behaviour,
-# and still the default.
-VALID_HEATMAP_PERIODS = ("all",) + tuple(TIME_PERIODS.keys())
-_PERIOD_LABELS = {
-    "all": "all-day",
-    "am_peak": "AM peak (6-10am)",
-    "midday": "midday (10am-3pm)",
-    "pm_peak": "PM peak (3-7pm)",
-    "evening": "evening (7pm-6am)",
-}
-
-
-def time_of_day_bucket(ts):
-    """Which TIME_PERIODS bucket a Sydney-local timestamp's hour falls
-    into. `evening` wraps past midnight (19:00-23:59 and 0:00-5:59)."""
-    hour = ts.hour
-    for name, (start, end) in TIME_PERIODS.items():
-        if start < end:
-            if start <= hour < end:
-                return name
-        else:  # wraps past midnight
-            if hour >= start or hour < end:
-                return name
-    return "evening"  # unreachable given the ranges above; safe fallback
+VALID_HEATMAP_METRICS = ("delay", "density", "speed")
 
 PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
@@ -640,38 +596,11 @@ def get_vehicles_cached(agency_names, trip_headsigns):
         return [dict(v) for v in vehicles]
 
 
-def _add_reading(c, lat, lon, delay_sec, speed_kmh):
-    """Fold one CSV row's values into a single cell accumulator `c`
-    ([lat_sum, lon_sum, n_total, late_sum_sec, n_delay, speed_sum_kmh,
-    n_speed, n_late_freq]). Shared by every period bucket a reading lands
-    in (see _fetch_one_day_into) so "all" and its matching time-of-day
-    bucket always agree on how a reading is counted."""
-    c[0] += lat
-    c[1] += lon
-    c[2] += 1
-    if delay_sec is not None:
-        c[3] += max(delay_sec, 0.0)
-        c[4] += 1
-        # index 7: how many of this cell's delay readings were genuinely
-        # late (not just "mean lateness" — see compute_metric_points'
-        # "frequency" branch).
-        if delay_sec > ON_TIME_LATE_SEC:
-            c[7] += 1
-    if speed_kmh is not None and speed_kmh >= 0:
-        c[5] += speed_kmh
-        c[6] += 1
-
-
-def _fetch_one_day_into(date_str, cutoff, local_cells_by_period):
-    """Aggregate one day's CSV into local_cells_by_period, a dict keyed by
-    VALID_HEATMAP_PERIODS ("all" plus each TIME_PERIODS bucket), each value
-    a dict-of-cells keyed by rounded (lat, lon). Every row is folded into
-    BOTH its "all" cell and its time-of-day-bucket cell (via
-    time_of_day_bucket(ts)) — one pass, no extra fetching, so bucketing by
-    period costs nothing beyond the arithmetic itself.
+def _fetch_one_day_into(date_str, cutoff, local_cells):
+    """Aggregate one day's CSV into local_cells, keyed by rounded (lat, lon).
 
     Each cell accumulates [lat_sum, lon_sum, n_total, late_sum_sec, n_delay,
-    speed_sum_kmh, n_speed, n_late_freq]:
+    speed_sum_kmh, n_speed]:
       - lat_sum/lon_sum/n_total: for the cell's plotted position (its mean
         vehicle location) and its ping count, independent of whether delay
         or speed data was present. n_total alone is what the density metric
@@ -725,23 +654,26 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period):
                 except ValueError:
                     continue
                 key = (round(lat, GRID_DECIMALS), round(lon, GRID_DECIMALS))
-
-                delay_sec = None
+                c = local_cells[key]
+                c[0] += lat
+                c[1] += lon
+                c[2] += 1
                 if delay_idx is not None and len(row) > delay_idx and row[delay_idx].strip():
                     try:
                         delay_sec = float(row[delay_idx])
                     except ValueError:
                         delay_sec = None
-                speed_kmh = None
+                    if delay_sec is not None:
+                        c[3] += max(delay_sec, 0.0)
+                        c[4] += 1
                 if speed_idx is not None and len(row) > speed_idx and row[speed_idx].strip():
                     try:
                         speed_kmh = float(row[speed_idx])
                     except ValueError:
                         speed_kmh = None
-
-                period = time_of_day_bucket(ts)
-                _add_reading(local_cells_by_period["all"][key], lat, lon, delay_sec, speed_kmh)
-                _add_reading(local_cells_by_period[period][key], lat, lon, delay_sec, speed_kmh)
+                    if speed_kmh is not None and speed_kmh >= 0:
+                        c[5] += speed_kmh
+                        c[6] += 1
                 points_added += 1
             return date_str, rows_seen, points_added, None
     except requests.RequestException as e:
@@ -763,13 +695,7 @@ def fetch_historical_cells(window_hours):
         d += timedelta(days=1)
 
     workers = max(1, min(HEATMAP_FETCH_CONCURRENCY, len(dates_needed)))
-    # Each worker gets its own full set of period buckets (not just one
-    # "all" dict) so _fetch_one_day_into can fold every row into both its
-    # "all" cell and its time-of-day cell without workers colliding.
-    local_dicts = [
-        {p: defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0]) for p in VALID_HEATMAP_PERIODS}
-        for _ in range(workers)
-    ]
+    local_dicts = [defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0]) for _ in range(workers)]
 
     files_fetched = 0
     rows_seen_total = 0
@@ -796,38 +722,27 @@ def fetch_historical_cells(window_hours):
             rows_seen_total += rows_seen
             points_added_total += points_added
 
-    # cells_by_period["all"] is exactly what `cells` used to be pre-bucketing
-    # (every reading, regardless of time of day); the other keys are the
-    # same readings split by time_of_day_bucket(). A reading therefore
-    # appears in exactly two of these dicts' cells: "all" and its one
-    # matching period.
-    cells_by_period = {p: defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0]) for p in VALID_HEATMAP_PERIODS}
+    cells = defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0])
     for ld in local_dicts:
-        for period, pcells in ld.items():
-            target = cells_by_period[period]
-            for key, c in pcells.items():
-                tgt = target[key]
-                tgt[0] += c[0]
-                tgt[1] += c[1]
-                tgt[2] += c[2]
-                tgt[3] += c[3]
-                tgt[4] += c[4]
-                tgt[5] += c[5]
-                tgt[6] += c[6]
-                tgt[7] += c[7]
+        for key, c in ld.items():
+            tgt = cells[key]
+            tgt[0] += c[0]
+            tgt[1] += c[1]
+            tgt[2] += c[2]
+            tgt[3] += c[3]
+            tgt[4] += c[4]
+            tgt[5] += c[5]
+            tgt[6] += c[6]
 
-    cells = cells_by_period["all"]
     cells_with_delay = sum(1 for c in cells.values() if c[4] > 0)
     cells_with_speed = sum(1 for c in cells.values() if c[6] > 0)
-    period_counts = ", ".join(f"{p}={len(cells_by_period[p])}" for p in TIME_PERIODS)
     print(f"[heatmap] window={window_hours}h files={files_fetched} "
           f"rows={rows_seen_total} points={points_added_total} cells={len(cells)} "
           f"cells_with_delay={cells_with_delay} cells_with_speed={cells_with_speed} "
-          f"by_period=({period_counts}) "
           f"elapsed={time.monotonic() - start:.1f}s deadline_hit={deadline_hit}", flush=True)
 
     return {
-        "cells": cells_by_period,
+        "cells": cells,
         "files_fetched": files_fetched,
         "rows_seen_total": rows_seen_total,
         "last_error": last_error,
@@ -866,24 +781,6 @@ def compute_metric_points(cells, metric):
             points.append([c[0] / c[2], c[1] / c[2], norm * confidence])
         return points
 
-    if metric == "frequency":
-        # % of this cell's delay-bearing readings that were genuinely LATE
-        # (delay_sec > ON_TIME_LATE_SEC) — NOT mean lateness like "delay".
-        # A corridor where buses are often mildly late (frequent, low
-        # severity) stays cool on the delay metric but should register
-        # here; a corridor with one extremely late outlier among many
-        # on-time readings should NOT dominate here the way it can on the
-        # delay metric. Scaled by the same confidence factor as delay/speed
-        # so a cell backed by only one or two readings fades toward cool.
-        points = []
-        for c in cells.values():
-            if c[4] <= 0:
-                continue
-            rate = c[7] / c[4]
-            confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-            points.append([c[0] / c[2], c[1] / c[2], rate * confidence])
-        return points
-
     # metric == "delay" (default/fallback): mean lateness (seconds late,
     # floored at 0), normalised against HEATMAP_SEVERITY_CAP_SEC — NOT ping
     # density. A cell with plenty of on-time traffic should stay cool; a
@@ -902,7 +799,7 @@ def compute_metric_points(cells, metric):
     return points
 
 
-_METRIC_LABELS = {"delay": "delay", "density": "vehicle", "speed": "speed", "frequency": "frequency"}
+_METRIC_LABELS = {"delay": "delay", "density": "vehicle", "speed": "speed"}
 
 
 def get_historical_cells_cached(window_hours):
@@ -923,25 +820,17 @@ def get_historical_cells_cached(window_hours):
         return meta
 
 
-def get_heatmap_points_cached(window_hours, metric, period="all"):
+def get_heatmap_points_cached(window_hours, metric):
     if metric not in VALID_HEATMAP_METRICS:
         metric = "delay"
-    if period not in VALID_HEATMAP_PERIODS:
-        period = "all"
 
-    # get_historical_cells_cached always fetches/aggregates the whole
-    # window (bucketed by period during that single pass — see the module
-    # docstring); picking a period here is just a dict lookup into cells
-    # already sitting in the window cache, never a fresh fetch.
     meta = get_historical_cells_cached(window_hours)
-    cells = meta["cells"].get(period) or {}
+    cells = meta["cells"]
 
     if not cells:
         if meta["files_fetched"] == 0:
             return [], meta["last_error"] or "No data files found for this window"
-        if period == "all":
-            return [], f"Fetched {meta['files_fetched']} file(s) but no rows fell inside the window"
-        return [], f"No readings in the {_PERIOD_LABELS.get(period, period)} window for this period"
+        return [], f"Fetched {meta['files_fetched']} file(s) but no rows fell inside the window"
 
     points = compute_metric_points(cells, metric)
 
@@ -1020,7 +909,14 @@ def compute_vehicles(data):
 # layer rebuild-on-metric-switch logic, bus markers, popups, polling — is
 # this exact text in both.
 HEATMAP_SCRIPT = """\
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+    // Plainer basemap than stock OSM tiles: CartoDB Positron is a light,
+    // low-contrast style (muted roads, no busy POI icons) so the heatmap
+    // and bus markers read as the main content rather than competing with
+    // a colourful street map underneath them.
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+      subdomains: 'abcd', maxZoom: 20,
+    }).addTo(map);
     const markers = new Map();
 
     // One metric dropdown drives both heat layers at once, rather than a
@@ -1065,18 +961,14 @@ HEATMAP_SCRIPT = """\
         histTitle: 'Historical window — mean speed',
         ticks: ['0 km/h', 'SPEED_CAP+ km/h'],
       },
-      frequency: {
-        label: 'Frequency',
-        liveGradient:  { 0.0:'#fdf3e3', 0.15:'#fadfb0', 0.35:'#f5c473', 0.55:'#eea53a', 0.7:'#d6841a', 0.85:'#a8630f', 1.0:'#6e3f08' }, // amber
-        histGradient:  { 0.0:'#e6f0f5', 0.15:'#c3ddea', 0.35:'#95c2da', 0.55:'#66a1c4', 0.7:'#3d7fa9', 0.85:'#245e83', 1.0:'#123c56' }, // teal-blue
-        liveTitle: 'Live snapshot — currently running late',
-        histTitle: 'Historical window — % of readings late',
-        ticks: ['0% late', '100% late'],
-      },
     };
     const DEFAULT_METRIC = 'delay';
     let currentMetric = DEFAULT_METRIC;
     let lastVehicles = [];
+    // 'pill' = the original route-labelled marker; 'arrow' = just the
+    // outline-coloured, bearing-rotated arrowhead with no label/background,
+    // for a less cluttered view when many buses are on screen at once.
+    let markerStyle = 'pill';
 
     // Keep these two in sync with their server-side counterparts
     // (HEATMAP_SEVERITY_CAP_SEC, HEATMAP_SPEED_CAP_KMH) so the live and
@@ -1230,39 +1122,31 @@ HEATMAP_SCRIPT = """\
         <option value="delay" selected>Delay</option>
         <option value="density">Density</option>
         <option value="speed">Speed</option>
-        <option value="frequency">Frequency</option>
       </select>`;
     layersControl.getContainer().appendChild(metricPickerDiv);
     L.DomEvent.disableClickPropagation(metricPickerDiv);
+
+    const markerStylePickerDiv = document.createElement('div');
+    markerStylePickerDiv.id = 'markerStylePicker';
+    markerStylePickerDiv.innerHTML = `Marker style: <select id="markerStyleSelect">
+        <option value="pill" selected>Full pill</option>
+        <option value="arrow">Delta arrow</option>
+      </select>`;
+    layersControl.getContainer().appendChild(markerStylePickerDiv);
+    L.DomEvent.disableClickPropagation(markerStylePickerDiv);
+    document.getElementById('markerStyleSelect').addEventListener('change', e => {
+      markerStyle = e.target.value;
+      renderVehicles(lastVehicles);
+    });
 
     const pickerDiv = document.createElement('div');
     pickerDiv.id = 'histWindowPicker';
     pickerDiv.innerHTML = `Historical window: <select id="histWindowSelect"><option value="1">Last hour</option><option value="24" selected>Last 24 hours</option><option value="168">Last 7 days</option></select>`;
     layersControl.getContainer().appendChild(pickerDiv);
-    L.DomEvent.disableClickPropagation(pickerDiv);
-
-    // Time-of-day bucket for the historical layer — a dict lookup into
-    // cells the window fetch already aggregated (see server docstring),
-    // so switching this never triggers a new CSV fetch, same as the
-    // metric dropdown.
-    const PERIODS = [
-      ['all', 'All day'],
-      ['am_peak', 'AM peak (6\u201310am)'],
-      ['midday', 'Midday (10am\u20133pm)'],
-      ['pm_peak', 'PM peak (3\u20137pm)'],
-      ['evening', 'Evening (7pm\u20136am)'],
-    ];
-    const periodPickerDiv = document.createElement('div');
-    periodPickerDiv.id = 'histPeriodPicker';
-    periodPickerDiv.innerHTML = 'Time of day: <select id="histPeriodSelect">' +
-      PERIODS.map(([v, label]) => `<option value="${v}"${v === 'all' ? ' selected' : ''}>${label}</option>`).join('') +
-      '</select>';
-    layersControl.getContainer().appendChild(periodPickerDiv);
-    L.DomEvent.disableClickPropagation(periodPickerDiv);
-
     const statusDiv = document.createElement('div');
     statusDiv.id = 'histWindowStatus';
     layersControl.getContainer().appendChild(statusDiv);
+    L.DomEvent.disableClickPropagation(pickerDiv);
 
     // Historical fetches can be slow (up to HEATMAP_DEADLINE_SEC on a cold
     // per-window cache — see server docstring) and switching metric or
@@ -1282,7 +1166,6 @@ HEATMAP_SCRIPT = """\
     async function loadHistoricalHeatmap() {
       const seq = ++histRequestSeq;
       const wh = document.getElementById('histWindowSelect').value;
-      const period = document.getElementById('histPeriodSelect').value;
       const metricAtRequest = currentMetric;
       statusDiv.textContent = 'Loading…';
       statusDiv.style.color = '#666';
@@ -1292,7 +1175,7 @@ HEATMAP_SCRIPT = """\
       heatLoadingBanner.textContent = `Updating ${METRICS[metricAtRequest].label.toLowerCase()} heatmap…`;
       heatLoadingBanner.hidden = false;
       try {
-        const res = await fetch(`/api/heatmap?window=${wh}&metric=${metricAtRequest}&period=${period}`);
+        const res = await fetch(`/api/heatmap?window=${wh}&metric=${metricAtRequest}`);
         const text = await res.text();
         if (seq !== histRequestSeq) return; // superseded by a newer window/metric change
         let data;
@@ -1312,7 +1195,6 @@ HEATMAP_SCRIPT = """\
       }
     }
     document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
-    document.getElementById('histPeriodSelect').addEventListener('change', loadHistoricalHeatmap);
 
     // Per-vehicle live heat weight for the current metric. Returns null to
     // exclude a vehicle from the live layer entirely (no data for that
@@ -1329,15 +1211,6 @@ HEATMAP_SCRIPT = """\
         const kmh = v.speed * 3.6;
         if (kmh < 0) return null;
         return Math.min(kmh / SPEED_CAP_KMH, 1);
-      }
-      if (metric === 'frequency') {
-        // Live version is necessarily instantaneous (one poll = one
-        // reading per vehicle, not a rolling rate), so this is simply
-        // "is this specific bus late right now" — 1 for late, 0 for
-        // on-time/early. Vehicles with no delay reading or a flagged
-        // anomaly contribute no heat point, same reasoning as delay.
-        if (v.delay_min == null || v.anomaly) return null;
-        return v.on_time ? 0 : (v.delay_min > 0 ? 1 : 0);
       }
       // delay (default): weight by this vehicle's own lateness, not by
       // 1-per-vehicle — otherwise the heat layer just draws the route
@@ -1376,6 +1249,14 @@ HEATMAP_SCRIPT = """\
 
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
+      // 'arrow' style: same outline colour (on time / late / early / no
+      // data) and same bearing rotation as the pill's own arrow, just
+      // without the label/background chrome — for a lighter-weight view
+      // when the map is busy with vehicles.
+      if (markerStyle === 'arrow') {
+        return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
+          html:`<div class="bus-marker"><div class="bus-arrow-only"><span class="arrow-glyph" style="color:${outlineColor}; transform:rotate(${rot}deg);">&#10148;</span></div></div>` });
+      }
       return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
         html:`<div class="bus-marker"><div class="bus-pill" style="border-color:${outlineColor};"><div class="bus-arrow" style="transform:rotate(${rot}deg);">&#10148;</div><span>${routeLabel}</span></div></div>` });
     }
@@ -1455,6 +1336,7 @@ PAGE = """
   th { color:var(--muted); font-weight:normal; font-size:0.8rem; border-bottom:1px solid var(--line); }
   th a { color:inherit; text-decoration:underline; }
   th a:hover { color:var(--late); }
+  th.help { text-decoration:underline dotted; text-underline-offset:2px; cursor:help; }
   tr:hover { background:#eeece5; }
   td.late { color:var(--late); }
   td.early { color:var(--early); }
@@ -1467,6 +1349,8 @@ PAGE = """
   .bus-marker { position:relative; width:56px; height:24px; }
   .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
   .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
+  .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
+  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
@@ -1486,9 +1370,9 @@ PAGE = """
 <body>
   <h1>Delay Board <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/project">smart-city project &rarr;</a></h1>
   <div class="meta">
-    Pulled {{ pulled_at }} &middot; {{ n_total }} readings ({{ n_flagged }} flagged as anomalous, {{ 'hidden' if hide_anomalies else 'shown' }})
+    Pulled {{ pulled_at }}
     &middot; <a class="toggle" href="?hide_anomalies={{ 0 if hide_anomalies else 1 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">{{ 'show anomalies' if hide_anomalies else 'hide anomalies' }}</a>
-    <br>"On time" = 1 min early to 5 min late &middot; n = distinct non-anomalous buses reporting (latest stop each)
+    <br>"On time" = 0 to 5:59 min late &middot; n = distinct non-anomalous buses reporting (latest stop each)
     {% if agency_error %}<br><span style="color:#b3261e">Operator names unavailable: {{ agency_error }}</span>{% endif %}
   </div>
 
@@ -1518,7 +1402,7 @@ PAGE = """
 
   <h2>By operator</h2>
   <table>
-    <tr><th>Operator</th><th>n</th><th>avg delay</th><th>spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
+    <tr><th>Operator</th><th>n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
     {% for r in operators %}
     <tr><td>{{ r.operator }}</td><td>{{ r.n }}</td>
       <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
@@ -1530,7 +1414,7 @@ PAGE = """
 
   <h2>By route &mdash; worst variance first (sort: <a class="toggle" href="?sort=stdev_min&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">spread</a> / <a class="toggle" href="?sort=mean_min&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">avg delay</a> / <a class="toggle" href="?sort=on_time_pct&amp;asc=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">worst on-time %</a>)</h2>
   <table>
-    <tr><th>Route</th><th>Operator</th><th>n</th><th>avg delay</th><th>spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
+    <tr><th>Route</th><th>Operator</th><th>n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
     {% for r in routes[:60] %}
     <tr><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td>{{ r.n }}</td>
       <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
@@ -1578,6 +1462,8 @@ PROJECT_PAGE = """
   .bus-marker { position:relative; width:56px; height:24px; }
   .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
   .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
+  .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
+  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
@@ -1692,12 +1578,8 @@ def health():
 def status():
     heatmap_state = {}
     for wh, entry in _heatmap_cells_cache.items():
-        # entry["cells"] is now {period: cells_dict} — "all" is the
-        # headline count (matches what this endpoint reported before
-        # time-of-day bucketing existed); cells_by_period breaks it down.
         heatmap_state[str(wh)] = {
-            "cells": len(entry["cells"].get("all", {})),
-            "cells_by_period": {p: len(c) for p, c in entry["cells"].items()},
+            "cells": len(entry["cells"]),
             "files_fetched": entry["files_fetched"],
             "error": entry["last_error"],
             "age_seconds": (datetime.now(tz=SYDNEY_TZ) - entry["fetched_at"]).total_seconds(),
@@ -1784,13 +1666,10 @@ def api_heatmap():
         metric = request.args.get("metric", "delay")
         if metric not in VALID_HEATMAP_METRICS:
             metric = "delay"
-        period = request.args.get("period", "all")
-        if period not in VALID_HEATMAP_PERIODS:
-            period = "all"
-        points, error = get_heatmap_points_cached(window_hours, metric, period)
-        return jsonify({"points": points, "window_hours": window_hours, "metric": metric, "period": period, "error": error})
+        points, error = get_heatmap_points_cached(window_hours, metric)
+        return jsonify({"points": points, "window_hours": window_hours, "metric": metric, "error": error})
     except Exception as e:
-        return jsonify({"points": [], "window_hours": None, "metric": None, "period": None, "error": f"Server error: {e}"}), 200
+        return jsonify({"points": [], "window_hours": None, "metric": None, "error": f"Server error: {e}"}), 200
 
 
 if __name__ == "__main__":
