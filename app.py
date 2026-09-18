@@ -1257,18 +1257,22 @@ HEATMAP_SCRIPT = """\
 
     applyMetric(DEFAULT_METRIC);
 
+    // The on-time outline colour (OUTLINE_ON_TIME, server-side) is white —
+    // fine as a thin ring around a solid blue pill, but used as an entire
+    // glyph's fill on its own it vanishes against a light basemap. Late
+    // (red) and early (green) should still read as red/green on the arrow,
+    // same as the pill's border; only on-time swaps to the pill's own blue
+    // so it stays visible without losing the red/green severity meaning.
+    const ON_TIME_OUTLINE_HEX = '#ffffff';
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
       // 'arrow' style: same bearing rotation as the pill's own arrow, just
       // without the label/background chrome — for a lighter-weight view
-      // when the map is busy with vehicles. Coloured with the same solid
-      // blue as the pill's fill (var(--fill-blue)), NOT the on-time/late/
-      // early outline colour — on-time's outline is white, which vanished
-      // against a light basemap once there was no pill background behind
-      // it to sit on.
+      // when the map is busy with vehicles.
       if (markerStyle === 'arrow') {
+        const arrowColor = (outlineColor || '').toLowerCase() === ON_TIME_OUTLINE_HEX ? 'var(--fill-blue)' : outlineColor;
         return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
-          html:`<div class="bus-marker"><div class="bus-arrow-only"><span class="arrow-glyph" style="transform:rotate(${rot}deg);">&#10148;</span></div></div>` });
+          html:`<div class="bus-marker"><div class="bus-arrow-only"><span class="arrow-glyph" style="color:${arrowColor}; transform:rotate(${rot}deg);">&#10148;</span></div></div>` });
       }
       return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
         html:`<div class="bus-marker"><div class="bus-pill" style="border-color:${outlineColor};"><div class="bus-arrow" style="transform:rotate(${rot}deg);">&#10148;</div><span>${routeLabel}</span></div></div>` });
@@ -1363,7 +1367,7 @@ PAGE = """
   .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
   .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
   .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
-  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; color:var(--fill-blue); text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
+  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
@@ -1476,7 +1480,7 @@ PROJECT_PAGE = """
   .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
   .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
   .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
-  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; color:var(--fill-blue); text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
+  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
