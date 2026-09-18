@@ -909,13 +909,23 @@ def compute_vehicles(data):
 # layer rebuild-on-metric-switch logic, bus markers, popups, polling — is
 # this exact text in both.
 HEATMAP_SCRIPT = """\
-    // Plainer basemap than stock OSM tiles: CartoDB Positron is a light,
-    // low-contrast style (muted roads, no busy POI icons) so the heatmap
-    // and bus markers read as the main content rather than competing with
-    // a colourful street map underneath them.
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; OpenStreetMap contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-      subdomains: 'abcd', maxZoom: 20,
+    // Plainer basemap than stock OSM tiles. Was CartoDB Positron
+    // (basemaps.cartocdn.com) — CARTO started requiring an API key for
+    // that raster endpoint (see docs.carto.com/faqs/carto-basemaps), which
+    // would mean an extra secret to provision on Render for a uni project.
+    // Esri's "Light Gray Canvas" is the same idea (muted grey, no busy POI
+    // icons, heatmap/markers stay the visual focus) but needs no key and
+    // has no request quota — split into a Base layer (the grey fill) and a
+    // Reference layer on top (just roads/place labels, transparent
+    // elsewhere) per Esri's own pairing for this style. If a CARTO look is
+    // ever preferred instead, grab a free key at carto.com/basemaps/apikey
+    // (5M requests/month free) and add `?key=...` to a cartocdn.com URL.
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ',
+      maxZoom: 16,
+    }).addTo(map);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 16,
     }).addTo(map);
     const markers = new Map();
 
@@ -1249,13 +1259,16 @@ HEATMAP_SCRIPT = """\
 
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
-      // 'arrow' style: same outline colour (on time / late / early / no
-      // data) and same bearing rotation as the pill's own arrow, just
+      // 'arrow' style: same bearing rotation as the pill's own arrow, just
       // without the label/background chrome — for a lighter-weight view
-      // when the map is busy with vehicles.
+      // when the map is busy with vehicles. Coloured with the same solid
+      // blue as the pill's fill (var(--fill-blue)), NOT the on-time/late/
+      // early outline colour — on-time's outline is white, which vanished
+      // against a light basemap once there was no pill background behind
+      // it to sit on.
       if (markerStyle === 'arrow') {
         return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
-          html:`<div class="bus-marker"><div class="bus-arrow-only"><span class="arrow-glyph" style="color:${outlineColor}; transform:rotate(${rot}deg);">&#10148;</span></div></div>` });
+          html:`<div class="bus-marker"><div class="bus-arrow-only"><span class="arrow-glyph" style="transform:rotate(${rot}deg);">&#10148;</span></div></div>` });
       }
       return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
         html:`<div class="bus-marker"><div class="bus-pill" style="border-color:${outlineColor};"><div class="bus-arrow" style="transform:rotate(${rot}deg);">&#10148;</div><span>${routeLabel}</span></div></div>` });
@@ -1350,7 +1363,7 @@ PAGE = """
   .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
   .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
   .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
-  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
+  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; color:var(--fill-blue); text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
@@ -1463,7 +1476,7 @@ PROJECT_PAGE = """
   .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
   .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
   .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
-  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
+  .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; color:var(--fill-blue); text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
