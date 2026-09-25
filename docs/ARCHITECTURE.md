@@ -23,7 +23,7 @@ The app is organised into three main layers:
 - Joins vehicle positions with delays using `trip_id`.
 - Applies route, stop, operator, anomaly and geographic-bound filters.
 - Aggregates historical readings into geographic grid cells.
-- Calculates historical heatmap weights for delay, vehicle density and speed, including confidence weighting for mean-based metrics.
+- Calculates historical heatmap weights for mean delay, median delay, delay standard deviation, vehicle density and speed, including confidence weighting for delay and speed metrics.
 - Prepares vehicle data for both the dashboard and the `/api/vehicles` endpoint.
 
 ## 3. Visualisation layer
@@ -32,7 +32,7 @@ The app is organised into three main layers:
 - Jinja renders summary tables for operators, routes and individual trips.
 - Leaflet displays live vehicle markers on an interactive map.
 - Marker outlines show whether a vehicle is on time, late, early or has no delay data.
-- Leaflet.heat displays live and historical heatmaps for delay, vehicle density and speed.
+- Leaflet.heat displays live and historical heatmaps for mean delay, median delay, delay standard deviation, vehicle density and speed.
 - Historical heatmaps support one-hour, 24-hour and seven-day windows and refresh automatically every five minutes.
 - JavaScript polls vehicle data every 15 seconds without reloading the tables.
 - The `/project` view provides a non-interactive map locked to the smart-city physical model's geographic bounds.

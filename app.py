@@ -52,7 +52,8 @@ with a 20-second deadline, aggregating into rounded lat/lon grid cells
 size and memory regardless of how many readings a window covers. The
 frontend auto-loads it on page view and every 5 minutes after.
 
-/api/heatmap takes a &metric= of "delay" (default), "density", or "speed".
+/api/heatmap takes a &metric= of "delay_mean" (or legacy "delay"),
+"delay_median", "delay_std", "density", or "speed".
 Fetching and aggregating a window's CSVs into grid cells is the expensive
 part (network + parse), and is identical regardless of which metric the
 caller wants — so that work is cached per window_hours only
@@ -62,7 +63,7 @@ arithmetic done fresh on every request, so switching the metric dropdown
 client-side never triggers a re-fetch.
 
 Per-metric weighting:
-  - delay: mean lateness (seconds late, floored at 0 so early running never
+    - delay_mean: mean lateness (seconds late, floored at 0 so early running never
     cancels out a late reading elsewhere), not raw ping count — a busy
     interchange with mostly on-time buses should not outrank a quiet
     corridor where buses are consistently 15 minutes late. See
@@ -78,7 +79,7 @@ Per-metric weighting:
     three: it exists mainly to prove the heatmap rendering pipeline is
     correct independent of any weighting logic.
 
-delay and speed weight are both scaled by a confidence factor —
+Delay statistics and speed weight are scaled by a confidence factor —
 min(n_readings / HEATMAP_CONFIDENT_SAMPLES, 1) — so a cell backed by only
 one or two readings fades toward the cool end even if that one reading was
 extreme, rather than painting a full-strength hotspot off a single noisy
@@ -157,7 +158,7 @@ HEATMAP_CONFIDENT_SAMPLES = 3
 # (clearways, motorway sections) stand out rather than the whole map
 # reading as "hot".
 HEATMAP_SPEED_CAP_KMH = 60.0
-VALID_HEATMAP_METRICS = ("delay", "density", "speed")
+VALID_HEATMAP_METRICS = ("delay", "delay_mean", "delay_median", "delay_std", "density", "speed")
 
 PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
@@ -600,7 +601,7 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
     """Aggregate one day's CSV into local_cells, keyed by rounded (lat, lon).
 
     Each cell accumulates [lat_sum, lon_sum, n_total, late_sum_sec, n_delay,
-    speed_sum_kmh, n_speed]:
+    speed_sum_kmh, n_speed, delay_values]:
       - lat_sum/lon_sum/n_total: for the cell's plotted position (its mean
         vehicle location) and its ping count, independent of whether delay
         or speed data was present. n_total alone is what the density metric
@@ -664,8 +665,10 @@ def _fetch_one_day_into(date_str, cutoff, local_cells):
                     except ValueError:
                         delay_sec = None
                     if delay_sec is not None:
-                        c[3] += max(delay_sec, 0.0)
+                        delay_sec = max(delay_sec, 0.0)
+                        c[3] += delay_sec
                         c[4] += 1
+                        c[7].append(delay_sec)
                 if speed_idx is not None and len(row) > speed_idx and row[speed_idx].strip():
                     try:
                         speed_kmh = float(row[speed_idx])
@@ -695,7 +698,7 @@ def fetch_historical_cells(window_hours):
         d += timedelta(days=1)
 
     workers = max(1, min(HEATMAP_FETCH_CONCURRENCY, len(dates_needed)))
-    local_dicts = [defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0]) for _ in range(workers)]
+    local_dicts = [defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0, []]) for _ in range(workers)]
 
     files_fetched = 0
     rows_seen_total = 0
@@ -722,7 +725,7 @@ def fetch_historical_cells(window_hours):
             rows_seen_total += rows_seen
             points_added_total += points_added
 
-    cells = defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0])
+    cells = defaultdict(lambda: [0.0, 0.0, 0, 0.0, 0, 0.0, 0, []])
     for ld in local_dicts:
         for key, c in ld.items():
             tgt = cells[key]
@@ -733,6 +736,7 @@ def fetch_historical_cells(window_hours):
             tgt[4] += c[4]
             tgt[5] += c[5]
             tgt[6] += c[6]
+            tgt[7].extend(c[7])
 
     cells_with_delay = sum(1 for c in cells.values() if c[4] > 0)
     cells_with_speed = sum(1 for c in cells.values() if c[6] > 0)
@@ -781,7 +785,23 @@ def compute_metric_points(cells, metric):
             points.append([c[0] / c[2], c[1] / c[2], norm * confidence])
         return points
 
-    # metric == "delay" (default/fallback): mean lateness (seconds late,
+    # Delay metrics use lateness in seconds, floored at 0 so early running
+    # cannot cancel out late running in the same cell.
+    if metric in ("delay_median", "delay_std"):
+        points = []
+        for c in cells.values():
+            if c[4] <= 0:
+                continue
+            if metric == "delay_median":
+                delay_value = statistics.median(c[7])
+            else:
+                delay_value = statistics.stdev(c[7]) if c[4] > 1 else 0.0
+            severity = min(delay_value / HEATMAP_SEVERITY_CAP_SEC, 1.0)
+            confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
+            points.append([c[0] / c[2], c[1] / c[2], severity * confidence])
+        return points
+
+    # metric == "delay" or "delay_mean" (default/fallback): mean lateness (seconds late,
     # floored at 0), normalised against HEATMAP_SEVERITY_CAP_SEC — NOT ping
     # density. A cell with plenty of on-time traffic should stay cool; a
     # cell with few but consistently very-late readings should still
@@ -799,7 +819,10 @@ def compute_metric_points(cells, metric):
     return points
 
 
-_METRIC_LABELS = {"delay": "delay", "density": "vehicle", "speed": "speed"}
+_METRIC_LABELS = {
+    "delay": "delay", "delay_mean": "mean delay", "delay_median": "median delay",
+    "delay_std": "delay standard deviation", "density": "vehicle", "speed": "speed",
+}
 
 
 def get_historical_cells_cached(window_hours):
@@ -948,11 +971,11 @@ HEATMAP_SCRIPT = """\
     // blue/orange, green/magenta — each live/hist pair colourblind-safe).
     const METRICS = {
       delay: {
-        label: 'Delay',
+                label: 'Delay mean',
         liveGradient:  { 0.0:'#f7e9e9', 0.15:'#f0c9c8', 0.35:'#e69795', 0.55:'#dd6664', 0.7:'#cf3d3b', 0.85:'#b21f1d', 1.0:'#7a0f0e' }, // red
         histGradient:  { 0.0:'#eeecf5', 0.15:'#d6d0ea', 0.35:'#b3a7d9', 0.55:'#8f7ec7', 0.7:'#6c58ad', 0.85:'#4c3a8a', 1.0:'#2c2160' }, // violet
         liveTitle: 'Live snapshot — current lateness',
-        histTitle: 'Historical window — mean lateness',
+                histTitle: 'Historical window — mean lateness',
         ticks: ['0 min late', 'SEVERITY_CAP+ min late'],
       },
       density: {
@@ -972,6 +995,9 @@ HEATMAP_SCRIPT = """\
         ticks: ['0 km/h', 'SPEED_CAP+ km/h'],
       },
     };
+        METRICS.delay_mean = { ...METRICS.delay, label: 'Delay mean' };
+        METRICS.delay_median = { ...METRICS.delay, label: 'Delay median', histTitle: 'Historical window — median lateness' };
+        METRICS.delay_std = { ...METRICS.delay, label: 'Delay std deviation', histTitle: 'Historical window — delay standard deviation' };
     const DEFAULT_METRIC = 'delay';
     let currentMetric = DEFAULT_METRIC;
     let lastVehicles = [];
@@ -1129,7 +1155,9 @@ HEATMAP_SCRIPT = """\
     const metricPickerDiv = document.createElement('div');
     metricPickerDiv.id = 'heatMetricPicker';
     metricPickerDiv.innerHTML = `Heatmap metric: <select id="heatMetricSelect">
-        <option value="delay" selected>Delay</option>
+                <option value="delay" selected>Delay mean</option>
+                <option value="delay_median">Delay median</option>
+                <option value="delay_std">Delay std deviation</option>
         <option value="density">Density</option>
         <option value="speed">Speed</option>
       </select>`;
