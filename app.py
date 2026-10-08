@@ -179,7 +179,24 @@ HEATMAP_CONFIDENT_SAMPLES = 3
 # cell means incl. dwell/signal stops): CBD streets ~7-10 km/h, arterials
 # ~18-22, motorway sections ~40-45 (medians ~54, p90 ~66).
 HEATMAP_SPEED_CAP_KMH = 80.0
-VALID_HEATMAP_METRICS = ("delay", "delay_mean", "delay_median", "delay_std", "frequency", "density", "speed")
+VALID_HEATMAP_METRICS = ("delay", "delay_mean", "delay_median", "delay_std", "delay_total",
+                         "frequency", "density", "speed")
+# Empirical-Bayes shrinkage for the average-delay and not-on-time maps.
+# The scrape is sparse (7 days ~ 1.3 readings per 10 m cell; 83% of cells
+# hold a single reading), so a lone bus that happened to be 15 min late
+# would paint a full-strength hotspot and a one-reading cell's on-time %
+# is a coin flip (0% or 100%). Every pixel's estimate is therefore treated
+# as if it also held SHRINK_PRIOR_N readings at the network-wide value.
+# Applied per PIXEL by the client (FieldLayer), after pooling nearby cells
+# — not per cell before pooling, which smooths twice and flattened the map
+# to a 1.3-1.9 min band. With pixel-level shrinkage (250 m pooling, ~20
+# readings per pixel at the median) the 7-day map keeps real spread:
+# average delay p5-p95 0.6-2.9 min, not on time 11-50%.
+SHRINK_PRIOR_N = 3
+# Colour-scale caps for those two maps, set from that observed spread
+# (the old 10 min / 100% caps squeezed everything into the pale end).
+DELAY_FIELD_CAP_SEC = 300
+NOT_ON_TIME_CAP = 0.6
 
 # Time-of-day buckets for the historical heatmap (from Liha's changes).
 # Averaged over a full "Last 24 hours" window, a corridor that's terrible
@@ -915,6 +932,17 @@ def compute_metric_points(cells, metric):
             points.append([c[0] / c[2], c[1] / c[2], norm, confidence])
         return points
 
+    if metric == "delay_total":
+        # "Delay burden": total lateness accumulated in a cell (bus-seconds
+        # late, floored at 0 per reading), additive like density — i.e.
+        # where the most bus-minutes of delay pile up across the network.
+        # This is roughly what the original summed delay heatmap showed:
+        # busy corridors (CBD) rank high because many buses each add a
+        # little, which is real total impact, NOT a sign that each bus there
+        # runs later. Weight 1 = one bus 10 min late (HEATMAP_SEVERITY_CAP_SEC).
+        return [[c[0] / c[2], c[1] / c[2], c[3] / HEATMAP_SEVERITY_CAP_SEC]
+                for c in cells.values() if c[4] > 0 and c[3] > 0]
+
     # Delay metrics use lateness in seconds, floored at 0 so early running
     # cannot cancel out late running in the same cell.
     if metric == "frequency":
@@ -926,14 +954,15 @@ def compute_metric_points(cells, metric):
         # the way it can on delay_mean. Same confidence scaling as the
         # other metrics. (From Liha's changes; widened from "late only" to
         # "outside the KPI window" so it's exactly 1 - on-time %.)
+        # [lat, lon, rate / NOT_ON_TIME_CAP, n_readings] — weight is the raw
+        # reading count (not capped confidence) because the client pools
+        # these and shrinks per pixel toward metric_prior().
         points = []
         for c in cells.values():
             if c[4] <= 0:
                 continue
             off_time = sum(1 for d in c[7] if not is_on_time(d))
-            rate = off_time / c[4]
-            confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-            points.append([c[0] / c[2], c[1] / c[2], rate, confidence])
+            points.append([c[0] / c[2], c[1] / c[2], (off_time / c[4]) / NOT_ON_TIME_CAP, c[4]])
         return points
 
     if metric in ("delay_median", "delay_std"):
@@ -959,19 +988,31 @@ def compute_metric_points(cells, metric):
     # backed by only one or two readings can't paint a full-strength
     # hotspot off a single noisy ping. Cells with zero delay-bearing
     # readings are dropped — there's nothing to weight.
-    points = []
-    for c in cells.values():
-        if c[4] <= 0:
-            continue
-        severity = min((c[3] / c[4]) / HEATMAP_SEVERITY_CAP_SEC, 1.0)
-        confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-        points.append([c[0] / c[2], c[1] / c[2], severity, confidence])
-    return points
+    # [lat, lon, mean lateness / DELAY_FIELD_CAP_SEC, n_readings] — same
+    # raw-count weighting + client-side per-pixel shrinkage as "frequency".
+    # Not clamped here: the client clamps AFTER averaging, so one extreme
+    # cell can't be silently capped before it's pooled with its neighbours.
+    return [[c[0] / c[2], c[1] / c[2], (c[3] / c[4]) / DELAY_FIELD_CAP_SEC, c[4]]
+            for c in cells.values() if c[4] > 0]
+
+
+def metric_prior(cells, metric):
+    """[network value (normalised like the metric's points), SHRINK_PRIOR_N]
+    for the metrics the client shrinks per pixel, else None."""
+    n = sum(c[4] for c in cells.values())
+    if not n:
+        return None
+    if metric in ("delay", "delay_mean"):
+        return [sum(c[3] for c in cells.values()) / n / DELAY_FIELD_CAP_SEC, SHRINK_PRIOR_N]
+    if metric == "frequency":
+        off = sum(sum(1 for d in c[7] if not is_on_time(d)) for c in cells.values())
+        return [off / n / NOT_ON_TIME_CAP, SHRINK_PRIOR_N]
+    return None
 
 
 _METRIC_LABELS = {
     "delay": "delay", "delay_mean": "mean delay", "delay_median": "median delay",
-    "delay_std": "delay standard deviation", "frequency": "on-time",
+    "delay_std": "delay standard deviation", "delay_total": "delay", "frequency": "on-time",
     "density": "vehicle", "speed": "speed",
 }
 
@@ -1007,12 +1048,13 @@ def get_heatmap_points_cached(window_hours, metric, period="all"):
 
     if not cells:
         if meta["files_fetched"] == 0:
-            return [], meta["last_error"] or "No data files found for this window"
+            return [], meta["last_error"] or "No data files found for this window", None
         if period == "all":
-            return [], f"Fetched {meta['files_fetched']} file(s) but no rows fell inside the window"
-        return [], f"No readings in the {_PERIOD_LABELS.get(period, period)} period for this window"
+            return [], f"Fetched {meta['files_fetched']} file(s) but no rows fell inside the window", None
+        return [], f"No readings in the {_PERIOD_LABELS.get(period, period)} period for this window", None
 
     points = compute_metric_points(cells, metric)
+    prior = metric_prior(cells, metric)
 
     if meta["deadline_hit"]:
         note = f"Partial data (deadline hit after {HEATMAP_DEADLINE_SEC}s)"
@@ -1021,7 +1063,7 @@ def get_heatmap_points_cached(window_hours, metric, period="all"):
         note = f"Fetched {meta['files_fetched']} file(s) but no rows had {label} data yet"
     else:
         note = None
-    return points, note
+    return points, note, prior
 
 
 def compute_delay_data(args):
@@ -1185,46 +1227,59 @@ HEATMAP_SCRIPT = """\
     // Keep these two in sync with their server-side counterparts
     // (HEATMAP_SEVERITY_CAP_SEC, HEATMAP_SPEED_CAP_KMH) so the live and
     // historical legends mean the same thing for the same metric.
-    const SEVERITY_CAP_MIN = 10;
+    const SEVERITY_CAP_MIN = 10;  // delay-burden unit (live weight saturates here)
+    const DELAY_CAP_MIN = 5;      // average-delay colour scale (DELAY_FIELD_CAP_SEC)
     const SPEED_CAP_KMH = 80;
+    const FIELD_RADIUS_M = 160;  // default averaging radius for FieldLayer
 
     // kind 'field' = averaged value field (FieldLayer) — colour is the
     // local confidence-weighted MEAN of the metric, opacity is how much
     // data backs it, so a busy street can't look worse/faster just by
     // having more readings. kind 'sum' = classic additive heatmap
     // (Leaflet.heat), which is exactly right for density and only density.
-    const DELAY_TICKS = ['0', '2.5', '5', '7.5', `${SEVERITY_CAP_MIN}+ min`];
+    const DELAY_TICKS = ['0', '1', '2', '3', '4', `${DELAY_CAP_MIN}+ min`];
+    // radiusM / fullSupport (field metrics only): delay and not-on-time
+    // pool over a wider radius and need more data before reaching full
+    // opacity, because individual delay readings are noisy and sparse;
+    // speed keeps a tighter radius so adjacent roads of different classes
+    // (motorway vs the street beside it) don't blend.
     const METRICS = {
       delay: {
-        label: 'Delay mean', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
-        liveTitle: 'Live snapshot — current lateness',
-        histTitle: 'Historical window — mean lateness (min)',
+        label: 'Average delay', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
+        radiusM: 250, fullSupport: 3,
+        liveTitle: 'Live: current delay (min)',
+        histTitle: 'Historical: average delay (min)',
         ticks: DELAY_TICKS,
       },
-      density: {
-        label: 'Density', kind: 'sum', hist: 'Oranges', live: 'Blues',
-        liveTitle: 'Live snapshot — vehicle density',
-        histTitle: 'Historical window — vehicle density',
-        ticks: ['fewer pings', 'more pings'],
-      },
-      speed: {
-        label: 'Speed', kind: 'field', hist: 'PlasmaR', live: 'YlGnBu',
-        liveTitle: 'Live snapshot — current speed (km/h)',
-        histTitle: 'Historical window — mean speed (km/h)',
-        ticks: ['0', '20', '40', '60', `${SPEED_CAP_KMH}+`],
+      delay_total: {
+        label: 'Delay burden', kind: 'sum', hist: 'RdPu', live: 'PuBu',
+        liveTitle: 'Live: buses running late',
+        histTitle: 'Historical: total bus-minutes late',
+        ticks: ['less', 'more'],
       },
       // % of readings outside the TfNSW on-time KPI window (0:59 early to
       // 5:59 late) — i.e. 1 − on-time %. From Liha's changes.
       frequency: {
-        label: 'Not on time %', kind: 'field', hist: 'YlOrBr', live: 'BuPu',
-        liveTitle: 'Live snapshot — currently not on time',
-        histTitle: 'Historical window — % of readings not on time',
-        ticks: ['0%', '25%', '50%', '75%', '100%'],
+        label: 'Not on time', kind: 'field', hist: 'YlOrBr', live: 'BuPu',
+        radiusM: 250, fullSupport: 3,
+        liveTitle: 'Live: currently not on time',
+        histTitle: 'Historical: readings not on time (%)',
+        ticks: ['0', '15', '30', '45', '60+%'],
+      },
+      speed: {
+        label: 'Speed', kind: 'field', hist: 'PlasmaR', live: 'YlGnBu',
+        radiusM: FIELD_RADIUS_M, fullSupport: 0.4,
+        liveTitle: 'Live: current speed (km/h)',
+        histTitle: 'Historical: average speed (km/h)',
+        ticks: ['0', '20', '40', '60', `${SPEED_CAP_KMH}+`],
+      },
+      density: {
+        label: 'Bus density', kind: 'sum', hist: 'Oranges', live: 'Blues',
+        liveTitle: 'Live: bus density',
+        histTitle: 'Historical: bus density',
+        ticks: ['fewer buses', 'more buses'],
       },
     };
-    METRICS.delay_mean = { ...METRICS.delay, label: 'Delay mean' };
-    METRICS.delay_median = { ...METRICS.delay, label: 'Delay median', histTitle: 'Historical window — median lateness (min)' };
-    METRICS.delay_std = { ...METRICS.delay, label: 'Delay std deviation', histTitle: 'Historical window — delay standard deviation (min)' };
     for (const cfg of Object.values(METRICS)) {
       cfg.liveGradient = rampStops(cfg.live);
       cfg.histGradient = rampStops(cfg.hist);
@@ -1378,7 +1433,6 @@ HEATMAP_SCRIPT = """\
     // but it never changes the colour. Rendered on a coarse grid (~6 cells
     // per kernel radius) and upscaled with smoothing, so cost stays flat
     // across zoom levels.
-    const FIELD_RADIUS_M = 160;
     const FieldLayer = L.Layer.extend({
       // fullSupport: summed kernel*confidence at which a pixel reaches
       // maxOpacity. 0.4 ~ one or two readings at the pixel; most cells only
@@ -1390,6 +1444,10 @@ HEATMAP_SCRIPT = """\
         this._lut = buildLut(this.options.ramp);
       },
       setLatLngs(points) { this._pts = points || []; return this.redraw(); },
+      // [value, n] network prior from /api/heatmap (see SHRINK_PRIOR_N),
+      // or null: each pixel's mean is shrunk as if it also held n readings
+      // at `value`. Opacity still comes from the real data only.
+      setPrior(prior) { this._prior = prior || null; return this; },
       // Leaflet.heat API parity: updateHeatRadii() passes radius/blur/maxZoom
       // to every heat layer on zoom; none apply here (moveend redraws).
       setOptions(o) { L.setOptions(this, o); return this; },
@@ -1447,7 +1505,7 @@ HEATMAP_SCRIPT = """\
           const pt = m.latLngToContainerPoint([p[0], p[1]]);
           const gx = pt.x / ds, gy = pt.y / ds;
           if (gx < -r || gy < -r || gx > gw + r || gy > gh + r) continue;
-          const v = Math.min(Math.max(p[2], 0), 1);
+          const v = p[2];  // clamped after averaging, not before
           const x0 = Math.max(0, Math.ceil(gx - r)), x1 = Math.min(gw - 1, Math.floor(gx + r));
           const y0 = Math.max(0, Math.ceil(gy - r)), y1 = Math.min(gh - 1, Math.floor(gy + r));
           for (let y = y0; y <= y1; y++) {
@@ -1468,10 +1526,12 @@ HEATMAP_SCRIPT = """\
         const octx = off.getContext('2d');
         const img = octx.createImageData(gw, gh), d = img.data, lut = this._lut;
         const full = this.options.fullSupport, maxA = this.options.maxOpacity * 255;
+        const pv = this._prior ? this._prior[0] : 0, pn = this._prior ? this._prior[1] : 0;
         for (let i = 0; i < gw * gh; i++) {
           const w = den[i];
           if (w < 1e-3) continue;
-          const li = Math.round(Math.min(Math.max(num[i] / w, 0), 1) * 255) * 3, j = i * 4;
+          const val = (num[i] + pn * pv) / (w + pn);
+          const li = Math.round(Math.min(Math.max(val, 0), 1) * 255) * 3, j = i * 4;
           d[j] = lut[li]; d[j + 1] = lut[li + 1]; d[j + 2] = lut[li + 2];
           d[j + 3] = Math.min(1, w / full) * maxA;
         }
@@ -1485,7 +1545,14 @@ HEATMAP_SCRIPT = """\
 
     function buildHeatLayer(metric, which) {
       const cfg = METRICS[metric];
-      if (cfg.kind === 'field') return new FieldLayer([], { ramp: cfg[which] });
+      if (cfg.kind === 'field') {
+        return new FieldLayer([], {
+          ramp: cfg[which],
+          radiusM: cfg.radiusM || FIELD_RADIUS_M,
+          // Live = one point per bus, nothing pooled — full opacity at ~1 bus.
+          fullSupport: which === 'live' ? Math.min(cfg.fullSupport || 0.4, 1) : (cfg.fullSupport || 0.4),
+        });
+      }
       return new MaskedHeatLayer([], {
         radius: currentHeatRadius, blur: currentHeatBlur, max: HEAT_MAX,
         minOpacity: HEAT_MIN_OPACITY, maxZoom: map.getZoom(),
@@ -1520,8 +1587,8 @@ HEATMAP_SCRIPT = """\
     map.on('zoomend', updateHeatRadii);
     updateHeatRadii();
 
-    const LIVE_LAYER_NAME = 'Heatmap (live)';
-    const HIST_LAYER_NAME = 'Heatmap (historical)';
+    const LIVE_LAYER_NAME = 'Live heatmap';
+    const HIST_LAYER_NAME = 'Historical heatmap';
     const layersControl = L.control.layers(null, {
       'Bus markers': markersLayer,
       [LIVE_LAYER_NAME]: heatLayer,
@@ -1549,6 +1616,63 @@ HEATMAP_SCRIPT = """\
         .map(k => `${gradient[k]} ${Math.round(k * 100)}%`);
       return `linear-gradient(to right, ${stops.join(', ')})`;
     }
+    // One tidy panel under the layer checkboxes: a Heatmap section (metric,
+    // route clip, history window, time of day, then legend + status) and a
+    // Markers section. Element IDs are unchanged so the handlers below
+    // don't care how the panel is laid out.
+    const PERIODS = [  // Liha's time-of-day buckets — see TIME_PERIODS server-side
+      ['all', 'All day'],
+      ['am_peak', 'AM peak (06:00\u201310:00)'],
+      ['midday', 'Midday (10:00\u201315:00)'],
+      ['pm_peak', 'PM peak (15:00\u201319:00)'],
+      ['evening', 'Evening (19:00\u201306:00)'],
+    ];
+    const heatPanel = document.createElement('div');
+    heatPanel.className = 'heat-panel';
+    heatPanel.innerHTML = `
+      <div class="hp-section">Heatmap</div>
+      <div class="hp-grid">
+        <label for="heatMetricSelect">Metric</label>
+        <select id="heatMetricSelect">
+          ${Object.entries(METRICS).map(([k, c]) => `<option value="${k}"${k === DEFAULT_METRIC ? ' selected' : ''}>${c.label}</option>`).join('')}
+        </select>
+        <label for="routeMaskSelect">Route clip</label>
+        <span class="hp-inline">
+          <select id="routeMaskSelect">
+            <option value="0">Off</option>
+            <option value="15">\u00b115 m</option>
+            <option value="25" selected>\u00b125 m</option>
+            <option value="50">\u00b150 m</option>
+            <option value="100">\u00b1100 m</option>
+          </select>
+          <span id="routeMaskStatus">loading\u2026</span>
+        </span>
+        <label for="histWindowSelect">History</label>
+        <select id="histWindowSelect">
+          <option value="1">Last hour</option>
+          <option value="24" selected>Last 24 hours</option>
+          <option value="168">Last 7 days</option>
+        </select>
+        <label for="histPeriodSelect">Time of day</label>
+        <select id="histPeriodSelect">
+          ${PERIODS.map(([v, label]) => `<option value="${v}"${v === 'all' ? ' selected' : ''}>${label}</option>`).join('')}
+        </select>
+      </div>
+      <div class="hp-legends"></div>
+      <div id="histWindowStatus"></div>
+      <div class="hp-section">Markers</div>
+      <div class="hp-grid">
+        <label for="markerStyleSelect">Style</label>
+        <select id="markerStyleSelect">
+          <option value="pill" selected>Route label</option>
+          <option value="arrow">Arrow only</option>
+        </select>
+      </div>`;
+    layersControl.getContainer().appendChild(heatPanel);
+    L.DomEvent.disableClickPropagation(heatPanel);
+    L.DomEvent.disableScrollPropagation(heatPanel);
+    const statusDiv = heatPanel.querySelector('#histWindowStatus');
+
     function makeHeatLegend(id) {
       const div = document.createElement('div');
       div.className = 'heat-legend';
@@ -1557,7 +1681,7 @@ HEATMAP_SCRIPT = """\
       div.innerHTML = `<div class="heat-legend-title"></div>
         <div class="heat-legend-bar"></div>
         <div class="heat-legend-ticks"></div>`;
-      layersControl.getContainer().appendChild(div);
+      heatPanel.querySelector('.hp-legends').appendChild(div);
       return div;
     }
     const liveLegend = makeHeatLegend('liveHeatLegend');
@@ -1582,30 +1706,6 @@ HEATMAP_SCRIPT = """\
       }));
     }
 
-    const metricPickerDiv = document.createElement('div');
-    metricPickerDiv.id = 'heatMetricPicker';
-    metricPickerDiv.innerHTML = `Heatmap metric: <select id="heatMetricSelect">
-                <option value="delay" selected>Delay mean</option>
-                <option value="delay_median">Delay median</option>
-                <option value="delay_std">Delay std deviation</option>
-        <option value="frequency">Not on time %</option>
-        <option value="density">Density</option>
-        <option value="speed">Speed</option>
-      </select>`;
-    layersControl.getContainer().appendChild(metricPickerDiv);
-    L.DomEvent.disableClickPropagation(metricPickerDiv);
-
-    const maskPickerDiv = document.createElement('div');
-    maskPickerDiv.id = 'routeMaskPicker';
-    maskPickerDiv.innerHTML = `Clip to bus routes: <select id="routeMaskSelect">
-        <option value="0">Off</option>
-        <option value="15">\u00b115 m</option>
-        <option value="25" selected>\u00b125 m</option>
-        <option value="50">\u00b150 m</option>
-        <option value="100">\u00b1100 m</option>
-      </select> <span id="routeMaskStatus">(loading\u2026)</span>`;
-    layersControl.getContainer().appendChild(maskPickerDiv);
-    L.DomEvent.disableClickPropagation(maskPickerDiv);
     document.getElementById('routeMaskSelect').addEventListener('change', e => {
       routeMaskHalfWidthM = Number(e.target.value);
       heatLayer.redraw();
@@ -1617,7 +1717,7 @@ HEATMAP_SCRIPT = """\
         const res = await fetch('/api/route_shapes');
         const data = await res.json();
         if (!data.lines || !data.lines.length) {
-          st.textContent = '(unavailable)';
+          st.textContent = 'unavailable';
           st.title = data.error || 'No route shapes';
           return;
         }
@@ -1627,51 +1727,15 @@ HEATMAP_SCRIPT = """\
         heatLayer.redraw();
         histHeatLayer.redraw();
       } catch (e) {
-        st.textContent = '(unavailable)';
+        st.textContent = 'unavailable';
         st.title = String(e);
       }
     }
 
-    const markerStylePickerDiv = document.createElement('div');
-    markerStylePickerDiv.id = 'markerStylePicker';
-    markerStylePickerDiv.innerHTML = `Marker style: <select id="markerStyleSelect">
-        <option value="pill" selected>Full pill</option>
-        <option value="arrow">Delta arrow</option>
-      </select>`;
-    layersControl.getContainer().appendChild(markerStylePickerDiv);
-    L.DomEvent.disableClickPropagation(markerStylePickerDiv);
     document.getElementById('markerStyleSelect').addEventListener('change', e => {
       markerStyle = e.target.value;
       renderVehicles(lastVehicles);
     });
-
-    const pickerDiv = document.createElement('div');
-    pickerDiv.id = 'histWindowPicker';
-    pickerDiv.innerHTML = `Historical window: <select id="histWindowSelect"><option value="1">Last hour</option><option value="24" selected>Last 24 hours</option><option value="168">Last 7 days</option></select>`;
-    layersControl.getContainer().appendChild(pickerDiv);
-    L.DomEvent.disableClickPropagation(pickerDiv);
-
-    // Time-of-day bucket for the historical layer (Liha's changes) — a
-    // dict lookup into cells the window fetch already aggregated (see
-    // server docstring), so switching this never triggers a new CSV fetch.
-    const PERIODS = [
-      ['all', 'All day'],
-      ['am_peak', 'AM peak (06:00\u201310:00)'],
-      ['midday', 'Midday (10:00\u201315:00)'],
-      ['pm_peak', 'PM peak (15:00\u201319:00)'],
-      ['evening', 'Evening (19:00\u201306:00)'],
-    ];
-    const periodPickerDiv = document.createElement('div');
-    periodPickerDiv.id = 'histPeriodPicker';
-    periodPickerDiv.innerHTML = 'Time of day: <select id="histPeriodSelect">' +
-      PERIODS.map(([v, label]) => `<option value="${v}"${v === 'all' ? ' selected' : ''}>${label}</option>`).join('') +
-      '</select>';
-    layersControl.getContainer().appendChild(periodPickerDiv);
-    L.DomEvent.disableClickPropagation(periodPickerDiv);
-
-    const statusDiv = document.createElement('div');
-    statusDiv.id = 'histWindowStatus';
-    layersControl.getContainer().appendChild(statusDiv);
 
     // Historical fetches can be slow (up to HEATMAP_DEADLINE_SEC on a cold
     // per-window cache — see server docstring) and switching metric or
@@ -1698,7 +1762,7 @@ HEATMAP_SCRIPT = """\
       // Visible on the map itself (not just the collapsed layer control)
       // so a slow cold-cache fetch reads as "still working" rather than
       // "did switching this do anything?".
-      heatLoadingBanner.textContent = `Updating ${METRICS[metricAtRequest].label.toLowerCase()} heatmap…`;
+      heatLoadingBanner.textContent = `Updating heatmap: ${METRICS[metricAtRequest].label.toLowerCase()}\u2026`;
       heatLoadingBanner.hidden = false;
       try {
         const res = await fetch(`/api/heatmap?window=${wh}&metric=${metricAtRequest}&period=${period}`);
@@ -1709,10 +1773,11 @@ HEATMAP_SCRIPT = """\
         catch (e) { statusDiv.textContent = `Bad response (HTTP ${res.status})`; statusDiv.style.color = '#b3261e'; return; }
         const points = data.points || [];
         histHeatData = points;
+        if (histHeatLayer.setPrior) histHeatLayer.setPrior(data.prior);
         histHeatLayer.setLatLngs(points);
         if (data.error) { statusDiv.textContent = data.error; statusDiv.style.color = '#b3261e'; }
-        else if (points.length === 0) { statusDiv.textContent = 'No historical points in this window yet'; statusDiv.style.color = '#b3261e'; }
-        else { statusDiv.textContent = points.length + ' historical cells loaded'; statusDiv.style.color = '#666'; }
+        else if (points.length === 0) { statusDiv.textContent = 'No data in this window yet'; statusDiv.style.color = '#b3261e'; }
+        else { statusDiv.textContent = `${points.length.toLocaleString('en-AU')} cells loaded`; statusDiv.style.color = ''; }
       } catch (e) {
         if (seq !== histRequestSeq) return;
         statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e';
@@ -1753,7 +1818,8 @@ HEATMAP_SCRIPT = """\
       // flagged anomaly don't contribute a heat point (still shown as a
       // marker), since we can't say whether they're a bottleneck or not.
       if (v.delay_min == null || v.anomaly) return null;
-      return Math.min(Math.max(v.delay_min, 0) / SEVERITY_CAP_MIN, 1);
+      const cap = metric === 'delay' ? DELAY_CAP_MIN : SEVERITY_CAP_MIN;
+      return Math.min(Math.max(v.delay_min, 0) / cap, 1);
     }
 
     function updateLiveHeatFromVehicles(vehicles) {
@@ -1899,9 +1965,16 @@ PAGE = """
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
   .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
-  #histWindowPicker, #histPeriodPicker, #routeMaskPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
-  #histWindowPicker select, #histPeriodPicker select, #routeMaskPicker select { font:inherit; }
-  #routeMaskStatus { color:#888; }
+  .heat-panel { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#333; margin-top:6px; padding-top:6px; border-top:1px solid #ddd; width:230px; }
+  .heat-panel .hp-section { font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#777; margin:8px 0 4px; }
+  .heat-panel .hp-section:first-child { margin-top:0; }
+  .heat-panel .hp-grid { display:grid; grid-template-columns:auto 1fr; gap:4px 8px; align-items:center; }
+  .heat-panel .hp-grid label { color:#555; }
+  .heat-panel select { font:inherit; width:100%; min-width:0; }
+  .heat-panel .hp-inline { display:flex; align-items:center; gap:4px; min-width:0; }
+  .heat-panel #routeMaskStatus { color:#888; white-space:nowrap; }
+  .heat-panel #histWindowStatus { color:#777; font-size:11px; margin-top:4px; }
+  .heat-panel .heat-legend { margin:8px 0 0; }
   #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
   .heat-legend { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:6px 22px 2px; color:#333; }
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
@@ -1911,11 +1984,9 @@ PAGE = """
 </style>
 </head>
 <body>
-  <h1>Delay Board <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/project">smart-city project &rarr;</a></h1>
+  <h1>Delay Board <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/project">Projector mode &rarr;</a></h1>
   <div class="meta">
-    Pulled {{ pulled_at }}
-    &middot; <a class="toggle" href="?hide_anomalies={{ 0 if hide_anomalies else 1 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">{{ 'show anomalies' if hide_anomalies else 'hide anomalies' }}</a>
-    <br>"On time" = 0:59 early to 5:59 late (TfNSW KPI) &middot; n = distinct non-anomalous buses reporting (latest stop each)
+    Data fetched {{ pulled_at }}
     {% if agency_error %}<br><span style="color:#b3261e">Operator names unavailable: {{ agency_error }}</span>{% endif %}
   </div>
 
@@ -1938,14 +2009,13 @@ PAGE = """
     <span><span class="swatch" style="border-color:{{ outline_late }}"></span>Late</span>
     <span><span class="swatch" style="border-color:{{ outline_early }}"></span>Early</span>
     <span><span class="swatch" style="border-color:{{ outline_no_data }}"></span>No delay data / anomalous</span>
-    <span>{{ vehicles|length }} vehicles shown{% if filters_active %} (filtered){% endif %}{% if apply_bounds %} &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">within 10km of CBD, show statewide</a>{% else %} &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">statewide, restrict to 10km of CBD</a>{% endif %}</span>
-    <span>Use the layer switcher (top-right) to toggle the heatmaps.</span>
+    <span>{{ vehicles|length }} buses{% if filters_active %} (filtered){% endif %} {% if apply_bounds %}within 10 km of the CBD &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">show Opal area</a>{% else %}across the Opal area &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">show 10 km of the CBD only</a>{% endif %}</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
 
   <h2>By operator</h2>
   <table>
-    <tr><th>Operator</th><th>n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
+    <tr><th>Operator</th><th class="help" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded.">n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th class="help" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window).">on time</th><th>range</th></tr>
     {% for r in operators %}
     <tr><td>{{ r.operator }}</td><td>{{ r.n }}</td>
       <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
@@ -1957,7 +2027,7 @@ PAGE = """
 
   <h2>By route &mdash; worst variance first (sort: <a class="toggle" href="?sort=stdev_min&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">spread</a> / <a class="toggle" href="?sort=mean_min&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">avg delay</a> / <a class="toggle" href="?sort=on_time_pct&amp;asc=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">worst on-time %</a>)</h2>
   <table>
-    <tr><th>Route</th><th>Operator</th><th>n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th>on time</th><th>range</th></tr>
+    <tr><th>Route</th><th>Operator</th><th class="help" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded.">n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th class="help" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window).">on time</th><th>range</th></tr>
     {% for r in routes[:60] %}
     <tr><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td>{{ r.n }}</td>
       <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
@@ -1992,7 +2062,7 @@ PROJECT_PAGE = """
 <head>
 <meta charset="utf-8">
 <meta name="robots" content="noindex, nofollow">
-<title>smart-city project map</title>
+<title>Delay Board — projector mode</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
@@ -2013,9 +2083,16 @@ PROJECT_PAGE = """
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
   .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
-  #histWindowPicker, #histPeriodPicker, #routeMaskPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
-  #histWindowPicker select, #histPeriodPicker select, #routeMaskPicker select { font:inherit; }
-  #routeMaskStatus { color:#888; }
+  .heat-panel { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#333; margin-top:6px; padding-top:6px; border-top:1px solid #ddd; width:230px; }
+  .heat-panel .hp-section { font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#777; margin:8px 0 4px; }
+  .heat-panel .hp-section:first-child { margin-top:0; }
+  .heat-panel .hp-grid { display:grid; grid-template-columns:auto 1fr; gap:4px 8px; align-items:center; }
+  .heat-panel .hp-grid label { color:#555; }
+  .heat-panel select { font:inherit; width:100%; min-width:0; }
+  .heat-panel .hp-inline { display:flex; align-items:center; gap:4px; min-width:0; }
+  .heat-panel #routeMaskStatus { color:#888; white-space:nowrap; }
+  .heat-panel #histWindowStatus { color:#777; font-size:11px; margin-top:4px; }
+  .heat-panel .heat-legend { margin:8px 0 0; }
   #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
   .heat-legend { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:6px 22px 2px; color:#333; }
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
@@ -2090,6 +2167,15 @@ PROJECT_PAGE = """
 </body>
 </html>
 """
+
+
+def _fmt_pulled(iso):
+    """'2026-10-09T10:44:12.123456+11:00' -> '10:44:12 · Fri 9 Oct' (Sydney, 24 h)."""
+    try:
+        t = datetime.fromisoformat(iso).astimezone(SYDNEY_TZ)
+    except (TypeError, ValueError):
+        return iso
+    return f"{t:%H:%M:%S} \u00b7 {t:%a} {t.day} {t:%b}"
 
 
 @app.route("/project")
@@ -2174,7 +2260,7 @@ def dashboard():
 
     return render_template_string(
         PAGE,
-        pulled_at=all_rows[0]["pulled_at"] if all_rows else "-",
+        pulled_at=_fmt_pulled(all_rows[0]["pulled_at"]) if all_rows else "-",
         n_total=len(all_rows),
         n_flagged=sum(1 for r in all_rows if r["anomaly"]),
         hide_anomalies=data["hide_anomalies"],
@@ -2254,9 +2340,9 @@ def api_heatmap():
         period = request.args.get("period", "all")
         if period not in VALID_HEATMAP_PERIODS:
             period = "all"
-        points, error = get_heatmap_points_cached(window_hours, metric, period)
-        return jsonify({"points": points, "window_hours": window_hours, "metric": metric,
-                        "period": period, "error": error})
+        points, error, prior = get_heatmap_points_cached(window_hours, metric, period)
+        return jsonify({"points": points, "prior": prior, "window_hours": window_hours,
+                        "metric": metric, "period": period, "error": error})
     except Exception as e:
         return jsonify({"points": [], "window_hours": None, "metric": None, "period": None,
                         "error": f"Server error: {e}"}), 200
