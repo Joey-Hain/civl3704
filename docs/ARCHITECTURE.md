@@ -32,6 +32,7 @@ The app is organised into three main layers:
 - Jinja renders summary tables for operators, routes and individual trips.
 - Leaflet displays live vehicle markers on an interactive map.
 - Marker outlines show whether a vehicle is on time, late, early or has no delay data.
+- Value metrics (delay mean/median/SD, % not on time, speed) render through a custom `FieldLayer`: a confidence- and Gaussian-weighted mean per pixel (normalised convolution) with opacity from data support, coloured with perceptually ordered ramps interpolated in OKLab. Density stays on Leaflet.heat, whose additive stacking is correct only for counts.
 - Leaflet.heat displays live and historical heatmaps for mean delay, median delay, delay standard deviation, vehicle density and speed.
 - An optional route mask clips both heat layers to the bus road network: `gtfs-r-scrape/build_route_shapes.py` (weekly GitHub Action) de-duplicates TfNSW GTFS `shapes.txt` within 12 km of the CBD into `shapes/route_shapes.json`; the app serves it gzipped from `/api/route_shapes` and the client strokes it with a `destination-in` composite after each heat redraw.
 - Historical heatmaps support one-hour, 24-hour and seven-day windows, a time-of-day filter (AM peak, midday, PM peak, evening) bucketed during the same aggregation pass, and refresh automatically every five minutes.

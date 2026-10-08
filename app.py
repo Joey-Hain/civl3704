@@ -89,11 +89,16 @@ Per-metric weighting:
     three: it exists mainly to prove the heatmap rendering pipeline is
     correct independent of any weighting logic.
 
-Delay statistics and speed weight are scaled by a confidence factor —
-min(n_readings / HEATMAP_CONFIDENT_SAMPLES, 1) — so a cell backed by only
-one or two readings fades toward the cool end even if that one reading was
-extreme, rather than painting a full-strength hotspot off a single noisy
-ping. A hard minimum-sample cutoff was tried first (for delay) and
+Every metric except density also carries a confidence factor —
+min(n_readings / HEATMAP_CONFIDENT_SAMPLES, 1) — returned alongside the
+value rather than multiplied into it. The client renders these metrics as
+an averaged field (FieldLayer): each pixel's colour is the confidence- and
+distance-weighted MEAN of nearby cells, and its opacity is how much data
+backs it. So a cell backed by one noisy reading fades out instead of
+painting a full-strength hotspot, and — unlike the additive heatmap these
+metrics used to share with density — a street with many closely packed
+readings no longer renders darker just for being busy (Elizabeth St at
+~9 km/h used to out-colour the Harbour Bridge at ~42 km/h on speed). A hard minimum-sample cutoff was tried first (for delay) and
 rejected: the scrape cadence in practice is roughly every 2-3 hours (see
 gtfs-r-scrape), so "Last hour" would almost always have exactly one
 reading per cell and a cutoff of 2+ would leave that window essentially
@@ -167,11 +172,13 @@ HEATMAP_SEVERITY_CAP_SEC = 600
 # full confidence; fewer readings fade its weight toward 0 (see
 # compute_metric_points) rather than being dropped outright.
 HEATMAP_CONFIDENT_SAMPLES = 3
-# Speed (km/h) at which the speed-heatmap gradient saturates. Set above
-# typical arterial running speed for Sydney buses so genuinely fast runs
-# (clearways, motorway sections) stand out rather than the whole map
-# reading as "hot".
-HEATMAP_SPEED_CAP_KMH = 60.0
+# Speed (km/h) at which the speed-heatmap gradient saturates. 80 km/h =
+# the posted limit on the motorway sections buses use (Bradfield Hwy,
+# Warringah Fwy, Eastern Distributor), so the scale separates road classes
+# instead of maxing out on any arterial clearway. Scrape data (7 days,
+# cell means incl. dwell/signal stops): CBD streets ~7-10 km/h, arterials
+# ~18-22, motorway sections ~40-45 (medians ~54, p90 ~66).
+HEATMAP_SPEED_CAP_KMH = 80.0
 VALID_HEATMAP_METRICS = ("delay", "delay_mean", "delay_median", "delay_std", "frequency", "density", "speed")
 
 # Time-of-day buckets for the historical heatmap (from Liha's changes).
@@ -870,9 +877,17 @@ def fetch_historical_cells(window_hours):
 
 
 def compute_metric_points(cells, metric):
-    """Turn aggregated cells into [lat, lon, weight] points for one metric.
+    """Turn aggregated cells into points for one metric.
     Pure/cheap — no network — so switching the metric dropdown client-side
-    never re-triggers a CSV fetch (see get_heatmap_points_cached)."""
+    never re-triggers a CSV fetch (see get_heatmap_points_cached).
+
+    density -> [lat, lon, weight] for the additive heatmap (Leaflet.heat).
+    every other metric -> [lat, lon, value, confidence], value in 0..1
+    (the metric normalised against its cap) and confidence =
+    min(n / HEATMAP_CONFIDENT_SAMPLES, 1). They're kept separate (not
+    multiplied) because the client renders these as an averaged field:
+    confidence weights a cell's say in the local mean and sets opacity,
+    but never changes the colour — see FieldLayer in HEATMAP_SCRIPT."""
     if metric == "density":
         # Raw ping count per cell, normalised against the busiest cell in
         # the window. No confidence scaling: the count itself already IS
@@ -897,7 +912,7 @@ def compute_metric_points(cells, metric):
             mean_speed = c[5] / c[6]
             norm = min(mean_speed / HEATMAP_SPEED_CAP_KMH, 1.0)
             confidence = min(c[6] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-            points.append([c[0] / c[2], c[1] / c[2], norm * confidence])
+            points.append([c[0] / c[2], c[1] / c[2], norm, confidence])
         return points
 
     # Delay metrics use lateness in seconds, floored at 0 so early running
@@ -918,7 +933,7 @@ def compute_metric_points(cells, metric):
             off_time = sum(1 for d in c[7] if not is_on_time(d))
             rate = off_time / c[4]
             confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-            points.append([c[0] / c[2], c[1] / c[2], rate * confidence])
+            points.append([c[0] / c[2], c[1] / c[2], rate, confidence])
         return points
 
     if metric in ("delay_median", "delay_std"):
@@ -933,7 +948,7 @@ def compute_metric_points(cells, metric):
                 delay_value = statistics.stdev(late) if c[4] > 1 else 0.0
             severity = min(delay_value / HEATMAP_SEVERITY_CAP_SEC, 1.0)
             confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-            points.append([c[0] / c[2], c[1] / c[2], severity * confidence])
+            points.append([c[0] / c[2], c[1] / c[2], severity, confidence])
         return points
 
     # metric == "delay" or "delay_mean" (default/fallback): mean lateness (seconds late,
@@ -950,7 +965,7 @@ def compute_metric_points(cells, metric):
             continue
         severity = min((c[3] / c[4]) / HEATMAP_SEVERITY_CAP_SEC, 1.0)
         confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-        points.append([c[0] / c[2], c[1] / c[2], severity * confidence])
+        points.append([c[0] / c[2], c[1] / c[2], severity, confidence])
     return points
 
 
@@ -1094,62 +1109,126 @@ HEATMAP_SCRIPT = """\
     }).addTo(map);
     const markers = new Map();
 
-    // One metric dropdown drives both heat layers at once, rather than a
-    // separate live+historical toggle pair per metric (6 checkboxes for
-    // density/delay/speed × live/historical was unmanageable). Each metric
-    // still gets its own live/historical colour-family pair — same idea as
-    // the original delay-only scheme — so the two active layers read as
-    // distinct from each other, but only one metric's pair is ever visible
-    // at a time.
+    // One metric dropdown drives both heat layers at once. Each metric gets
+    // its own live/historical ramp pair so the two layers stay
+    // distinguishable when both are on.
     //
-    // Each ramp now has 7 stops instead of 5, spread with more resolution
-    // in the upper-middle range (0.55-0.85) rather than jumping straight
-    // from "medium" to "darkest" — that jump was most of why hot areas all
-    // read as one flat dark blob instead of showing gradation. Paired with
-    // HEAT_MAX below (which stops a couple of overlapping points from
-    // instantly maxing out the ramp), distinct severities now land on
-    // visibly distinct stops instead of all piling onto the top colour.
-    // Hue families unchanged from the previous pass (red/violet,
-    // blue/orange, green/magenta — each live/hist pair colourblind-safe).
+    // Ramps are ColorBrewer sequential schemes: perceptually ordered with
+    // monotonic lightness, either one hue family or analogous neighbours
+    // (YlGnBu, YlOrRd as "semantic heat") — never a rainbow. Their
+    // near-white first stop is trimmed so the low end still reads against
+    // the light-grey basemap, and they're interpolated in OKLab (buildLut)
+    // rather than sRGB, which is what removes the flat, banded "solid
+    // colour" look of the old hand-picked 7-stop gradients.
+    const RAMPS = {
+      YlOrRd:  ['#ffeda0','#fed976','#feb24c','#fd8d3c','#fc4e2a','#e31a1c','#bd0026','#800026'],
+      PuBu:    ['#d0d1e6','#a6bddb','#74a9cf','#3690c0','#0570b0','#045a8d','#023858'],
+      YlGnBu:  ['#edf8b1','#c7e9b4','#7fcdbb','#41b6c4','#1d91c0','#225ea8','#253494','#081d58'],
+      RdPu:    ['#fcc5c0','#fa9fb5','#f768a1','#dd3497','#ae017e','#7a0177','#49006a'],
+      YlOrBr:  ['#fff7bc','#fee391','#fec44f','#fe9929','#ec7014','#cc4c02','#993404','#662506'],
+      BuPu:    ['#bfd3e6','#9ebcda','#8c96c6','#8c6bb1','#88419d','#810f7c','#4d004b'],
+      Oranges: ['#fdd0a2','#fdae6b','#fd8d3c','#f16913','#d94801','#a63603','#7f2704'],
+      Blues:   ['#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b'],
+      // Matplotlib "plasma", reversed and with its pale-yellow end dropped
+      // (too little contrast on the light basemap). Perceptually uniform,
+      // OKLab lightness strictly decreasing 0.79 -> 0.29, but with far more
+      // hue travel than a ColorBrewer ramp — that's what makes CBD
+      // (amber), arterials (orange), ~40 km/h roads (pink) and motorways
+      // (purple) read as clearly different classes on the speed map.
+      PlasmaR: ['#fca636','#f2844b','#e16462','#cc4778','#b12a90','#8f0da4','#6a00a8','#41049d','#0d0887'],
+    };
+    function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+    const toLin = c => { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+    const toSrgb = c => { const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055; return Math.round(Math.min(1, Math.max(0, v)) * 255); };
+    function rgbToOklab(rgb) {
+      const r = toLin(rgb[0]), g = toLin(rgb[1]), b = toLin(rgb[2]);
+      const l = Math.cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b);
+      const m = Math.cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b);
+      const q = Math.cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b);
+      return [0.2104542553*l + 0.7936177850*m - 0.0040720468*q,
+              1.9779984951*l - 2.4285922050*m + 0.4505937099*q,
+              0.0259040371*l + 0.7827717662*m - 0.8086757660*q];
+    }
+    function oklabToRgb(lab) {
+      const L = lab[0], a = lab[1], b = lab[2];
+      const l = Math.pow(L + 0.3963377774*a + 0.2158037573*b, 3);
+      const m = Math.pow(L - 0.1055613458*a - 0.0638541728*b, 3);
+      const q = Math.pow(L - 0.0894841775*a - 1.2914855480*b, 3);
+      return [toSrgb( 4.0767416621*l - 3.3077115913*m + 0.2309699292*q),
+              toSrgb(-1.2684380046*l + 2.6097574011*m - 0.3413193965*q),
+              toSrgb(-0.0041960863*l - 0.7034186147*m + 1.7076147010*q)];
+    }
+    // 256-entry RGB lookup table for a ramp, interpolated in OKLab.
+    const _lutCache = {};
+    function buildLut(name) {
+      if (_lutCache[name]) return _lutCache[name];
+      const labs = RAMPS[name].map(h => rgbToOklab(hexToRgb(h)));
+      const n = labs.length - 1, lut = new Uint8ClampedArray(256 * 3);
+      for (let i = 0; i < 256; i++) {
+        const t = i / 255 * n, k = Math.min(Math.floor(t), n - 1), f = t - k, A = labs[k], B = labs[k + 1];
+        lut.set(oklabToRgb([A[0] + (B[0]-A[0])*f, A[1] + (B[1]-A[1])*f, A[2] + (B[2]-A[2])*f]), i * 3);
+      }
+      return (_lutCache[name] = lut);
+    }
+    // Gradient-stop object ({pos: 'rgb(...)'}) sampled from the OKLab LUT,
+    // for the legend bar and for Leaflet.heat (density), so both match the
+    // field layer's colours exactly.
+    function rampStops(name, n = 11) {
+      const lut = buildLut(name), o = {};
+      for (let i = 0; i < n; i++) {
+        const t = i / (n - 1), j = Math.round(t * 255) * 3;
+        o[t.toFixed(3)] = `rgb(${lut[j]},${lut[j+1]},${lut[j+2]})`;
+      }
+      return o;
+    }
+
+    // Keep these two in sync with their server-side counterparts
+    // (HEATMAP_SEVERITY_CAP_SEC, HEATMAP_SPEED_CAP_KMH) so the live and
+    // historical legends mean the same thing for the same metric.
+    const SEVERITY_CAP_MIN = 10;
+    const SPEED_CAP_KMH = 80;
+
+    // kind 'field' = averaged value field (FieldLayer) — colour is the
+    // local confidence-weighted MEAN of the metric, opacity is how much
+    // data backs it, so a busy street can't look worse/faster just by
+    // having more readings. kind 'sum' = classic additive heatmap
+    // (Leaflet.heat), which is exactly right for density and only density.
+    const DELAY_TICKS = ['0', '2.5', '5', '7.5', `${SEVERITY_CAP_MIN}+ min`];
     const METRICS = {
       delay: {
-                label: 'Delay mean',
-        liveGradient:  { 0.0:'#f7e9e9', 0.15:'#f0c9c8', 0.35:'#e69795', 0.55:'#dd6664', 0.7:'#cf3d3b', 0.85:'#b21f1d', 1.0:'#7a0f0e' }, // red
-        histGradient:  { 0.0:'#eeecf5', 0.15:'#d6d0ea', 0.35:'#b3a7d9', 0.55:'#8f7ec7', 0.7:'#6c58ad', 0.85:'#4c3a8a', 1.0:'#2c2160' }, // violet
+        label: 'Delay mean', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
         liveTitle: 'Live snapshot — current lateness',
-                histTitle: 'Historical window — mean lateness',
-        ticks: ['0 min late', 'SEVERITY_CAP+ min late'],
+        histTitle: 'Historical window — mean lateness (min)',
+        ticks: DELAY_TICKS,
       },
       density: {
-        label: 'Density',
-        liveGradient:  { 0.0:'#e3eefc', 0.15:'#c2ddf8', 0.35:'#93c1f0', 0.55:'#5da0e3', 0.7:'#2f7fd0', 0.85:'#1a5fa8', 1.0:'#0c3d73' }, // blue
-        histGradient:  { 0.0:'#fcece3', 0.15:'#f8d3bd', 0.35:'#f2af86', 0.55:'#ec8a57', 0.7:'#df662f', 0.85:'#b8481a', 1.0:'#7f2f0e' }, // orange
+        label: 'Density', kind: 'sum', hist: 'Oranges', live: 'Blues',
         liveTitle: 'Live snapshot — vehicle density',
         histTitle: 'Historical window — vehicle density',
         ticks: ['fewer pings', 'more pings'],
       },
       speed: {
-        label: 'Speed',
-        liveGradient:  { 0.0:'#e6f7e6', 0.15:'#c5ecc5', 0.35:'#98d998', 0.55:'#69c069', 0.7:'#3c9e3c', 0.85:'#217a21', 1.0:'#0f4f0f' }, // green
-        histGradient:  { 0.0:'#f8e9f0', 0.15:'#f0c8dd', 0.35:'#e498bf', 0.55:'#d669a2', 0.7:'#c2417f', 0.85:'#9c235f', 1.0:'#671041' }, // magenta
-        liveTitle: 'Live snapshot — current speed',
-        histTitle: 'Historical window — mean speed',
-        ticks: ['0 km/h', 'SPEED_CAP+ km/h'],
+        label: 'Speed', kind: 'field', hist: 'PlasmaR', live: 'YlGnBu',
+        liveTitle: 'Live snapshot — current speed (km/h)',
+        histTitle: 'Historical window — mean speed (km/h)',
+        ticks: ['0', '20', '40', '60', `${SPEED_CAP_KMH}+`],
+      },
+      // % of readings outside the TfNSW on-time KPI window (0:59 early to
+      // 5:59 late) — i.e. 1 − on-time %. From Liha's changes.
+      frequency: {
+        label: 'Not on time %', kind: 'field', hist: 'YlOrBr', live: 'BuPu',
+        liveTitle: 'Live snapshot — currently not on time',
+        histTitle: 'Historical window — % of readings not on time',
+        ticks: ['0%', '25%', '50%', '75%', '100%'],
       },
     };
-        METRICS.delay_mean = { ...METRICS.delay, label: 'Delay mean' };
-        METRICS.delay_median = { ...METRICS.delay, label: 'Delay median', histTitle: 'Historical window — median lateness' };
-        METRICS.delay_std = { ...METRICS.delay, label: 'Delay std deviation', histTitle: 'Historical window — delay standard deviation' };
-    // % of readings outside the TfNSW on-time KPI window (0:59 early to
-    // 5:59 late) — i.e. 1 − on-time %. From Liha's changes.
-    METRICS.frequency = {
-      label: 'Not on time %',
-      liveGradient:  { 0.0:'#fdf3e3', 0.15:'#fadfb0', 0.35:'#f5c473', 0.55:'#eea53a', 0.7:'#d6841a', 0.85:'#a8630f', 1.0:'#6e3f08' }, // amber
-      histGradient:  { 0.0:'#e6f0f5', 0.15:'#c3ddea', 0.35:'#95c2da', 0.55:'#66a1c4', 0.7:'#3d7fa9', 0.85:'#245e83', 1.0:'#123c56' }, // teal-blue
-      liveTitle: 'Live snapshot — currently not on time',
-      histTitle: 'Historical window — % of readings not on time',
-      ticks: ['0% off-time', '100% off-time'],
-    };
+    METRICS.delay_mean = { ...METRICS.delay, label: 'Delay mean' };
+    METRICS.delay_median = { ...METRICS.delay, label: 'Delay median', histTitle: 'Historical window — median lateness (min)' };
+    METRICS.delay_std = { ...METRICS.delay, label: 'Delay std deviation', histTitle: 'Historical window — delay standard deviation (min)' };
+    for (const cfg of Object.values(METRICS)) {
+      cfg.liveGradient = rampStops(cfg.live);
+      cfg.histGradient = rampStops(cfg.hist);
+    }
     const DEFAULT_METRIC = 'delay';
     let currentMetric = DEFAULT_METRIC;
     let lastVehicles = [];
@@ -1157,14 +1236,6 @@ HEATMAP_SCRIPT = """\
     // outline-coloured, bearing-rotated arrowhead with no label/background,
     // for a less cluttered view when many buses are on screen at once.
     let markerStyle = 'pill';
-
-    // Keep these two in sync with their server-side counterparts
-    // (HEATMAP_SEVERITY_CAP_SEC, HEATMAP_SPEED_CAP_KMH) so the live and
-    // historical legends mean the same thing for the same metric.
-    const SEVERITY_CAP_MIN = 10;
-    const SPEED_CAP_KMH = 60;
-    METRICS.delay.ticks[1] = `${SEVERITY_CAP_MIN}+ min late`;
-    METRICS.speed.ticks[1] = `${SPEED_CAP_KMH}+ km/h`;
 
     const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
     // Kept small — this is only a floor so a point never shrinks to an
@@ -1278,20 +1349,151 @@ HEATMAP_SCRIPT = """\
       ctx.restore();
     }
     const MaskedHeatLayer = L.HeatLayer.extend({
+      // L.latLng() only accepts 2- or 3-element arrays (returns null for a
+      // 4th element), so field-metric points [lat, lon, value, confidence]
+      // carried over during a metric switch would crash Leaflet.heat.
+      setLatLngs(pts) {
+        return L.HeatLayer.prototype.setLatLngs.call(this, (pts || []).map(p => p.length > 3 ? [p[0], p[1], p[2]] : p));
+      },
       _redraw() {
         L.HeatLayer.prototype._redraw.call(this);
         applyRouteMask(this);
       },
     });
 
-    function buildHeatLayer(gradient) {
+    // ---- Averaged value field (all non-density metrics) ----
+    // Leaflet.heat ADDS overlapping points before colouring, so on a value
+    // metric (speed, delay) a street with many closely spaced readings
+    // stacks up to the darkest colour regardless of the values themselves:
+    // Elizabeth St (mean ~9 km/h, ~200 tightly packed cells) rendered darker
+    // than the Harbour Bridge (~42 km/h, one reading per cell) on the speed
+    // map, and the delay maps had the same bias toward busy streets.
+    //
+    // FieldLayer instead computes, per pixel, a Gaussian-weighted MEAN of
+    // nearby cells (normalised convolution): colour = sum(k*c*v) / sum(k*c),
+    // where v is the cell's normalised value, c its confidence (sample
+    // count / HEATMAP_CONFIDENT_SAMPLES, capped at 1) and k the kernel.
+    // Opacity comes from sum(k*c) — how much data backs that pixel — so
+    // thin evidence fades out instead of being painted at full strength,
+    // but it never changes the colour. Rendered on a coarse grid (~6 cells
+    // per kernel radius) and upscaled with smoothing, so cost stays flat
+    // across zoom levels.
+    const FIELD_RADIUS_M = 160;
+    const FieldLayer = L.Layer.extend({
+      // fullSupport: summed kernel*confidence at which a pixel reaches
+      // maxOpacity. 0.4 ~ one or two readings at the pixel; most cells only
+      // have one, and a higher threshold left the whole map washed out.
+      options: { radiusM: FIELD_RADIUS_M, maxOpacity: 0.95, fullSupport: 0.4, ramp: 'YlOrRd' },
+      initialize(points, options) {
+        L.setOptions(this, options);
+        this._pts = points || [];
+        this._lut = buildLut(this.options.ramp);
+      },
+      setLatLngs(points) { this._pts = points || []; return this.redraw(); },
+      // Leaflet.heat API parity: updateHeatRadii() passes radius/blur/maxZoom
+      // to every heat layer on zoom; none apply here (moveend redraws).
+      setOptions(o) { L.setOptions(this, o); return this; },
+      redraw() {
+        if (this._map && !this._frame && !this._map._animating) {
+          this._frame = L.Util.requestAnimFrame(this._redraw, this);
+        }
+        return this;
+      },
+      onAdd(map) {
+        this._map = map;
+        const c = this._canvas = L.DomUtil.create('canvas', 'leaflet-heatmap-layer leaflet-layer');
+        const animated = map.options.zoomAnimation && L.Browser.any3d;
+        L.DomUtil.addClass(c, 'leaflet-zoom-' + (animated ? 'animated' : 'hide'));
+        map.getPanes().overlayPane.appendChild(c);
+        map.on('moveend', this._reset, this);
+        if (animated) map.on('zoomanim', this._animateZoom, this);
+        this._reset();
+      },
+      onRemove(map) {
+        map.getPanes().overlayPane.removeChild(this._canvas);
+        map.off('moveend', this._reset, this);
+        map.off('zoomanim', this._animateZoom, this);
+        if (this._frame) { L.Util.cancelAnimFrame(this._frame); this._frame = null; }
+      },
+      _reset() {
+        L.DomUtil.setPosition(this._canvas, this._map.containerPointToLayerPoint([0, 0]));
+        const size = this._map.getSize();
+        if (this._canvas.width !== size.x) this._canvas.width = size.x;
+        if (this._canvas.height !== size.y) this._canvas.height = size.y;
+        this._redraw();
+      },
+      _animateZoom(e) {
+        const scale = this._map.getZoomScale(e.zoom);
+        const offset = this._map._getCenterOffset(e.center)._multiplyBy(-scale).subtract(this._map._getMapPanePos());
+        L.DomUtil.setTransform(this._canvas, offset, scale);
+      },
+      _redraw() {
+        this._frame = null;
+        const m = this._map;
+        if (!m || !this._canvas) return;
+        const canvas = this._canvas, ctx = canvas.getContext('2d');
+        const W = canvas.width, H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+        if (!this._pts.length) return;
+
+        const R = Math.max(metresToPixels(this.options.radiusM, m.getZoom(), m.getCenter().lat), 3);
+        const ds = Math.max(1, R / 6);                 // grid cell size (px)
+        const gw = Math.ceil(W / ds) + 1, gh = Math.ceil(H / ds) + 1;
+        const r = R / ds, r2 = r * r, inv2s2 = 1 / (2 * (r / 2) * (r / 2));  // sigma = R/2, cut at R
+        const num = new Float32Array(gw * gh), den = new Float32Array(gw * gh);
+        for (const p of this._pts) {
+          const c = p.length > 3 ? p[3] : 1;
+          if (!(c > 0)) continue;
+          const pt = m.latLngToContainerPoint([p[0], p[1]]);
+          const gx = pt.x / ds, gy = pt.y / ds;
+          if (gx < -r || gy < -r || gx > gw + r || gy > gh + r) continue;
+          const v = Math.min(Math.max(p[2], 0), 1);
+          const x0 = Math.max(0, Math.ceil(gx - r)), x1 = Math.min(gw - 1, Math.floor(gx + r));
+          const y0 = Math.max(0, Math.ceil(gy - r)), y1 = Math.min(gh - 1, Math.floor(gy + r));
+          for (let y = y0; y <= y1; y++) {
+            const dy = y - gy, row = y * gw;
+            for (let x = x0; x <= x1; x++) {
+              const dx = x - gx, d2 = dx * dx + dy * dy;
+              if (d2 > r2) continue;
+              const k = Math.exp(-d2 * inv2s2) * c;
+              num[row + x] += k * v;
+              den[row + x] += k;
+            }
+          }
+        }
+
+        // (not `_off` — that's an internal L.Evented method name)
+        const off = this._gridCanvas || (this._gridCanvas = document.createElement('canvas'));
+        off.width = gw; off.height = gh;
+        const octx = off.getContext('2d');
+        const img = octx.createImageData(gw, gh), d = img.data, lut = this._lut;
+        const full = this.options.fullSupport, maxA = this.options.maxOpacity * 255;
+        for (let i = 0; i < gw * gh; i++) {
+          const w = den[i];
+          if (w < 1e-3) continue;
+          const li = Math.round(Math.min(Math.max(num[i] / w, 0), 1) * 255) * 3, j = i * 4;
+          d[j] = lut[li]; d[j + 1] = lut[li + 1]; d[j + 2] = lut[li + 2];
+          d[j + 3] = Math.min(1, w / full) * maxA;
+        }
+        octx.putImageData(img, 0, 0);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(off, -ds / 2, -ds / 2, gw * ds, gh * ds);  // grid cell i is centred on pixel i*ds
+        applyRouteMask(this);
+      },
+    });
+
+    function buildHeatLayer(metric, which) {
+      const cfg = METRICS[metric];
+      if (cfg.kind === 'field') return new FieldLayer([], { ramp: cfg[which] });
       return new MaskedHeatLayer([], {
         radius: currentHeatRadius, blur: currentHeatBlur, max: HEAT_MAX,
-        minOpacity: HEAT_MIN_OPACITY, maxZoom: map.getZoom(), gradient,
+        minOpacity: HEAT_MIN_OPACITY, maxZoom: map.getZoom(),
+        gradient: which === 'live' ? cfg.liveGradient : cfg.histGradient,
       });
     }
-    let heatLayer = buildHeatLayer(METRICS[DEFAULT_METRIC].liveGradient);
-    let histHeatLayer = buildHeatLayer(METRICS[DEFAULT_METRIC].histGradient);
+    let heatLayer = buildHeatLayer(DEFAULT_METRIC, 'live');
+    let histHeatLayer = buildHeatLayer(DEFAULT_METRIC, 'hist');
     let liveHeatData = [];
     let histHeatData = [];
 
@@ -1326,14 +1528,14 @@ HEATMAP_SCRIPT = """\
       [HIST_LAYER_NAME]: histHeatLayer
     }, { collapsed:false }).addTo(map);
 
-    // Swap `oldLayer` out for a freshly-built one with `newGradient`,
+    // Swap `oldLayer` out for a freshly-built one for `metric`,
     // carrying over its current data and visibility (checked/unchecked in
     // the layer control) and keeping the control's own bookkeeping in
     // sync. Returns the new layer — callers must reassign their
     // heatLayer/histHeatLayer binding to it.
-    function swapHeatLayer(oldLayer, newGradient, layerName, currentData) {
+    function swapHeatLayer(oldLayer, metric, which, layerName, currentData) {
       const wasVisible = map.hasLayer(oldLayer);
-      const newLayer = buildHeatLayer(newGradient);
+      const newLayer = buildHeatLayer(metric, which);
       newLayer.setLatLngs(currentData);
       layersControl.removeLayer(oldLayer);
       if (wasVisible) map.removeLayer(oldLayer);
@@ -1354,7 +1556,7 @@ HEATMAP_SCRIPT = """\
       div.hidden = true;
       div.innerHTML = `<div class="heat-legend-title"></div>
         <div class="heat-legend-bar"></div>
-        <div class="heat-legend-ticks"><span></span><span></span></div>`;
+        <div class="heat-legend-ticks"></div>`;
       layersControl.getContainer().appendChild(div);
       return div;
     }
@@ -1372,9 +1574,12 @@ HEATMAP_SCRIPT = """\
     function fillLegend(div, gradient, title, ticks) {
       div.querySelector('.heat-legend-title').textContent = title;
       div.querySelector('.heat-legend-bar').style.background = gradientCss(gradient);
-      const [t0, t1] = div.querySelectorAll('.heat-legend-ticks span');
-      t0.textContent = ticks[0];
-      t1.textContent = ticks[1];
+      const tickRow = div.querySelector('.heat-legend-ticks');
+      tickRow.replaceChildren(...ticks.map(t => {
+        const span = document.createElement('span');
+        span.textContent = t;
+        return span;
+      }));
     }
 
     const metricPickerDiv = document.createElement('div');
@@ -1565,8 +1770,8 @@ HEATMAP_SCRIPT = """\
     function applyMetric(metric) {
       currentMetric = metric;
       const cfg = METRICS[metric];
-      heatLayer = swapHeatLayer(heatLayer, cfg.liveGradient, LIVE_LAYER_NAME, liveHeatData);
-      histHeatLayer = swapHeatLayer(histHeatLayer, cfg.histGradient, HIST_LAYER_NAME, histHeatData);
+      heatLayer = swapHeatLayer(heatLayer, metric, 'live', LIVE_LAYER_NAME, liveHeatData);
+      histHeatLayer = swapHeatLayer(histHeatLayer, metric, 'hist', HIST_LAYER_NAME, histHeatData);
       fillLegend(liveLegend, cfg.liveGradient, cfg.liveTitle, cfg.ticks);
       fillLegend(histLegend, cfg.histGradient, cfg.histTitle, cfg.ticks);
       updateLiveHeatFromVehicles(lastVehicles);
