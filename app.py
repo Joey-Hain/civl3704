@@ -121,6 +121,7 @@ Setup:
 
 import codecs
 import csv
+import gzip
 import io
 import json
 import os
@@ -139,7 +140,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 from google.transit import gtfs_realtime_pb2
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
@@ -231,6 +232,16 @@ VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
 HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
+
+# Route-mask geometry: a de-duplicated bus road network within ~12 km of the
+# CBD, built weekly from the TfNSW GTFS shapes.txt by gtfs-r-scrape's
+# build_route_shapes.py (the scrape repo holds the API key as a secret, and
+# building it there keeps a ~100MB+ schedule parse off this 512MB instance).
+# The dashboard fetches it once per page load from /api/route_shapes and
+# uses it to clip the heat layers to corridors — see applyRouteMask() in
+# HEATMAP_SCRIPT.
+ROUTE_SHAPES_URL = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/shapes/route_shapes.json"
+ROUTE_SHAPES_CACHE_TTL_SECONDS = 6 * 3600
 
 # /project page: a Leaflet view locked to the exact real-world box
 # TransportLab's smart-city rig projects onto its physical table model, so
@@ -611,6 +622,10 @@ _heatmap_cells_cache = {}
 _rows_lock = threading.Lock()
 _vehicles_lock = threading.Lock()
 _heatmap_lock = threading.Lock()
+# Cached as gzipped bytes: it's served verbatim, and pre-compressing once
+# shrinks a few hundred kB of integer JSON to well under a third.
+_route_shapes_cache = {"gz": None, "fetched_at": None}
+_route_shapes_lock = threading.Lock()
 
 
 def get_all_rows_cached():
@@ -1196,8 +1211,81 @@ HEATMAP_SCRIPT = """\
     // guaranteed to (re)initialise the canvas with the new options, so
     // metric switches no longer depend on a third-party plugin's internal
     // caching behaviour at all.
+    // ---- Route mask: clip both heat layers to bus corridors ----
+    // The heat layers draw round blobs (HEAT_RADIUS_M) around each cell,
+    // which smears delay across blocks no bus ever drives through. With
+    // the mask on, after Leaflet.heat paints its canvas we stroke the bus
+    // road network (from /api/route_shapes — TfNSW GTFS shapes, built
+    // weekly by gtfs-r-scrape) at ±routeMaskHalfWidthM using the
+    // 'destination-in' composite: heat survives only where a route line
+    // was drawn, so hot areas read as corridors. Line width is set in
+    // real metres per redraw, so the corridor stays the same ground width
+    // at every zoom. If the shapes file isn't available the mask is
+    // simply skipped and the heatmap renders unclipped, as before.
+    let routeLines = null;
+    let routeMaskHalfWidthM = 25;  // 0 = off
+    function decodeRouteLines(lines) {
+      // Each line is flat [dlat, dlon, ...] in 1e-5 degrees, delta-encoded.
+      return lines.map(enc => {
+        const pts = new Float64Array(enc.length);
+        let lat = 0, lon = 0, s = 90, n = -90, w = 180, e = -180;
+        for (let i = 0; i < enc.length; i += 2) {
+          lat += enc[i]; lon += enc[i + 1];
+          const la = lat / 1e5, lo = lon / 1e5;
+          pts[i] = la; pts[i + 1] = lo;
+          if (la < s) s = la;
+          if (la > n) n = la;
+          if (lo < w) w = lo;
+          if (lo > e) e = lo;
+        }
+        return { pts, s, n, w, e };
+      });
+    }
+    function applyRouteMask(layer) {
+      if (!routeLines || routeMaskHalfWidthM <= 0 || !layer._map || !layer._canvas) return;
+      const m = layer._map;
+      const canvas = layer._canvas;
+      const ctx = canvas.getContext('2d');
+      const b = m.getBounds().pad(0.1);
+      const S = b.getSouth(), N = b.getNorth(), W = b.getWest(), E = b.getEast();
+      ctx.save();
+      // simpleheat leaves globalAlpha at its last point's opacity (often
+      // minOpacity) — reset it, or the mask stroke itself is translucent
+      // and 'destination-in' fades the corridors it's meant to keep.
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'destination-in';
+      ctx.lineWidth = Math.max(metresToPixels(2 * routeMaskHalfWidthM, m.getZoom(), m.getCenter().lat), 2);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = '#000';
+      ctx.beginPath();
+      let drawn = 0;
+      for (const ln of routeLines) {
+        if (ln.n < S || ln.s > N || ln.e < W || ln.w > E) continue;  // off-screen
+        const p = ln.pts;
+        // Leaflet.heat's canvas is pinned to container pixel (0,0) and
+        // plots its own points with latLngToContainerPoint — same here.
+        let pt = m.latLngToContainerPoint([p[0], p[1]]);
+        ctx.moveTo(pt.x, pt.y);
+        for (let i = 2; i < p.length; i += 2) {
+          pt = m.latLngToContainerPoint([p[i], p[i + 1]]);
+          ctx.lineTo(pt.x, pt.y);
+        }
+        drawn++;
+      }
+      // No route in view means nothing should survive the mask.
+      if (drawn) ctx.stroke(); else ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+    }
+    const MaskedHeatLayer = L.HeatLayer.extend({
+      _redraw() {
+        L.HeatLayer.prototype._redraw.call(this);
+        applyRouteMask(this);
+      },
+    });
+
     function buildHeatLayer(gradient) {
-      return L.heatLayer([], {
+      return new MaskedHeatLayer([], {
         radius: currentHeatRadius, blur: currentHeatBlur, max: HEAT_MAX,
         minOpacity: HEAT_MIN_OPACITY, maxZoom: map.getZoom(), gradient,
       });
@@ -1301,6 +1389,43 @@ HEATMAP_SCRIPT = """\
       </select>`;
     layersControl.getContainer().appendChild(metricPickerDiv);
     L.DomEvent.disableClickPropagation(metricPickerDiv);
+
+    const maskPickerDiv = document.createElement('div');
+    maskPickerDiv.id = 'routeMaskPicker';
+    maskPickerDiv.innerHTML = `Clip to bus routes: <select id="routeMaskSelect">
+        <option value="0">Off</option>
+        <option value="15">\u00b115 m</option>
+        <option value="25" selected>\u00b125 m</option>
+        <option value="50">\u00b150 m</option>
+        <option value="100">\u00b1100 m</option>
+      </select> <span id="routeMaskStatus">(loading\u2026)</span>`;
+    layersControl.getContainer().appendChild(maskPickerDiv);
+    L.DomEvent.disableClickPropagation(maskPickerDiv);
+    document.getElementById('routeMaskSelect').addEventListener('change', e => {
+      routeMaskHalfWidthM = Number(e.target.value);
+      heatLayer.redraw();
+      histHeatLayer.redraw();
+    });
+    async function loadRouteShapes() {
+      const st = document.getElementById('routeMaskStatus');
+      try {
+        const res = await fetch('/api/route_shapes');
+        const data = await res.json();
+        if (!data.lines || !data.lines.length) {
+          st.textContent = '(unavailable)';
+          st.title = data.error || 'No route shapes';
+          return;
+        }
+        routeLines = decodeRouteLines(data.lines);
+        st.textContent = '';
+        st.title = '';
+        heatLayer.redraw();
+        histHeatLayer.redraw();
+      } catch (e) {
+        st.textContent = '(unavailable)';
+        st.title = String(e);
+      }
+    }
 
     const markerStylePickerDiv = document.createElement('div');
     markerStylePickerDiv.id = 'markerStylePicker';
@@ -1450,6 +1575,7 @@ HEATMAP_SCRIPT = """\
     document.getElementById('heatMetricSelect').addEventListener('change', e => applyMetric(e.target.value));
 
     applyMetric(DEFAULT_METRIC);
+    loadRouteShapes();
 
     // The on-time outline colour (OUTLINE_ON_TIME, server-side) is white —
     // fine as a thin ring around a solid blue pill, but used as an entire
@@ -1568,8 +1694,9 @@ PAGE = """
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
   .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
-  #histWindowPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
-  #histWindowPicker select { font:inherit; }
+  #histWindowPicker, #histPeriodPicker, #routeMaskPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
+  #histWindowPicker select, #histPeriodPicker select, #routeMaskPicker select { font:inherit; }
+  #routeMaskStatus { color:#888; }
   #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
   .heat-legend { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:6px 22px 2px; color:#333; }
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
@@ -1681,8 +1808,9 @@ PROJECT_PAGE = """
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
   .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
-  #histWindowPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
-  #histWindowPicker select { font:inherit; }
+  #histWindowPicker, #histPeriodPicker, #routeMaskPicker { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:4px 0 2px 22px; }
+  #histWindowPicker select, #histPeriodPicker select, #routeMaskPicker select { font:inherit; }
+  #routeMaskStatus { color:#888; }
   #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
   .heat-legend { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:6px 22px 2px; color:#333; }
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
@@ -1864,6 +1992,46 @@ def api_vehicles():
     data = compute_delay_data(request.args)
     vehicles, map_error = compute_vehicles(data)
     return jsonify({"vehicles": vehicles, "error": map_error})
+
+
+def get_route_shapes_gz():
+    """Gzipped route_shapes.json bytes, or None if not built/fetchable yet.
+    Failures aren't cached, so the mask turns on as soon as the file exists."""
+    now = time.monotonic()
+    if _route_shapes_cache["gz"] and now - _route_shapes_cache["fetched_at"] < ROUTE_SHAPES_CACHE_TTL_SECONDS:
+        return _route_shapes_cache["gz"]
+    with _route_shapes_lock:
+        now = time.monotonic()
+        if _route_shapes_cache["gz"] and now - _route_shapes_cache["fetched_at"] < ROUTE_SHAPES_CACHE_TTL_SECONDS:
+            return _route_shapes_cache["gz"]
+        try:
+            r = requests.get(ROUTE_SHAPES_URL, timeout=30)
+            if r.status_code != 200:
+                print(f"[shapes] GET {ROUTE_SHAPES_URL} -> HTTP {r.status_code}", flush=True)
+                return _route_shapes_cache["gz"]  # keep serving a stale copy if we have one
+            json.loads(r.content)  # don't cache a broken file
+        except (requests.RequestException, ValueError) as e:
+            print(f"[shapes] fetch failed: {e}", flush=True)
+            return _route_shapes_cache["gz"]
+        _route_shapes_cache.update(gz=gzip.compress(r.content, 6), fetched_at=now)
+        print(f"[shapes] cached {len(r.content) / 1e3:.0f} kB "
+              f"({len(_route_shapes_cache['gz']) / 1e3:.0f} kB gzipped)", flush=True)
+        return _route_shapes_cache["gz"]
+
+
+@app.route("/api/route_shapes")
+def api_route_shapes():
+    gz = get_route_shapes_gz()
+    if gz is None:
+        return jsonify({"lines": [], "error": "Route shapes not built yet"})
+    if "gzip" in request.headers.get("Accept-Encoding", ""):
+        resp = Response(gz, mimetype="application/json")
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Vary"] = "Accept-Encoding"
+    else:
+        resp = Response(gzip.decompress(gz), mimetype="application/json")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
 
 
 @app.route("/api/heatmap")
