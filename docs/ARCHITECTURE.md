@@ -38,4 +38,5 @@ The app is organised into three main layers:
 - Historical heatmaps support one-hour, 24-hour, seven-day and 30-day (default) windows — daily CSVs are downloaded in parallel and parsed serially into one set of cells (~3 s for 30 days), a time-of-day filter (AM peak, midday, PM peak, evening) bucketed during the same aggregation pass, and refresh automatically every five minutes.
 - JavaScript polls vehicle data every 15 seconds without reloading the tables.
 - The `/project` view provides a non-interactive map locked to the TransportLab physical model's geographic bounds ("Projector mode" in the UI).
+- Projector calibration: a corner-pin warp (homography applied as a CSS `matrix3d` to the map) maps the model's four corners onto four draggable crosshairs, with an SVG mask blacking out everything outside them; saved per browser and shareable as a `?cal=` link.
 - HTML, CSS and JavaScript provide the dashboard layout, filters, layer controls, legends, popups and loading/error states.
