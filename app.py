@@ -2317,8 +2317,8 @@ PROJECT_PAGE = """
   :root { --fill-blue: {{ color_fill }}; }
   * { box-sizing: border-box; }
   html, body { height:100%; }
-  body { margin:0; background:#e5e3dc; }
-  #dashmap { position:absolute; inset:0; }
+  body { margin:0; background:#000; overflow:hidden; }
+  #dashmap { position:absolute; inset:0; transform-origin:0 0; }
   .bus-marker { position:relative; width:56px; height:24px; }
   .bus-pill { position:absolute; top:0; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:4px; background:var(--fill-blue); color:#fff; font:600 11px/1 -apple-system, Helvetica, Arial, sans-serif; padding:5px 7px; border-radius:7px; border:2.5px solid #888; box-shadow:0 1px 3px rgba(0,0,0,0.4); white-space:nowrap; }
   .bus-arrow { flex:0 0 auto; font-size:12px; line-height:1; display:inline-block; color:#fff; }
@@ -2348,7 +2348,28 @@ PROJECT_PAGE = """
   .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
   #heatLoadingBanner { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:900; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
-  .project-mask { position:absolute; background:#000; z-index:850; pointer-events:none; }
+  /* Calibration: black everywhere outside the four corner crosshairs, the
+     crosshairs themselves (calibration mode only) and the help box. */
+  #projMask { position:fixed; inset:0; width:100%; height:100%; z-index:850; pointer-events:none; }
+  #projControls { position:fixed; top:10px; right:10px; z-index:1100; }
+  #projControls .leaflet-control-layers { margin:0; }
+  .cal-handle { position:fixed; width:0; height:0; z-index:1200; cursor:move; display:none; }
+  body.calibrating .cal-handle { display:block; }
+  body.calibrating { user-select:none; -webkit-user-select:none; }
+  body.calibrating #projControls { display:none; }  /* menu would cover the NE crosshair */
+  .cal-handle svg { position:absolute; left:-40px; top:-40px; overflow:visible; }
+  .cal-handle .cal-label { position:absolute; font:700 13px/1 -apple-system, Helvetica, Arial, sans-serif; color:#fff; background:#d0021b; padding:3px 6px; border-radius:4px; white-space:nowrap; }
+  /* labels sit on the inward side of each corner so they stay on screen */
+  .cal-handle.c-nw .cal-label { left:12px; top:12px; }
+  .cal-handle.c-ne .cal-label { right:12px; top:12px; }
+  .cal-handle.c-se .cal-label { right:12px; bottom:12px; }
+  .cal-handle.c-sw .cal-label { left:12px; bottom:12px; }
+  .cal-handle.selected .cal-label { background:#0a84ff; }
+  #calHelp { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:1150; display:none; max-width:440px; background:rgba(17,17,17,0.9); color:#fff; font:13px/1.45 -apple-system, Helvetica, Arial, sans-serif; padding:14px 16px; border-radius:10px; }
+  body.calibrating #calHelp { display:block; }
+  #calHelp b { color:#9fd0ff; }
+  #calHelp input { width:100%; margin-top:6px; font:11px/1.3 ui-monospace, Menlo, monospace; }
+  #calHelp button { margin-top:8px; margin-right:6px; font:inherit; cursor:pointer; }
   body.menu-hidden .leaflet-control-layers, body.menu-hidden #heatLoadingBanner { display:none !important; }
   .heat-panel .hp-hide { display:block; width:100%; margin-top:10px; font:inherit; cursor:pointer; }
   .menu-hint { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; opacity:0; transition:opacity 0.4s; pointer-events:none; }
@@ -2382,40 +2403,201 @@ PROJECT_PAGE = """
     map.setMaxBounds(PROJECT_BOUNDS);
 """ + HEATMAP_SCRIPT + """
 
-    // This view gets fed straight to a physical projector, so anything
-    // the browser shows outside the calibrated real-world box must be
-    // solid black, not map/tiles/ocean colour — otherwise the projector
-    // paints stray imagery past the edge of the physical model. The map
-    // itself is fully locked (no pan/zoom at all — see above), but on a
-    // browser window whose aspect ratio doesn't exactly match the box's,
-    // fitBounds still leaves a margin on one axis (letterboxing) — that's
-    // what these four bars blank out. Recomputed on 'resize' (in case the
-    // window/output resolution changes) and on the initial move/zoom
-    // fitBounds itself fires, so it's exact regardless of window size.
-    const maskTop = document.createElement('div');
-    const maskBottom = document.createElement('div');
-    const maskLeft = document.createElement('div');
-    const maskRight = document.createElement('div');
-    [maskTop, maskBottom, maskLeft, maskRight].forEach(el => {
-      el.className = 'project-mask';
-      document.body.appendChild(el);
-    });
-    function updateProjectMask() {
-      const size = map.getSize();
+    // ---- Projector calibration (corner pin) ----
+    // The physical model's four corners are PROJECT_BOUNDS' corners. With no
+    // calibration the page behaves as before: the box fills the window and
+    // everything outside it is black. In calibration mode (C, or the
+    // "Calibrate" button) a crosshair sits on each model corner; drag them
+    // (or select one and use the arrow keys, Shift = 10 px) until each lands
+    // on the matching corner of the physical model. The map is then warped
+    // with a perspective transform so the box's corners map exactly onto the
+    // four crosshairs (correcting position, scale, rotation and keystone), and
+    // everything outside the quadrilateral they form is solid black, so
+    // nothing is projected past the model.
+    //
+    // Saved per browser (localStorage) as fractions of the window, and
+    // shareable as ?cal=... (the help box shows the full link — bookmark it on
+    // the projector laptop so a cleared browser can't lose the calibration).
+    // Exact at ground level; the model's buildings stand proud of the table,
+    // so align to street-level corners, not roof tops.
+    // Move the menu out of the map container so the warp doesn't skew it.
+    const projControls = document.createElement('div');
+    projControls.id = 'projControls';
+    document.body.appendChild(projControls);
+    projControls.appendChild(layersControl.getContainer());
+
+    const CORNERS = ['NW', 'NE', 'SE', 'SW'];
+    const CAL_KEY = 'projector.calibration';
+    const mapEl = document.getElementById('dashmap');
+    let dst = null;        // [[x,y] x4] screen px, NW NE SE SW; null = uncalibrated
+    let selected = 0;
+
+    // Unwarped pixel corners of the model box (what the warp maps FROM).
+    function srcCorners() {
       const nw = map.latLngToContainerPoint(PROJECT_BOUNDS.getNorthWest());
       const se = map.latLngToContainerPoint(PROJECT_BOUNDS.getSouthEast());
-      const left = Math.max(0, Math.min(nw.x, size.x));
-      const top = Math.max(0, Math.min(nw.y, size.y));
-      const right = Math.max(0, Math.min(se.x, size.x));
-      const bottom = Math.max(0, Math.min(se.y, size.y));
-      maskTop.style.cssText    = `left:0; top:0; width:100%; height:${top}px;`;
-      maskBottom.style.cssText = `left:0; top:${bottom}px; width:100%; height:${Math.max(0, size.y - bottom)}px;`;
-      maskLeft.style.cssText   = `left:0; top:${top}px; width:${left}px; height:${Math.max(0, bottom - top)}px;`;
-      maskRight.style.cssText  = `left:${right}px; top:${top}px; width:${Math.max(0, size.x - right)}px; height:${Math.max(0, bottom - top)}px;`;
+      return [[nw.x, nw.y], [se.x, nw.y], [se.x, se.y], [nw.x, se.y]];
     }
-    map.on('move zoom resize', updateProjectMask);
-    updateProjectMask();
-    window.addEventListener('resize', () => { map.invalidateSize(); updateProjectMask(); });
+
+    // Homography H (3x3, h33 = 1) mapping 4 src points to 4 dst points:
+    // solve the 8x8 linear system by Gaussian elimination.
+    function homography(src, dstPts) {
+      const A = [], bv = [];
+      for (let i = 0; i < 4; i++) {
+        const [x, y] = src[i], [u, v] = dstPts[i];
+        A.push([x, y, 1, 0, 0, 0, -x * u, -y * u]); bv.push(u);
+        A.push([0, 0, 0, x, y, 1, -x * v, -y * v]); bv.push(v);
+      }
+      const n = 8;
+      for (let c = 0; c < n; c++) {
+        let piv = c;
+        for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+        [A[c], A[piv]] = [A[piv], A[c]]; [bv[c], bv[piv]] = [bv[piv], bv[c]];
+        if (Math.abs(A[c][c]) < 1e-12) return null;  // degenerate (e.g. three corners in a line)
+        for (let r = 0; r < n; r++) {
+          if (r === c) continue;
+          const f = A[r][c] / A[c][c];
+          if (!f) continue;
+          for (let k = c; k < n; k++) A[r][k] -= f * A[c][k];
+          bv[r] -= f * bv[c];
+        }
+      }
+      return bv.map((val, i) => val / A[i][i]);  // h11 h12 h13 h21 h22 h23 h31 h32
+    }
+
+    const svgNS = 'http://www.w3.org/2000/svg';
+    const maskSvg = document.createElementNS(svgNS, 'svg');
+    maskSvg.id = 'projMask';
+    const maskPath = document.createElementNS(svgNS, 'path');
+    maskPath.setAttribute('fill', '#000');
+    maskPath.setAttribute('fill-rule', 'evenodd');
+    maskSvg.appendChild(maskPath);
+    document.body.appendChild(maskSvg);
+
+    function currentQuad() { return dst || srcCorners(); }
+
+    function applyCalibration() {
+      const src = srcCorners();
+      let ok = true;
+      if (dst) {
+        const h = homography(src, dst);
+        if (h && h.every(Number.isFinite)) {
+          const [h11, h12, h13, h21, h22, h23, h31, h32] = h;
+          mapEl.style.transform = `matrix3d(${h11},${h21},0,${h31},${h12},${h22},0,${h32},0,0,1,0,${h13},${h23},0,1)`;
+        } else { ok = false; }
+      }
+      if (!dst || !ok) mapEl.style.transform = '';
+      // Black everywhere except inside the quadrilateral.
+      const W = window.innerWidth, H = window.innerHeight, q = currentQuad();
+      maskSvg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      maskPath.setAttribute('d', `M0 0H${W}V${H}H0Z M${q.map(p => p.join(' ')).join(' L')} Z`);
+      handles.forEach((hd, i) => {
+        hd.style.left = q[i][0] + 'px'; hd.style.top = q[i][1] + 'px';
+        hd.classList.toggle('selected', i === selected);
+      });
+      updateShareLink();
+    }
+
+    function saveCalibration() {
+      try {
+        if (dst) localStorage.setItem(CAL_KEY, JSON.stringify(toFractions(dst)));
+        else localStorage.removeItem(CAL_KEY);
+      } catch (e) { /* storage unavailable */ }
+    }
+    const toFractions = pts => pts.map(([x, y]) => [+(x / window.innerWidth).toFixed(5), +(y / window.innerHeight).toFixed(5)]);
+    const fromFractions = fr => fr.map(([fx, fy]) => [fx * window.innerWidth, fy * window.innerHeight]);
+    function loadCalibration() {
+      const param = new URLSearchParams(window.location.search).get('cal');
+      let fr = null;
+      if (param) {
+        const nums = param.split(',').map(Number);
+        if (nums.length === 8 && nums.every(Number.isFinite)) fr = [0, 2, 4, 6].map(i => [nums[i], nums[i + 1]]);
+      }
+      if (!fr) { try { fr = JSON.parse(localStorage.getItem(CAL_KEY) || 'null'); } catch (e) { fr = null; } }
+      return Array.isArray(fr) && fr.length === 4 ? fromFractions(fr) : null;
+    }
+
+    // Crosshair handles
+    const handles = CORNERS.map((name, i) => {
+      const hd = document.createElement('div');
+      hd.className = `cal-handle c-${name.toLowerCase()}`;
+      // The transparent rect makes the whole 80 px square grabbable, not just
+      // the drawn lines — the uncalibrated corners sit right on the window edge.
+      hd.innerHTML = `<svg width="80" height="80"><rect width="80" height="80" fill="transparent" pointer-events="all"/><circle cx="40" cy="40" r="14" fill="none" stroke="#fff" stroke-width="3"/><circle cx="40" cy="40" r="14" fill="none" stroke="#d0021b" stroke-width="1.5"/><path d="M0 40H80M40 0V80" stroke="#fff" stroke-width="3"/><path d="M0 40H80M40 0V80" stroke="#d0021b" stroke-width="1.5"/></svg><span class="cal-label">${name}</span>`;
+      document.body.appendChild(hd);
+      hd.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        selected = i;
+        if (!dst) dst = srcCorners();
+        const start = [e.clientX, e.clientY], orig = dst[i].slice();
+        const move = ev => { dst[i] = [orig[0] + ev.clientX - start[0], orig[1] + ev.clientY - start[1]]; applyCalibration(); };
+        const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); saveCalibration(); };
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', up);
+        applyCalibration();
+      });
+      return hd;
+    });
+
+    const calHelp = document.createElement('div');
+    calHelp.id = 'calHelp';
+    calHelp.innerHTML = `<div><b>Calibration</b>: drag each crosshair onto the matching corner of the model
+      (NW = top-left of the map). Tab selects the next crosshair; arrow keys nudge it (Shift = 10 px).
+      Align to street-level corners, not building tops.</div>
+      <div style="margin-top:6px">Bookmark this link on the projector laptop to restore this calibration:</div>
+      <input id="calLink" readonly>
+      <div><button type="button" id="calDone">Done (C)</button><button type="button" id="calReset">Reset (R)</button></div>`;
+    document.body.appendChild(calHelp);
+    const calLink = calHelp.querySelector('#calLink');
+    calLink.addEventListener('focus', () => calLink.select());
+    function updateShareLink() {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('cal');
+      if (dst) url.searchParams.set('cal', toFractions(dst).flat().join(','));
+      calLink.value = url.toString();
+    }
+
+    function setCalibrating(on) {
+      document.body.classList.toggle('calibrating', on);
+      if (on) document.body.classList.remove('menu-hidden');
+      applyCalibration();
+    }
+    calHelp.querySelector('#calDone').addEventListener('click', () => setCalibrating(false));
+    calHelp.querySelector('#calReset').addEventListener('click', () => { dst = null; saveCalibration(); applyCalibration(); });
+
+    const calBtn = document.createElement('button');
+    calBtn.type = 'button';
+    calBtn.className = 'hp-hide';
+    calBtn.textContent = 'Calibrate projection (C)';
+    calBtn.addEventListener('click', () => setCalibrating(!document.body.classList.contains('calibrating')));
+    document.querySelector('.heat-panel').appendChild(calBtn);
+
+    document.addEventListener('keydown', e => {
+      if (e.target.closest('input, select, textarea')) return;
+      const calibrating = document.body.classList.contains('calibrating');
+      if (e.key === 'c' || e.key === 'C') { setCalibrating(!calibrating); e.preventDefault(); return; }
+      if (!calibrating) return;
+      if (e.key === 'Enter' || e.key === 'Escape') { setCalibrating(false); return; }
+      if (e.key === 'r' || e.key === 'R') { dst = null; saveCalibration(); applyCalibration(); return; }
+      if (e.key === 'Tab') { selected = (selected + (e.shiftKey ? 3 : 1)) % 4; applyCalibration(); e.preventDefault(); return; }
+      const step = e.shiftKey ? 10 : 1;
+      const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
+      if (!d) return;
+      e.preventDefault();
+      if (!dst) dst = srcCorners();
+      dst[selected] = [dst[selected][0] + d[0], dst[selected][1] + d[1]];
+      applyCalibration();
+      saveCalibration();
+    });
+
+    dst = loadCalibration();
+    map.on('move zoom resize', applyCalibration);
+    window.addEventListener('resize', () => {
+      map.invalidateSize();
+      dst = loadCalibration();  // stored as window fractions, so it follows a resolution change
+      applyCalibration();
+    });
+    applyCalibration();
 
     // Hide the map menu so only the map reaches the projector. "Hide menu"
     // button in the menu, M to toggle, ?menu=0 / ?menu=1 in the URL to force
