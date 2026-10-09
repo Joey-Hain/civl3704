@@ -782,7 +782,8 @@ def _download_day(date_str, base=SCRAPE_RAW_BASE):
         return date_str, None, f"{date_str}: {e}"
 
 
-def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None):
+def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None,
+                        end=None, agency_stats=None):
     """Aggregate one day's CSV into local_cells_by_period: a dict keyed by
     VALID_HEATMAP_PERIODS ("all" plus each TIME_PERIODS bucket), each value
     a dict-of-cells keyed by rounded (lat, lon). Every row is folded into
@@ -833,6 +834,7 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
                 return date_str, 0, 0, f"{date_str}: missing required columns"
             delay_idx = header.index("delay_sec") if "delay_sec" in header else None
             speed_idx = header.index("speed_kmh") if "speed_kmh" in header else None
+            route_idx = header.index("route_id") if "route_id" in header else None
             max_idx = max(ts_idx, lat_idx, lon_idx)
             for i, row in enumerate(csv.reader(lines)):
                 if i % 2000 == 0:
@@ -841,7 +843,7 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
                 if len(row) <= max_idx:
                     continue
                 ts = _parse_ts_cached(row[ts_idx])
-                if ts is None or ts < cutoff:
+                if ts is None or ts < cutoff or (end is not None and ts >= end):
                     continue
                 try:
                     lat = float(row[lat_idx])
@@ -863,6 +865,20 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
                     except ValueError:
                         speed_kmh = None
 
+                if agency_stats is not None and delay_sec is not None and route_idx is not None \
+                        and len(row) > route_idx and "_" in row[route_idx]:
+                    # Per-operator on-time tallies for /api/validation, keyed by
+                    # the agency id prefix of route_id ("2436_M30" -> "2436").
+                    st = agency_stats[row[route_idx].split("_", 1)[0]]
+                    st[0] += 1
+                    if delay_sec < ON_TIME_EARLY_SEC:
+                        st[1] += 1
+                    elif delay_sec > ON_TIME_LATE_SEC:
+                        st[3] += 1
+                    else:
+                        st[2] += 1
+                    st[4] += max(delay_sec, 0.0)
+
                 period = time_of_day_bucket(ts)
                 _add_reading(local_cells_by_period["all"][key], lat, lon, delay_sec, speed_kmh)
                 _add_reading(local_cells_by_period[period][key], lat, lon, delay_sec, speed_kmh)
@@ -872,19 +888,29 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
         return date_str, 0, 0, f"{date_str}: {e}"
 
 
-def fetch_historical_cells(window_hours):
+def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
     """Fetch + aggregate a window's CSVs into grid cells. This is the
     expensive, metric-independent half of building a historical heatmap —
     see compute_metric_points() for turning these cells into a specific
-    metric's weighted points."""
+    metric's weighted points.
+
+    Either window_hours (the last N hours) or an explicit [start_dt, end_dt)
+    range (custom dates). Also tallies on-time counts per operator agency id
+    in the same pass, for /api/validation."""
     start = time.monotonic()
     now = datetime.now(tz=SYDNEY_TZ)
-    cutoff = now - timedelta(hours=window_hours)
+    if start_dt is None:
+        cutoff, end_dt = now - timedelta(hours=window_hours), None
+    else:
+        cutoff = start_dt
+    last_day = min((end_dt - timedelta(microseconds=1)).date() if end_dt else now.date(), now.date())
     dates_needed = []
     d = cutoff.date()
-    while d <= now.date():
+    while d <= last_day:
         dates_needed.append(d.isoformat())
         d += timedelta(days=1)
+    # agency id -> [n_with_delay, n_early, n_on_time, n_late, late_sum_sec]
+    agency_stats = defaultdict(lambda: [0, 0, 0, 0, 0.0])
 
     # Downloads run in parallel; parsing happens here, one file at a time,
     # into a single set of period buckets (a reading lands in "all" and in
@@ -908,7 +934,8 @@ def fetch_historical_cells(window_hours):
             date_str, body, error = future.result()
             if error is None:
                 date_str, rows_seen, points_added, error = _fetch_one_day_into(
-                    date_str, cutoff, cells_by_period, prefetched=body)
+                    date_str, cutoff, cells_by_period, prefetched=body,
+                    end=end_dt, agency_stats=agency_stats)
             if error is not None:
                 last_error = error
                 continue
@@ -933,6 +960,7 @@ def fetch_historical_cells(window_hours):
 
     return {
         "cells": cells_by_period,
+        "agency_stats": dict(agency_stats),
         "files_fetched": files_fetched,
         "rows_seen_total": rows_seen_total,
         "last_error": last_error,
@@ -1079,26 +1107,107 @@ _METRIC_LABELS = {
 }
 
 
-def get_historical_cells_cached(window_hours):
+class WindowSpec:
+    """A historical window: the last N hours (key = N), or a custom date
+    range [start_date 00:00, end_date + 1 day 00:00) Sydney time
+    (key = "YYYY-MM-DD..YYYY-MM-DD")."""
+
+    def __init__(self, hours=None, start_date=None, end_date=None):
+        self.hours, self.start_date, self.end_date = hours, start_date, end_date
+
+    @property
+    def key(self):
+        return self.hours if self.hours is not None else f"{self.start_date}..{self.end_date}"
+
+    @property
+    def is_custom(self):
+        return self.hours is None
+
+    def bounds(self):
+        if not self.is_custom:
+            return None, None
+        start = datetime.combine(self.start_date, datetime.min.time(), tzinfo=SYDNEY_TZ)
+        end = datetime.combine(self.end_date + timedelta(days=1), datetime.min.time(), tzinfo=SYDNEY_TZ)
+        return start, end
+
+    def ttl(self):
+        if self.is_custom:
+            # A range that ended before today only changes if local data is
+            # pushed for it; one that includes today keeps refreshing.
+            today = datetime.now(tz=SYDNEY_TZ).date()
+            return HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if self.end_date < today else HEATMAP_WINDOW_CACHE_TTL_SECONDS
+        return HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if self.hours > 168 else HEATMAP_WINDOW_CACHE_TTL_SECONDS
+
+    def describe(self):
+        if self.is_custom:
+            return f"{self.start_date:%d %b %Y} to {self.end_date:%d %b %Y}"
+        return {1: "last hour", 24: "last 24 hours", 168: "last 7 days", 720: "last 30 days"}.get(
+            self.hours, f"last {self.hours} hours")
+
+
+# Custom ranges: at most this many days, starting no earlier than the scrape
+# keeps data for (gtfs-r-scrape COLLECTOR_RETENTION_DAYS = 60).
+CUSTOM_WINDOW_MAX_DAYS = 62
+CUSTOM_WINDOW_LOOKBACK_DAYS = 62
+CUSTOM_CACHE_MAX_ENTRIES = 4  # bound memory: each cached window holds its cells
+
+
+def parse_window_args(args):
+    """WindowSpec from ?window=1|24|168|720 or ?window=custom&start=&end=
+    (YYYY-MM-DD, inclusive). Returns (spec, error_message_or_None)."""
+    w = args.get("window", str(HEATMAP_DEFAULT_WINDOW))
+    if w != "custom":
+        try:
+            hours = int(w)
+        except ValueError:
+            hours = HEATMAP_DEFAULT_WINDOW
+        return WindowSpec(hours if hours in HEATMAP_WINDOWS else HEATMAP_DEFAULT_WINDOW), None
+    try:
+        start = datetime.strptime(args.get("start", ""), "%Y-%m-%d").date()
+        end = datetime.strptime(args.get("end", ""), "%Y-%m-%d").date()
+    except ValueError:
+        return None, "Custom range needs a start and end date"
+    today = datetime.now(tz=SYDNEY_TZ).date()
+    if end > today:
+        end = today
+    if start > end:
+        return None, "Start date is after the end date"
+    if (end - start).days + 1 > CUSTOM_WINDOW_MAX_DAYS:
+        return None, f"Custom range can be at most {CUSTOM_WINDOW_MAX_DAYS} days"
+    if start < today - timedelta(days=CUSTOM_WINDOW_LOOKBACK_DAYS):
+        return None, f"Data is only kept for about {CUSTOM_WINDOW_LOOKBACK_DAYS} days"
+    return WindowSpec(start_date=start, end_date=end), None
+
+
+def get_historical_cells_cached(window):
+    if not isinstance(window, WindowSpec):
+        window = WindowSpec(window)
+    key, ttl = window.key, window.ttl()
     now = datetime.now(tz=SYDNEY_TZ)
-    cached = _heatmap_cells_cache.get(window_hours)
-    ttl = HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if window_hours > 168 else HEATMAP_WINDOW_CACHE_TTL_SECONDS
+    cached = _heatmap_cells_cache.get(key)
     if cached is not None and (now - cached["fetched_at"]).total_seconds() < ttl:
         return cached
 
     with _heatmap_lock:
         now = datetime.now(tz=SYDNEY_TZ)
-        cached = _heatmap_cells_cache.get(window_hours)
+        cached = _heatmap_cells_cache.get(key)
         if cached is not None and (now - cached["fetched_at"]).total_seconds() < ttl:
             return cached
 
-        meta = fetch_historical_cells(window_hours)
+        start_dt, end_dt = window.bounds()
+        meta = fetch_historical_cells(window.hours, start_dt, end_dt)
         meta["fetched_at"] = now
-        _heatmap_cells_cache[window_hours] = meta
+        if window.is_custom:
+            custom_keys = [k for k in _heatmap_cells_cache if isinstance(k, str)]
+            while len(custom_keys) >= CUSTOM_CACHE_MAX_ENTRIES:
+                oldest = min(custom_keys, key=lambda k: _heatmap_cells_cache[k]["fetched_at"])
+                _heatmap_cells_cache.pop(oldest, None)
+                custom_keys.remove(oldest)
+        _heatmap_cells_cache[key] = meta
         return meta
 
 
-def get_heatmap_points_cached(window_hours, metric, period="all"):
+def get_heatmap_points_cached(window, metric, period="all"):
     if metric not in VALID_HEATMAP_METRICS:
         metric = "delay"
     if period not in VALID_HEATMAP_PERIODS:
@@ -1106,7 +1215,7 @@ def get_heatmap_points_cached(window_hours, metric, period="all"):
 
     # The window fetch already bucketed cells by period in its single pass;
     # picking a period here is just a dict lookup, never a fresh fetch.
-    meta = get_historical_cells_cached(window_hours)
+    meta = get_historical_cells_cached(window)
     cells = meta["cells"].get(period) or {}
 
     if not cells:
@@ -1727,7 +1836,12 @@ HEATMAP_SCRIPT = """\
           <option value="24">Last 24 hours</option>
           <option value="168">Last 7 days</option>
           <option value="720" selected>Last 30 days</option>
+          <option value="custom">Custom dates\u2026</option>
         </select>
+        <label class="hp-custom" for="histStartDate" hidden>From</label>
+        <input class="hp-custom" type="date" id="histStartDate" hidden>
+        <label class="hp-custom" for="histEndDate" hidden>To</label>
+        <input class="hp-custom" type="date" id="histEndDate" hidden>
         <label for="histPeriodSelect">Time of day</label>
         <select id="histPeriodSelect">
           ${PERIODS.map(([v, label]) => `<option value="${v}"${v === 'all' ? ' selected' : ''}>${label}</option>`).join('')}
@@ -1748,6 +1862,32 @@ HEATMAP_SCRIPT = """\
     L.DomEvent.disableClickPropagation(heatPanel);
     L.DomEvent.disableScrollPropagation(heatPanel);
     const statusDiv = heatPanel.querySelector('#histWindowStatus');
+
+    // Custom history range: date inputs appear when "Custom dates…" is
+    // picked. Bounds mirror the server's (CUSTOM_WINDOW_LOOKBACK_DAYS /
+    // CUSTOM_WINDOW_MAX_DAYS, ~62 days kept by the scraper).
+    const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const startInput = heatPanel.querySelector('#histStartDate');
+    const endInput = heatPanel.querySelector('#histEndDate');
+    {
+      const today = new Date(), earliest = new Date(), weekAgo = new Date();
+      earliest.setDate(today.getDate() - 62);
+      weekAgo.setDate(today.getDate() - 13);
+      for (const el of [startInput, endInput]) { el.min = isoDate(earliest); el.max = isoDate(today); }
+      startInput.value = isoDate(weekAgo);
+      endInput.value = isoDate(today);
+    }
+    function syncCustomVisibility() {
+      const custom = heatPanel.querySelector('#histWindowSelect').value === 'custom';
+      heatPanel.querySelectorAll('.hp-custom').forEach(el => { el.hidden = !custom; });
+    }
+    function historyQuery() {
+      const wh = heatPanel.querySelector('#histWindowSelect').value;
+      if (wh !== 'custom') return { query: `window=${wh}` };
+      if (!startInput.value || !endInput.value) return { error: 'Pick a start and end date' };
+      if (startInput.value > endInput.value) return { error: 'Start date is after the end date' };
+      return { query: `window=custom&start=${startInput.value}&end=${endInput.value}` };
+    }
 
     function makeHeatLegend(id) {
       const div = document.createElement('div');
@@ -1830,7 +1970,7 @@ HEATMAP_SCRIPT = """\
 
     async function loadHistoricalHeatmap() {
       const seq = ++histRequestSeq;
-      const wh = document.getElementById('histWindowSelect').value;
+      const hq = historyQuery();
       const period = document.getElementById('histPeriodSelect').value;
       const metricAtRequest = currentMetric;
       statusDiv.textContent = 'Loading…';
@@ -1840,8 +1980,13 @@ HEATMAP_SCRIPT = """\
       // "did switching this do anything?".
       heatLoadingBanner.textContent = `Updating heatmap: ${METRICS[metricAtRequest].label.toLowerCase()}\u2026`;
       heatLoadingBanner.hidden = false;
+      if (hq.error) {
+        statusDiv.textContent = hq.error; statusDiv.style.color = '#b3261e';
+        heatLoadingBanner.hidden = true;
+        return;
+      }
       try {
-        const res = await fetch(`/api/heatmap?window=${wh}&metric=${metricAtRequest}&period=${period}`);
+        const res = await fetch(`/api/heatmap?${hq.query}&metric=${metricAtRequest}&period=${period}`);
         const text = await res.text();
         if (seq !== histRequestSeq) return; // superseded by a newer window/metric change
         let data;
@@ -1861,7 +2006,9 @@ HEATMAP_SCRIPT = """\
         if (seq === histRequestSeq) heatLoadingBanner.hidden = true;
       }
     }
-    document.getElementById('histWindowSelect').addEventListener('change', loadHistoricalHeatmap);
+    document.getElementById('histWindowSelect').addEventListener('change', () => { syncCustomVisibility(); loadHistoricalHeatmap(); });
+    startInput.addEventListener('change', loadHistoricalHeatmap);
+    endInput.addEventListener('change', loadHistoricalHeatmap);
     document.getElementById('histPeriodSelect').addEventListener('change', loadHistoricalHeatmap);
 
     // Per-vehicle live heat weight for the current metric. Returns null to
@@ -2047,7 +2194,8 @@ PAGE = """
   .heat-panel .hp-section:first-child { margin-top:0; }
   .heat-panel .hp-grid { display:grid; grid-template-columns:auto 1fr; gap:4px 8px; align-items:center; }
   .heat-panel .hp-grid label { color:#555; }
-  .heat-panel select { font:inherit; width:100%; min-width:0; }
+  .heat-panel select, .heat-panel input[type=date] { font:inherit; width:100%; min-width:0; box-sizing:border-box; }
+  .heat-panel [hidden] { display:none !important; }
   .heat-panel .hp-inline { display:flex; align-items:center; gap:4px; min-width:0; }
   .heat-panel #routeMaskStatus { color:#888; white-space:nowrap; }
   .heat-panel #histWindowStatus { color:#777; font-size:11px; margin-top:4px; }
@@ -2187,7 +2335,8 @@ PROJECT_PAGE = """
   .heat-panel .hp-section:first-child { margin-top:0; }
   .heat-panel .hp-grid { display:grid; grid-template-columns:auto 1fr; gap:4px 8px; align-items:center; }
   .heat-panel .hp-grid label { color:#555; }
-  .heat-panel select { font:inherit; width:100%; min-width:0; }
+  .heat-panel select, .heat-panel input[type=date] { font:inherit; width:100%; min-width:0; box-sizing:border-box; }
+  .heat-panel [hidden] { display:none !important; }
   .heat-panel .hp-inline { display:flex; align-items:center; gap:4px; min-width:0; }
   .heat-panel #routeMaskStatus { color:#888; white-space:nowrap; }
   .heat-panel #histWindowStatus { color:#777; font-size:11px; margin-top:4px; }
@@ -2200,6 +2349,10 @@ PROJECT_PAGE = """
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
   #heatLoadingBanner { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:900; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
   .project-mask { position:absolute; background:#000; z-index:850; pointer-events:none; }
+  body.menu-hidden .leaflet-control-layers, body.menu-hidden #heatLoadingBanner { display:none !important; }
+  .heat-panel .hp-hide { display:block; width:100%; margin-top:10px; font:inherit; cursor:pointer; }
+  .menu-hint { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; opacity:0; transition:opacity 0.4s; pointer-events:none; }
+  .menu-hint.show { opacity:1; }
 </style>
 </head>
 <body>
@@ -2263,6 +2416,43 @@ PROJECT_PAGE = """
     map.on('move zoom resize', updateProjectMask);
     updateProjectMask();
     window.addEventListener('resize', () => { map.invalidateSize(); updateProjectMask(); });
+
+    // Hide the map menu so only the map reaches the projector. "Hide menu"
+    // button in the menu, M to toggle, ?menu=0 / ?menu=1 in the URL to force
+    // it on load; otherwise the last choice is remembered in this browser.
+    // The periodic "Updating heatmap…" banner is suppressed while hidden too.
+    (function () {
+      const STORE_KEY = 'projector.menuHidden';
+      const params = new URLSearchParams(window.location.search);
+      let hidden;
+      if (params.has('menu')) hidden = params.get('menu') === '0';
+      else { try { hidden = localStorage.getItem(STORE_KEY) === '1'; } catch (e) { hidden = false; } }
+      const hint = document.createElement('div');
+      hint.className = 'menu-hint';
+      hint.textContent = 'Menu hidden \u2014 press M to show it';
+      document.body.appendChild(hint);
+      let hintTimer = null;
+      function apply(announce) {
+        document.body.classList.toggle('menu-hidden', hidden);
+        try { localStorage.setItem(STORE_KEY, hidden ? '1' : '0'); } catch (e) { /* storage unavailable */ }
+        clearTimeout(hintTimer);
+        hint.classList.toggle('show', hidden && announce);
+        if (hidden && announce) hintTimer = setTimeout(() => hint.classList.remove('show'), 2500);
+      }
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'hp-hide';
+      btn.textContent = 'Hide menu (M)';
+      btn.addEventListener('click', () => { hidden = true; apply(true); });
+      document.querySelector('.heat-panel').appendChild(btn);
+      document.addEventListener('keydown', e => {
+        if (e.key !== 'm' && e.key !== 'M') return;
+        if (e.target.closest('input, select, textarea')) return;
+        hidden = !hidden;
+        apply(true);
+      });
+      apply(false);
+    })();
   </script>
 </body>
 </html>
@@ -2429,24 +2619,88 @@ def api_route_shapes():
 @app.route("/api/heatmap")
 def api_heatmap():
     try:
-        try:
-            window_hours = int(request.args.get("window", HEATMAP_DEFAULT_WINDOW))
-        except ValueError:
-            window_hours = 24
-        if window_hours not in HEATMAP_WINDOWS:
-            window_hours = HEATMAP_DEFAULT_WINDOW
+        window, werr = parse_window_args(request.args)
+        if werr:
+            return jsonify({"points": [], "window_hours": None, "metric": None, "period": None, "error": werr})
+        window_hours = window.hours
         metric = request.args.get("metric", "delay")
         if metric not in VALID_HEATMAP_METRICS:
             metric = "delay"
         period = request.args.get("period", "all")
         if period not in VALID_HEATMAP_PERIODS:
             period = "all"
-        points, error, prior = get_heatmap_points_cached(window_hours, metric, period)
+        points, error, prior = get_heatmap_points_cached(window, metric, period)
         return jsonify({"points": points, "prior": prior, "window_hours": window_hours,
-                        "metric": metric, "period": period, "error": error})
+                        "window": str(window.key), "metric": metric, "period": period, "error": error})
     except Exception as e:
         return jsonify({"points": [], "window_hours": None, "metric": None, "period": None,
                         "error": f"Server error: {e}"}), 200
+
+
+@app.route("/api/validation")
+def api_validation():
+    """On-time running by operator from the scraped history, for comparing
+    against TfNSW's published monthly on-time running results.
+
+    ?window=1|24|168|720 or ?window=custom&start=YYYY-MM-DD&end=YYYY-MM-DD;
+    &format=csv for a spreadsheet-ready table. Operators are grouped by NAME
+    (several agency ids can share one, e.g. multiple Transit Systems
+    contracts), using the timetable's agency.txt.
+
+    Not like-for-like with the published KPI, and the response says so:
+    each reading is one bus at one scrape snapshot (delay at its latest
+    reported stop, mid-trip), whereas the published figures measure
+    timetabled trips at defined points. Mid-trip delay accumulates along a
+    route, so these figures should read somewhat LOWER than published."""
+    window, werr = parse_window_args(request.args)
+    if werr:
+        return jsonify({"error": werr}), 400
+    meta = get_historical_cells_cached(window)
+    agency_names, _, agency_error = get_schedule_lookups()
+
+    by_name = {}
+    for agency_id, (n, early, on, late, late_sum) in meta.get("agency_stats", {}).items():
+        name = agency_names.get(agency_id, f"Unknown operator ({agency_id})")
+        g = by_name.setdefault(name, {"operator": name, "agency_ids": [], "n": 0, "early": 0,
+                                      "on_time": 0, "late": 0, "late_sum": 0.0})
+        g["agency_ids"].append(agency_id)
+        g["n"] += n; g["early"] += early; g["on_time"] += on; g["late"] += late; g["late_sum"] += late_sum
+
+    def finish(g):
+        n = g["n"] or 1
+        return {"operator": g["operator"], "agency_ids": sorted(g["agency_ids"]), "readings": g["n"],
+                "on_time_pct": round(100 * g["on_time"] / n, 1),
+                "early_pct": round(100 * g["early"] / n, 1),
+                "late_pct": round(100 * g["late"] / n, 1),
+                "mean_lateness_min": round(g["late_sum"] / n / 60, 2)}
+
+    rows = sorted((finish(g) for g in by_name.values()), key=lambda r: -r["readings"])
+    total = {"operator": "All operators", "agency_ids": [], "n": 0, "early": 0, "on_time": 0, "late": 0, "late_sum": 0.0}
+    for g in by_name.values():
+        for k in ("n", "early", "on_time", "late", "late_sum"):
+            total[k] += g[k]
+    network = finish(total)
+
+    if request.args.get("format") == "csv":
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["operator", "agency_ids", "readings", "on_time_pct", "early_pct", "late_pct", "mean_lateness_min"])
+        for r in rows + [network]:
+            w.writerow([r["operator"], " ".join(r["agency_ids"]), r["readings"], r["on_time_pct"],
+                        r["early_pct"], r["late_pct"], r["mean_lateness_min"]])
+        return Response(out.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=otr_{str(window.key).replace('..', '_to_')}.csv"})
+
+    return jsonify({
+        "window": window.describe(), "files_fetched": meta["files_fetched"],
+        "deadline_hit": meta["deadline_hit"], "operator_names_error": agency_error,
+        "on_time_definition": "0:59 early to 5:59 late inclusive (ON_TIME_EARLY_SEC..ON_TIME_LATE_SEC)",
+        "method_note": ("One reading per bus per scrape snapshot, using the delay at its latest reported stop "
+                        "(mid-trip). Published TfNSW on-time running measures timetabled trips at defined "
+                        "points, so expect these figures to read somewhat lower; compare ranking and spread, "
+                        "not exact values."),
+        "network": network, "operators": rows,
+    })
 
 
 if __name__ == "__main__":

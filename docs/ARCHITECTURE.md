@@ -28,7 +28,7 @@ The app is organised into three main layers:
 
 ## 3. Visualisation layer
 
-- Flask serves the dashboard, `/api/vehicles`, `/api/heatmap`, `/status`, `/health` and `/ping` endpoints.
+- Flask serves the dashboard, `/api/vehicles`, `/api/heatmap` (`window=1|24|168|720` or `window=custom&start=&end=`), `/api/validation` (on-time running by operator from the scraped history, JSON or `&format=csv`, for comparison with TfNSW's published results), `/api/route_shapes`, `/status`, `/health` and `/ping` endpoints.
 - Jinja renders summary tables for operators, routes and individual trips.
 - Leaflet displays live vehicle markers on an interactive map.
 - Marker outlines show whether a vehicle is on time, late, early or has no delay data.
