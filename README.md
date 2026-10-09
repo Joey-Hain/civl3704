@@ -34,7 +34,7 @@ Open [http://localhost:5000](http://localhost:5000) in a browser.
 - Interactive vehicle map
 - Delay-status marker colours
 - Vehicle-density heatmap
-- Route, stop, operator, and anomaly filters
+- Operator dropdown (operators sharing a name are grouped) plus route and stop ID filters
 
 The dashboard automatically refreshes vehicle positions every 15 seconds.
 

@@ -972,9 +972,24 @@ def compute_metric_points(cells, metric):
         # This is roughly what the original summed delay heatmap showed:
         # busy corridors (CBD) rank high because many buses each add a
         # little, which is real total impact, NOT a sign that each bus there
-        # runs later. Weight 1 = one bus 10 min late (HEATMAP_SEVERITY_CAP_SEC).
-        return [[c[0] / c[2], c[1] / c[2], c[3] / HEATMAP_SEVERITY_CAP_SEC]
-                for c in cells.values() if c[4] > 0 and c[3] > 0]
+        # runs later.
+        #
+        # Normalised to the SAME total heat as the density map for this
+        # window (sum of count / max_count), redistributed in proportion to
+        # each cell's share of total lateness. Raw totals grow with the
+        # window (30 days stacks ~15x a day's lateness) and saturated the
+        # map everywhere; this keeps it window-independent, and it reads
+        # directly against Bus density — an area hotter here than on density
+        # carries more than its share of the network's delay.
+        eligible = [c for c in cells.values() if c[2] > 0]
+        late_cells = [c for c in eligible if c[4] > 0 and c[3] > 0]
+        total_late = sum(c[3] for c in late_cells)
+        if not late_cells or not total_late:
+            return []
+        max_count = max(c[2] for c in eligible)
+        density_heat = sum(c[2] for c in eligible) / max_count
+        scale = density_heat / total_late
+        return [[c[0] / c[2], c[1] / c[2], c[3] * scale] for c in late_cells]
 
     # Delay metrics use lateness in seconds, floored at 0 so early running
     # cannot cancel out late running in the same cell.
@@ -1114,7 +1129,12 @@ def compute_delay_data(args):
     if q_route:
         rows = [r for r in rows if q_route in r["route_id"].lower()]
     if q_operator:
-        rows = [r for r in rows if q_operator in r["operator"].lower()]
+        # Exact (case-insensitive) name match: the dropdown lists unique
+        # operator NAMES, and several operator IDs can share one name
+        # (e.g. multiple Transit Systems contracts), so matching by name
+        # groups them; exact rather than substring so one name can't also
+        # catch another that merely contains it.
+        rows = [r for r in rows if r["operator"].lower() == q_operator]
     if q_stop:
         matching_trip_ids = {r["trip_id"] for r in rows if q_stop in r["stop_id"].lower()}
         rows = [r for r in rows if r["trip_id"] in matching_trip_ids]
@@ -1132,6 +1152,7 @@ def compute_delay_data(args):
         "delay_by_trip_all": delay_by_trip_all,
         "filters_active": bool(q_route or q_stop or q_operator),
         "apply_bounds": apply_bounds,
+        "operator_options": sorted({r["operator"] for r in all_rows if r.get("operator")}, key=str.lower),
     }
 
 
@@ -1279,6 +1300,7 @@ HEATMAP_SCRIPT = """\
     const METRICS = {
       delay: {
         label: 'Average delay', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
+        desc: 'How late buses typically run in each area: mean lateness of readings within 250 m (early running counts as 0). Thin data is pulled toward the network average, so one late bus can\u2019t make a hotspot.',
         radiusM: 250, fullSupport: 3,
         liveTitle: 'Live: current delay (min)',
         histTitle: 'Historical: average delay (min)',
@@ -1286,6 +1308,7 @@ HEATMAP_SCRIPT = """\
       },
       delay_total: {
         label: 'Delay burden', kind: 'sum', hist: 'RdPu', live: 'PuBu',
+        desc: 'Where the most delay accumulates: total bus-minutes late, scaled to the same total as Bus density. Busy corridors rank high even if each bus is only slightly late; areas hotter here than on Bus density carry more than their share of delay.',
         liveTitle: 'Live: buses running late',
         histTitle: 'Historical: total bus-minutes late',
         ticks: ['less', 'more'],
@@ -1294,6 +1317,7 @@ HEATMAP_SCRIPT = """\
       // 5:59 late) — i.e. 1 − on-time %. From Liha's changes.
       frequency: {
         label: 'Not on time', kind: 'field', hist: 'YlOrBr', live: 'BuPu',
+        desc: 'Share of readings within 250 m outside the TfNSW on-time window (0:59 early to 5:59 late), so running early counts too. Thin data is pulled toward the network average.',
         radiusM: 250, fullSupport: 3,
         liveTitle: 'Live: currently not on time',
         histTitle: 'Historical: readings not on time (%)',
@@ -1301,6 +1325,7 @@ HEATMAP_SCRIPT = """\
       },
       speed: {
         label: 'Speed', kind: 'field', hist: 'PlasmaR', live: 'YlGnBu',
+        desc: 'Average bus speed within 160 m, including time stopped at stops and signals. Amber = CBD streets, pink = arterials, purple = motorways.',
         radiusM: FIELD_RADIUS_M, fullSupport: 0.4,
         liveTitle: 'Live: current speed (km/h)',
         histTitle: 'Historical: average speed (km/h)',
@@ -1308,6 +1333,7 @@ HEATMAP_SCRIPT = """\
       },
       density: {
         label: 'Bus density', kind: 'sum', hist: 'Oranges', live: 'Blues',
+        desc: 'How many bus position readings were recorded in each area: where buses run most, not how well they run.',
         liveTitle: 'Live: bus density',
         histTitle: 'Historical: bus density',
         ticks: ['fewer buses', 'more buses'],
@@ -1693,6 +1719,7 @@ HEATMAP_SCRIPT = """\
         </select>
       </div>
       <div class="hp-legends"></div>
+      <div id="heatMetricDesc" class="hp-desc"></div>
       <div id="histWindowStatus"></div>
       <div class="hp-section">Markers</div>
       <div class="hp-grid">
@@ -1874,6 +1901,7 @@ HEATMAP_SCRIPT = """\
       histHeatLayer = swapHeatLayer(histHeatLayer, metric, 'hist', HIST_LAYER_NAME, histHeatData);
       fillLegend(liveLegend, cfg.liveGradient, cfg.liveTitle, cfg.ticks);
       fillLegend(histLegend, cfg.histGradient, cfg.histTitle, cfg.ticks);
+      heatPanel.querySelector('#heatMetricDesc').textContent = cfg.desc || '';
       updateLiveHeatFromVehicles(lastVehicles);
       loadHistoricalHeatmap();
     }
@@ -2009,6 +2037,13 @@ PAGE = """
   .heat-panel #routeMaskStatus { color:#888; white-space:nowrap; }
   .heat-panel #histWindowStatus { color:#777; font-size:11px; margin-top:4px; }
   .heat-panel .heat-legend { margin:8px 0 0; }
+  .heat-panel .hp-desc { color:#666; font-size:11px; line-height:1.35; margin-top:6px; }
+  .heat-help { margin:10px 0 0; font-size:0.85rem; color:#444; }
+  .heat-help summary { cursor:pointer; font-weight:600; }
+  .heat-help p { margin:8px 0; }
+  .heat-help dl { margin:6px 0 0; display:grid; grid-template-columns:max-content 1fr; gap:4px 14px; }
+  .heat-help dt { font-weight:600; }
+  .heat-help dd { margin:0; }
   #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
   .heat-legend { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:6px 22px 2px; color:#333; }
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
@@ -2026,11 +2061,14 @@ PAGE = """
 
   <form method="get" style="margin:20px 0; padding:14px; border:1px solid var(--line);">
     <input type="hidden" name="hide_anomalies" value="{{ 1 if hide_anomalies else 0 }}">
-    <label>Route <input type="text" name="route" value="{{ q_route }}" placeholder="e.g. 601" style="font-family:inherit;"></label>
+    <label>Operator <select name="operator" style="font-family:inherit;">
+      <option value="">All operators</option>
+      {% for op in operator_options %}<option value="{{ op }}"{% if op|lower == q_operator %} selected{% endif %}>{{ op }}</option>{% endfor %}
+    </select></label>
     &nbsp;&nbsp;
-    <label>Stop ID <input type="text" name="stop" value="{{ q_stop }}" placeholder="e.g. 207618" style="font-family:inherit;"></label>
+    <label>Route <input type="text" name="route" value="{{ q_route }}" autocomplete="off" style="font-family:inherit;"></label>
     &nbsp;&nbsp;
-    <label>Operator <input type="text" name="operator" value="{{ q_operator }}" placeholder="e.g. Transdev" style="font-family:inherit;"></label>
+    <label>Stop ID <input type="text" name="stop" value="{{ q_stop }}" autocomplete="off" style="font-family:inherit;"></label>
     &nbsp;&nbsp;
     <button type="submit" style="font-family:inherit;">Filter</button>
     {% if q_route or q_stop or q_operator %}<a class="toggle" href="?hide_anomalies={{ 1 if hide_anomalies else 0 }}">clear filters</a>{% endif %}
@@ -2046,6 +2084,18 @@ PAGE = """
     <span>{{ vehicles|length }} buses{% if filters_active %} (filtered){% endif %} {% if apply_bounds %}within 10 km of the CBD &middot; <a class="toggle" href="?bounds=0&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">show Opal area</a>{% else %}across the Opal area &middot; <a class="toggle" href="?bounds=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">show 10 km of the CBD only</a>{% endif %}</span>
   </div>
   {% if map_error %}<div class="map-error">Vehicle positions unavailable: {{ map_error }}</div>{% endif %}
+
+  <details class="heat-help">
+    <summary>About the heatmaps</summary>
+    <p><strong>Live heatmap</strong> colours each bus by its current value. <strong>Historical heatmap</strong> uses every scraped reading in the chosen history window (default 30 days), optionally limited to a time of day. <strong>Route clip</strong> trims colour to within the chosen distance of a bus route, so results read along corridors.</p>
+    <dl>
+      <dt>Average delay</dt><dd>How late buses typically run in each area: mean lateness of readings within 250 m, with early running counted as on time (0). Where data is thin, the estimate is pulled toward the network average, so a single late bus can&rsquo;t create a hotspot. Scale 0&ndash;5 min.</dd>
+      <dt>Delay burden</dt><dd>Where the most delay accumulates: total bus-minutes late, scaled to the same overall heat as Bus density. Busy corridors rank high even when each bus is only slightly late. An area hotter here than on Bus density carries more than its share of the network&rsquo;s delay.</dd>
+      <dt>Not on time</dt><dd>Share of readings within 250 m that fall outside the TfNSW on-time window (0:59 early to 5:59 late), so early running counts as well as late. Thin data is pulled toward the network average. Scale 0&ndash;60%.</dd>
+      <dt>Speed</dt><dd>Average bus speed within 160 m, including time stopped at stops and signals. Amber = CBD streets, pink = arterials, purple = motorways. Scale 0&ndash;80 km/h.</dd>
+      <dt>Bus density</dt><dd>How many bus position readings were recorded in each area: where buses run most, not how well they run.</dd>
+    </dl>
+  </details>
 
   <h2>By operator</h2>
   <table>
@@ -2127,6 +2177,7 @@ PROJECT_PAGE = """
   .heat-panel #routeMaskStatus { color:#888; white-space:nowrap; }
   .heat-panel #histWindowStatus { color:#777; font-size:11px; margin-top:4px; }
   .heat-panel .heat-legend { margin:8px 0 0; }
+  .heat-panel .hp-desc { color:#666; font-size:11px; line-height:1.35; margin-top:6px; }
   #histWindowStatus { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#b3261e; margin:2px 0 2px 22px; max-width:220px; }
   .heat-legend { font:11px/1.4 -apple-system, Helvetica, Arial, sans-serif; margin:6px 22px 2px; color:#333; }
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
@@ -2303,6 +2354,7 @@ def dashboard():
         operators=operators, routes=routes, worst_trips=worst_trips,
         vehicles=vehicles, vehicles_json=json.dumps(vehicles),
         filters_active=data["filters_active"], apply_bounds=data["apply_bounds"],
+        operator_options=data["operator_options"],
         map_error=map_error,
         color_fill=COLOR_FILL,
         outline_on_time=OUTLINE_ON_TIME, outline_late=OUTLINE_LATE,
