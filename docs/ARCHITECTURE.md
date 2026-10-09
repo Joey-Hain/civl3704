@@ -10,7 +10,7 @@ The app is organised into three main layers:
 - Downloads static GTFS schedule data for operator names and trip headsigns.
 - Caches successfully loaded schedule data for the lifetime of the process and retries failed loads after a backoff period.
 - Uses short-lived, lock-protected in-memory caches to reduce repeated API requests and prevent concurrent duplicate fetches.
-- Fetches historical daily CSV data from the `gtfs-r-scrape` repository for the heatmap.
+- Fetches historical daily CSV data from the `gtfs-r-scrape` repository for the heatmap: `data/` (GitHub Actions scrape, 3–6 snapshots a day) and `data-local/` (same format, from `local_collector.py` on a home machine every 15 minutes, pushed manually). Both are read for every day in the window.
 - Records trip-update readings in `CIVL3704/delay_log.csv`.
 
 ## 2. Processing layer

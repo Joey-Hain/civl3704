@@ -140,6 +140,7 @@ from array import array
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -265,7 +266,15 @@ VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
+# data-local/ = same CSV format, written by gtfs-r-scrape's local_collector.py
+# on a home machine (every 15 min) and pushed manually. Kept in a separate
+# folder so it never conflicts with the Action's data/ files; each day is
+# read from both (a missing file is a cheap 404).
+SCRAPE_RAW_BASES = (SCRAPE_RAW_BASE, f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data-local")
 HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
+# Long windows barely change minute to minute but are the slowest to build
+# (a month of 15-min local data is ~1.3M rows), so they're kept longer.
+HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS = 1800
 
 # Route-mask geometry: a de-duplicated bus road network within ~12 km of the
 # CBD, built weekly from the TfNSW GTFS shapes.txt by gtfs-r-scrape's
@@ -348,6 +357,10 @@ def parse_ts(raw):
         pass
     return None
 
+
+# Every row of one scrape snapshot shares a timestamp (~400-900 rows each),
+# so parsing each distinct string once saves real time on large files.
+_parse_ts_cached = lru_cache(maxsize=8192)(parse_ts)
 
 app = Flask(__name__)
 
@@ -757,10 +770,10 @@ class _Prefetched:
         return iter(self._content.decode("utf-8").splitlines())
 
 
-def _download_day(date_str):
+def _download_day(date_str, base=SCRAPE_RAW_BASE):
     """(date_str, _Prefetched or None, error). Network only — safe to run
     in a thread pool."""
-    url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
+    url = f"{base}/{date_str}.csv"
     try:
         r = requests.get(url, timeout=30)
         print(f"[heatmap] GET {url} -> HTTP {r.status_code}", flush=True)
@@ -827,7 +840,7 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
                 rows_seen += 1
                 if len(row) <= max_idx:
                     continue
-                ts = parse_ts(row[ts_idx])
+                ts = _parse_ts_cached(row[ts_idx])
                 if ts is None or ts < cutoff:
                     continue
                 try:
@@ -886,7 +899,8 @@ def fetch_historical_cells(window_hours):
     workers = max(1, min(HEATMAP_DOWNLOAD_CONCURRENCY, len(dates_needed)))
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
-        futures = [pool.submit(_download_day, ds) for ds in dates_needed]
+        futures = [pool.submit(_download_day, ds, base)
+                   for ds in dates_needed for base in SCRAPE_RAW_BASES]
         for future in as_completed(futures):
             if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
                 deadline_hit = True
@@ -1068,13 +1082,14 @@ _METRIC_LABELS = {
 def get_historical_cells_cached(window_hours):
     now = datetime.now(tz=SYDNEY_TZ)
     cached = _heatmap_cells_cache.get(window_hours)
-    if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
+    ttl = HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if window_hours > 168 else HEATMAP_WINDOW_CACHE_TTL_SECONDS
+    if cached is not None and (now - cached["fetched_at"]).total_seconds() < ttl:
         return cached
 
     with _heatmap_lock:
         now = datetime.now(tz=SYDNEY_TZ)
         cached = _heatmap_cells_cache.get(window_hours)
-        if cached is not None and (now - cached["fetched_at"]).total_seconds() < HEATMAP_WINDOW_CACHE_TTL_SECONDS:
+        if cached is not None and (now - cached["fetched_at"]).total_seconds() < ttl:
             return cached
 
         meta = fetch_historical_cells(window_hours)
