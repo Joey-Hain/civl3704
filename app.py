@@ -162,8 +162,18 @@ ON_TIME_EARLY_SEC = -59
 ON_TIME_LATE_SEC = 359
 
 GRID_DECIMALS = 4
-HEATMAP_FETCH_CONCURRENCY = 1
+# Daily CSVs are DOWNLOADED this many at a time but PARSED one at a time
+# into a single set of cells (see fetch_historical_cells) — parallel
+# downloads hide GitHub's per-request latency for the 30-day window
+# (~31 files of ~200 kB) without each worker holding its own copy of the
+# aggregated cells, which is what kept the old parse-in-workers design at 1.
+HEATMAP_DOWNLOAD_CONCURRENCY = 6
 HEATMAP_DEADLINE_SEC = 20
+# Historical windows offered (hours). 720 = 30 days: GitHub's scheduler only
+# runs the "every 5 minutes" scrape 3-6 times a day, so 7 days averages
+# ~1.3 readings per 10 m cell; 30 days gives the averaged maps ~5x more.
+HEATMAP_WINDOWS = (1, 24, 168, 720)
+HEATMAP_DEFAULT_WINDOW = 720
 # Mean lateness (seconds) at which the heat gradient saturates. Chosen
 # well above ON_TIME_LATE_SEC (359s) so the ramp has room to distinguish
 # "mildly late" from "genuinely stuck" before it maxes out.
@@ -724,13 +734,42 @@ def _add_reading(c, lat, lon, delay_sec, speed_kmh):
         c[6] += 1
 
 
-def _merge_cell(tgt, c):
-    for i in range(7):
-        tgt[i] += c[i]
-    tgt[7].extend(c[7])
+class _Prefetched:
+    """A downloaded daily CSV, shaped like the streaming requests response
+    _fetch_one_day_into reads, so parsing is identical either way."""
+
+    def __init__(self, status_code, content):
+        self.status_code = status_code
+        self._content = content
+        self.encoding = "utf-8"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    def iter_lines(self, decode_unicode=True):
+        return iter(self._content.decode("utf-8").splitlines())
 
 
-def _fetch_one_day_into(date_str, cutoff, local_cells_by_period):
+def _download_day(date_str):
+    """(date_str, _Prefetched or None, error). Network only — safe to run
+    in a thread pool."""
+    url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
+    try:
+        r = requests.get(url, timeout=30)
+        print(f"[heatmap] GET {url} -> HTTP {r.status_code}", flush=True)
+        return date_str, _Prefetched(r.status_code, r.content if r.status_code == 200 else b""), None
+    except requests.RequestException as e:
+        return date_str, None, f"{date_str}: {e}"
+
+
+def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None):
     """Aggregate one day's CSV into local_cells_by_period: a dict keyed by
     VALID_HEATMAP_PERIODS ("all" plus each TIME_PERIODS bucket), each value
     a dict-of-cells keyed by rounded (lat, lon). Every row is folded into
@@ -759,8 +798,10 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period):
     rows_seen = 0
     points_added = 0
     try:
-        with requests.get(url, timeout=30, stream=True) as resp:
-            print(f"[heatmap] GET {url} -> HTTP {resp.status_code}", flush=True)
+        resp_cm = prefetched if prefetched is not None else requests.get(url, timeout=30, stream=True)
+        with resp_cm as resp:
+            if prefetched is None:
+                print(f"[heatmap] GET {url} -> HTTP {resp.status_code}", flush=True)
             if resp.status_code == 404:
                 return date_str, 0, 0, None
             resp.raise_for_status()
@@ -832,27 +873,28 @@ def fetch_historical_cells(window_hours):
         dates_needed.append(d.isoformat())
         d += timedelta(days=1)
 
-    workers = max(1, min(HEATMAP_FETCH_CONCURRENCY, len(dates_needed)))
-    # Each worker gets its own full set of period buckets so rows can be
-    # folded into both "all" and their time-of-day bucket without collisions.
-    local_dicts = [_new_period_cells() for _ in range(workers)]
-
+    # Downloads run in parallel; parsing happens here, one file at a time,
+    # into a single set of period buckets (a reading lands in "all" and in
+    # its time-of-day bucket).
+    cells_by_period = _new_period_cells()
     files_fetched = 0
     rows_seen_total = 0
     points_added_total = 0
     last_error = None
     deadline_hit = False
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_fetch_one_day_into, ds, cutoff, local_dicts[i % workers])
-            for i, ds in enumerate(dates_needed)
-        ]
+    workers = max(1, min(HEATMAP_DOWNLOAD_CONCURRENCY, len(dates_needed)))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = [pool.submit(_download_day, ds) for ds in dates_needed]
         for future in as_completed(futures):
             if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
                 deadline_hit = True
                 break
-            date_str, rows_seen, points_added, error = future.result()
+            date_str, body, error = future.result()
+            if error is None:
+                date_str, rows_seen, points_added, error = _fetch_one_day_into(
+                    date_str, cutoff, cells_by_period, prefetched=body)
             if error is not None:
                 last_error = error
                 continue
@@ -861,19 +903,10 @@ def fetch_historical_cells(window_hours):
             files_fetched += 1
             rows_seen_total += rows_seen
             points_added_total += points_added
-
-    # cells_by_period["all"] is every reading regardless of time of day; the
-    # other keys are the same readings split by time_of_day_bucket(). A
-    # reading therefore appears in exactly two buckets.
-    if len(local_dicts) == 1:
-        cells_by_period = local_dicts[0]
-    else:
-        cells_by_period = _new_period_cells()
-        for ld in local_dicts:
-            for period, pcells in ld.items():
-                target = cells_by_period[period]
-                for key, c in pcells.items():
-                    _merge_cell(target[key], c)
+    finally:
+        # Don't block the request on downloads still in flight after a
+        # deadline hit; they finish (or time out) in the background.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     cells = cells_by_period["all"]
     cells_with_delay = sum(1 for c in cells.values() if c[4] > 0)
@@ -1650,8 +1683,9 @@ HEATMAP_SCRIPT = """\
         <label for="histWindowSelect">History</label>
         <select id="histWindowSelect">
           <option value="1">Last hour</option>
-          <option value="24" selected>Last 24 hours</option>
+          <option value="24">Last 24 hours</option>
           <option value="168">Last 7 days</option>
+          <option value="720" selected>Last 30 days</option>
         </select>
         <label for="histPeriodSelect">Time of day</label>
         <select id="histPeriodSelect">
@@ -2329,11 +2363,11 @@ def api_route_shapes():
 def api_heatmap():
     try:
         try:
-            window_hours = int(request.args.get("window", 24))
+            window_hours = int(request.args.get("window", HEATMAP_DEFAULT_WINDOW))
         except ValueError:
             window_hours = 24
-        if window_hours not in (1, 24, 168):
-            window_hours = 24
+        if window_hours not in HEATMAP_WINDOWS:
+            window_hours = HEATMAP_DEFAULT_WINDOW
         metric = request.args.get("metric", "delay")
         if metric not in VALID_HEATMAP_METRICS:
             metric = "delay"
