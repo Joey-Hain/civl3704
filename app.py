@@ -2155,7 +2155,7 @@ HEATMAP_SCRIPT = """\
     function fmtDelay(sec) {
       if (sec == null) return 'no prediction';
       const m = Math.round(sec / 6) / 10;
-      return m === 0 ? 'on schedule' : `${m > 0 ? '+' : ''}${m} min`;
+      return m === 0 ? 'on time' : `${m > 0 ? '+' : ''}${m} min`;
     }
     function stopColour(sec) {
       if (sec == null) return '#888';
