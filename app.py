@@ -3058,6 +3058,12 @@ def compute_trip_detail(trip_id):
     else:
         trips = _get_trip_shard("trips", trip_id, n_shards)
         shape_id = trips.get(trip_id) if trips is not None else None
+        if shape_id is None and trips is not None and "_" in trip_id:
+            # Operators' added/duplicated runs appear in the live feed as
+            # "<timetabled trip>_2" etc. and follow the original's route.
+            base = trip_id.rsplit("_", 1)[0]
+            base_trips = _get_trip_shard("trips", base, n_shards)
+            shape_id = base_trips.get(base) if base_trips else None
         if trips is None:
             shape_error = "Couldn't load route lookup"
         elif shape_id is None:
