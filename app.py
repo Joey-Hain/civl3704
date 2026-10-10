@@ -136,8 +136,9 @@ import tempfile
 import threading
 import time
 import zipfile
+import zlib
 from array import array
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -285,6 +286,17 @@ HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS = 1800
 # HEATMAP_SCRIPT.
 ROUTE_SHAPES_URL = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/shapes/route_shapes.json"
 ROUTE_SHAPES_CACHE_TTL_SECONDS = 6 * 3600
+# Per-trip lookup behind "click a bus to see its route and upcoming stops"
+# (/api/trip). Built by the same weekly gtfs-r-scrape job as the route mask:
+# trip_id -> shape_id and shape geometry, each split into n_shards small
+# files by zlib.crc32(id) % n_shards, plus stop names/coordinates. Only the
+# shards a click needs are fetched, and a bounded LRU keeps the busiest
+# ones, so the full timetable never has to sit in this 512 MB instance.
+# Upcoming stops and their predicted delays come from the live trip-update
+# feed already cached by get_all_rows_cached().
+TRIP_LOOKUP_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/shapes"
+TRIP_LOOKUP_TTL_SECONDS = 6 * 3600
+TRIP_SHARD_CACHE_MAX = 64
 
 # /project page: a Leaflet view locked to the exact real-world box
 # TransportLab's smart-city rig projects onto its physical table model, so
@@ -363,6 +375,14 @@ def parse_ts(raw):
 _parse_ts_cached = lru_cache(maxsize=8192)(parse_ts)
 
 app = Flask(__name__)
+
+# Values the shared map script (HEATMAP_SCRIPT, used by both "/" and
+# "/project") needs on every page, so each page's render call doesn't
+# have to remember to pass them.
+app.jinja_env.globals.update(
+    on_time_early_sec=ON_TIME_EARLY_SEC, on_time_late_sec=ON_TIME_LATE_SEC,
+    status_late=OUTLINE_LATE, status_early=OUTLINE_EARLY, status_on_time=COLOR_FILL,
+)
 
 _schedule_lock = threading.Lock()
 _schedule_cache = {"agency_names": None, "trip_headsigns": None, "error": None, "last_attempt": None}
@@ -673,6 +693,11 @@ _heatmap_lock = threading.Lock()
 # shrinks a few hundred kB of integer JSON to well under a third.
 _route_shapes_cache = {"gz": None, "fetched_at": None}
 _route_shapes_lock = threading.Lock()
+# /api/trip lookups: manifest + stops (refreshed together) and an LRU of
+# fetched shards keyed (kind, shard), kind = "trips" or "geom".
+_trip_meta_cache = {"n_shards": None, "generated": None, "stops": None, "fetched_at": None}
+_trip_shards = OrderedDict()
+_trip_lookup_lock = threading.Lock()
 
 
 def get_all_rows_cached():
@@ -1491,6 +1516,14 @@ HEATMAP_SCRIPT = """\
       return metres / mpp;
     }
     const markersLayer = L.layerGroup().addTo(map);
+    // Selected bus's route and upcoming stops (see selectTrip below). Own
+    // pane between the heat canvases (overlayPane, z 400) and the bus
+    // markers (markerPane, z 600), so the line sits on top of the heat but
+    // never hides a bus.
+    map.createPane('tripPane');
+    map.getPane('tripPane').style.zIndex = 450;
+    const tripRenderer = L.svg({ pane: 'tripPane' });
+    const tripLayer = L.layerGroup().addTo(map);
     // minOpacity nudged up from the original 0.12 — combined with the old
     // pale gradient stops, low-weight points were nearly invisible against
     // the map background, which was the other half of "switching metric
@@ -2100,7 +2133,125 @@ HEATMAP_SCRIPT = """\
       const dt = (v.delay_min != null) ? (v.anomaly ? `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min (flagged)` : `${v.delay_min > 0 ? '+' : ''}${v.delay_min} min`) : 'No current delay data';
       const sk = (v.speed != null) ? Math.round(v.speed * 3.6) + ' km/h' : 'Speed unavailable';
       const rl = v.headsign ? `Route ${v.route_num || v.route_id || '?'} to ${v.headsign}` : `Route ${v.route_num || v.route_id || '?'}`;
-      return `<strong>${rl}</strong><br>${v.route_operator || 'Unknown operator'}<br>Trip ${v.trip_id ?? '?'}<br>${dt}<br>${sk}`;
+      return `<strong>${rl}</strong><br>${v.route_operator || 'Unknown operator'}<br>Trip ${v.trip_id ?? '?'}<br>${dt}<br>${sk}` + tripSummaryHtml(v);
+    }
+
+    // ---- Click a bus: draw its route and upcoming stops ----
+    // /api/trip returns the trip's timetable shape (from gtfs-r-scrape's
+    // weekly lookup) and every stop the live feed still lists for it, each
+    // with its predicted delay. The line is split where the bus is now:
+    // faded dashes behind it, solid ahead. Stops are coloured by the same
+    // TfNSW on-time window as the markers, so you can see whether the
+    // bus's lateness is expected to grow or recover before it terminates.
+    // Re-fetched on every vehicle poll while the popup is open.
+    const ON_TIME_EARLY_SEC = {{ on_time_early_sec }}, ON_TIME_LATE_SEC = {{ on_time_late_sec }};
+    const STATUS_LATE = '{{ status_late }}', STATUS_EARLY = '{{ status_early }}', STATUS_ON_TIME = '{{ status_on_time }}';
+    const ROUTE_AHEAD = '#1f2a44', ROUTE_BEHIND = '#5b6474';
+    let selectedKey = null, selectedTripId = null, tripDetail = null, tripReq = 0;
+
+    function escHtml(t) {
+      return String(t).replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
+    }
+    function fmtDelay(sec) {
+      if (sec == null) return 'no prediction';
+      const m = Math.round(sec / 6) / 10;
+      return m === 0 ? 'on schedule' : `${m > 0 ? '+' : ''}${m} min`;
+    }
+    function stopColour(sec) {
+      if (sec == null) return '#888';
+      if (sec < ON_TIME_EARLY_SEC) return STATUS_EARLY;
+      if (sec > ON_TIME_LATE_SEC) return STATUS_LATE;
+      return STATUS_ON_TIME;
+    }
+    function stopLabel(s) { return s.name || `Stop ${s.stop_id}`; }
+
+    // Popup lines for the selected trip: next stop, and the last stop the
+    // feed predicts for — the bus's delay "outlook" along the route.
+    function tripSummaryHtml(v) {
+      if (!v.trip_id || v.trip_id !== selectedTripId) return '';
+      if (!tripDetail) return '<div class="trip-summary trip-muted">Loading route&hellip;</div>';
+      const st = tripDetail.stops || [];
+      let html = '<div class="trip-summary">';
+      if (st.length) {
+        const next = st[0], last = st[st.length - 1];
+        html += `Next: ${escHtml(stopLabel(next))} <span class="trip-delay" style="color:${stopColour(next.delay_sec)}">${fmtDelay(next.delay_sec)}</span>`;
+        if (st.length > 1) {
+          html += `<br>${st.length - 1} more stop${st.length > 2 ? 's' : ''} to ${escHtml(stopLabel(last))} <span class="trip-delay" style="color:${stopColour(last.delay_sec)}">${fmtDelay(last.delay_sec)}</span>`;
+          if (next.delay_sec != null && last.delay_sec != null) {
+            const ch = (last.delay_sec - next.delay_sec) / 60;
+            if (Math.abs(ch) >= 0.5) html += `<br><span class="trip-muted">Predicted to ${ch > 0 ? 'lose' : 'recover'} ${Math.abs(Math.round(ch * 10) / 10)} min by then</span>`;
+          }
+        }
+      } else {
+        html += '<span class="trip-muted">No upcoming stops in the live feed</span>';
+      }
+      if (tripDetail.shape_error) html += `<br><span class="trip-muted">Route line: ${escHtml(tripDetail.shape_error.toLowerCase())}</span>`;
+      return html + '</div>';
+    }
+
+    // Index of the shape vertex nearest the bus (equirectangular distance
+    // is plenty at this scale), so the line can be split there.
+    function nearestVertex(pts, lat, lon) {
+      const k = Math.cos(lat * Math.PI / 180);
+      let best = 0, bd = Infinity;
+      for (let i = 0; i < pts.length; i++) {
+        const dy = pts[i][0] - lat, dx = (pts[i][1] - lon) * k, d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    }
+    function drawTrip(detail, v) {
+      tripLayer.clearLayers();
+      if (detail.shape && detail.shape.length >= 4) {
+        const flat = decodeRouteLines([detail.shape])[0].pts;
+        const pts = [];
+        for (let i = 0; i < flat.length; i += 2) pts.push([flat[i], flat[i + 1]]);
+        const cut = (v && v.lat != null) ? nearestVertex(pts, v.lat, v.lon) : 0;
+        const behind = pts.slice(0, cut + 1), ahead = pts.slice(cut);
+        const opts = { renderer: tripRenderer, interactive: false, lineCap: 'round', lineJoin: 'round' };
+        if (behind.length > 1) L.polyline(behind, { ...opts, color: ROUTE_BEHIND, weight: 3, opacity: 0.55, dashArray: '4 6' }).addTo(tripLayer);
+        if (ahead.length > 1) {
+          // White casing under the line keeps it legible over the darkest
+          // heat colours and on the projected model.
+          L.polyline(ahead, { ...opts, color: '#fff', weight: 8, opacity: 0.85 }).addTo(tripLayer);
+          L.polyline(ahead, { ...opts, color: ROUTE_AHEAD, weight: 4, opacity: 0.95 }).addTo(tripLayer);
+        }
+      }
+      (detail.stops || []).forEach((s, i) => {
+        if (s.lat == null || s.lon == null) return;
+        L.circleMarker([s.lat, s.lon], {
+          renderer: tripRenderer, radius: i === 0 ? 7 : 5, weight: 2, color: '#fff',
+          fillColor: stopColour(s.delay_sec), fillOpacity: 1,
+        }).bindTooltip(`<strong>${escHtml(stopLabel(s))}</strong><br>${i === 0 ? 'Next stop &middot; ' : ''}${fmtDelay(s.delay_sec)}`,
+                       { direction: 'top', offset: [0, -6], className: 'glass-tooltip' })
+          .addTo(tripLayer);
+      });
+    }
+    async function loadTrip() {
+      const tripId = selectedTripId, key = selectedKey, req = ++tripReq;
+      if (!tripId) return;
+      try {
+        const res = await fetch('/api/trip/' + encodeURIComponent(tripId));
+        const detail = await res.json();
+        if (req !== tripReq || tripId !== selectedTripId) return;  // superseded by a newer click/poll
+        tripDetail = detail;
+        const v = lastVehicles.find(x => (x.vehicle_id || x.trip_id) === key);
+        drawTrip(detail, v);
+        const m = markers.get(key);
+        if (m && v && m.isPopupOpen()) m.getPopup().setContent(popupContent(v));
+      } catch (e) { console.warn('Trip load failed', e); }
+    }
+    function selectTrip(key, v) {
+      if (!v.trip_id) return;
+      if (selectedKey !== key || selectedTripId !== v.trip_id) { tripDetail = null; tripLayer.clearLayers(); }
+      selectedKey = key; selectedTripId = v.trip_id;
+      loadTrip();
+    }
+    function clearTrip(key) {
+      if (key != null && key !== selectedKey) return;  // a different popup closing
+      selectedKey = selectedTripId = tripDetail = null;
+      tripReq++;
+      tripLayer.clearLayers();
     }
     function renderVehicles(vehicles) {
       lastVehicles = vehicles;
@@ -2121,11 +2272,23 @@ HEATMAP_SCRIPT = """\
           const m = L.marker([v.lat, v.lon], { icon }).addTo(markersLayer)
             .bindPopup(popup, { className:'glass-popup' })
             .bindTooltip(tooltip, { direction:'top', offset:[0,-20], className:'glass-tooltip' });
+          m.on('popupopen', () => {
+            const cur = lastVehicles.find(x => (x.vehicle_id || x.trip_id) === key);
+            if (cur) selectTrip(key, cur);
+          });
+          m.on('popupclose', () => clearTrip(key));
           markers.set(key, m);
         }
       });
       for (const [key, m] of markers) { if (!seen.has(key)) { markersLayer.removeLayer(m); markers.delete(key); } }
       updateLiveHeatFromVehicles(vehicles);
+      // Keep the selected bus's route/stops current: it may have passed a
+      // stop or changed trip (end of run) since the last poll.
+      if (selectedKey != null) {
+        const v = vehicles.find(x => (x.vehicle_id || x.trip_id) === selectedKey);
+        if (!v || !v.trip_id) clearTrip();
+        else selectTrip(selectedKey, v);
+      }
     }
     async function pollVehicles() {
       try { const res = await fetch('/api/vehicles' + window.location.search); const data = await res.json(); renderVehicles(data.vehicles || []); }
@@ -2188,6 +2351,9 @@ PAGE = """
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
+  .trip-summary { margin-top:6px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12); }
+  .trip-summary .trip-delay { font-weight:600; }
+  .trip-muted { color:#666; }
   .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
   .heat-panel { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#333; margin-top:6px; padding-top:6px; border-top:1px solid #ddd; width:230px; }
   .heat-panel .hp-section { font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#777; margin:8px 0 4px; }
@@ -2329,6 +2495,9 @@ PROJECT_PAGE = """
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
+  .trip-summary { margin-top:6px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12); }
+  .trip-summary .trip-delay { font-weight:600; }
+  .trip-muted { color:#666; }
   .leaflet-control-layers { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif !important; }
   .heat-panel { font:12px/1.4 -apple-system, Helvetica, Arial, sans-serif; color:#333; margin-top:6px; padding-top:6px; border-top:1px solid #ddd; width:230px; }
   .heat-panel .hp-section { font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; color:#777; margin:8px 0 4px; }
@@ -2796,6 +2965,139 @@ def api_route_shapes():
         resp = Response(gzip.decompress(gz), mimetype="application/json")
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
+
+
+def _fetch_scrape_json(path, timeout=20):
+    """GET a JSON file from gtfs-r-scrape's shapes/ folder; None on any failure."""
+    url = f"{TRIP_LOOKUP_BASE}/{path}"
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            print(f"[trip] GET {url} -> HTTP {r.status_code}", flush=True)
+            return None
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        print(f"[trip] GET {url} failed: {e}", flush=True)
+        return None
+
+
+def get_trip_lookup_meta():
+    """(n_shards, {stop_id: (lat, lon, name)}), or (None, {}) if the lookup
+    hasn't been built yet. A new build (different 'generated' stamp) also
+    drops cached shards, since they may now point at different files."""
+    now = time.monotonic()
+    c = _trip_meta_cache
+    if c["n_shards"] and now - c["fetched_at"] < TRIP_LOOKUP_TTL_SECONDS:
+        return c["n_shards"], c["stops"]
+    with _trip_lookup_lock:
+        now = time.monotonic()
+        if c["n_shards"] and now - c["fetched_at"] < TRIP_LOOKUP_TTL_SECONDS:
+            return c["n_shards"], c["stops"]
+        manifest = _fetch_scrape_json("trip_lookup.json")
+        if not manifest or not manifest.get("n_shards"):
+            return c["n_shards"], c["stops"] or {}  # keep a stale copy if we have one
+        stops_raw = _fetch_scrape_json("stops.json", timeout=30) or {}
+        stops = {sid: (v[0] / 1e5, v[1] / 1e5, v[2]) for sid, v in stops_raw.items()
+                 if isinstance(v, list) and len(v) >= 3}
+        if manifest.get("generated") != c["generated"]:
+            _trip_shards.clear()
+        c.update(n_shards=int(manifest["n_shards"]), generated=manifest.get("generated"),
+                 stops=stops or c["stops"] or {}, fetched_at=now)
+        print(f"[trip] lookup {c['generated']}: {c['n_shards']} shards, {len(c['stops'])} stops", flush=True)
+        return c["n_shards"], c["stops"]
+
+
+def _get_trip_shard(kind, key, n_shards):
+    k = zlib.crc32(key.encode("utf-8")) % n_shards
+    ck = (kind, k)
+    now = time.monotonic()
+    with _trip_lookup_lock:
+        hit = _trip_shards.get(ck)
+        if hit and now - hit[0] < TRIP_LOOKUP_TTL_SECONDS:
+            _trip_shards.move_to_end(ck)
+            return hit[1]
+    data = _fetch_scrape_json(f"{kind}/{k:03d}.json")
+    if data is None:
+        return hit[1] if hit else None  # stale copy if we have one
+    with _trip_lookup_lock:
+        _trip_shards[ck] = (now, data)
+        _trip_shards.move_to_end(ck)
+        while len(_trip_shards) > TRIP_SHARD_CACHE_MAX:
+            _trip_shards.popitem(last=False)
+    return data
+
+
+def compute_trip_detail(trip_id):
+    """Route shape and upcoming stops for one live trip.
+
+    Stops: every stop_time_update the live feed currently has for the trip
+    (TfNSW only lists stops still to come), in stop_sequence order, each
+    with its predicted delay — so the response shows how the bus's current
+    lateness is expected to grow or recover along the rest of the route.
+    Shape: the timetable shape for the trip from gtfs-r-scrape, encoded as
+    in /api/route_shapes; null if the trip isn't in the lookup."""
+    all_rows, agency_names, trip_headsigns, _ = get_all_rows_cached()
+    n_shards, stops_lookup = get_trip_lookup_meta()
+
+    trip_rows = sorted((r for r in all_rows if r["trip_id"] == trip_id), key=lambda r: r["stop_sequence"])
+    stops = []
+    for r in trip_rows:
+        info = stops_lookup.get(r["stop_id"])
+        stops.append({
+            "stop_id": r["stop_id"],
+            "seq": r["stop_sequence"],
+            "name": info[2] if info else None,
+            "lat": info[0] if info else None,
+            "lon": info[1] if info else None,
+            "delay_sec": None if r["anomaly"] else r["delay"],
+        })
+
+    shape, shape_error = None, None
+    if not n_shards:
+        shape_error = "Route lookup not built yet"
+    else:
+        trips = _get_trip_shard("trips", trip_id, n_shards)
+        shape_id = trips.get(trip_id) if trips is not None else None
+        if shape_id is None and trips is not None and "_" in trip_id:
+            # Operators' added/duplicated runs appear in the live feed as
+            # "<timetabled trip>_2" etc. and follow the original's route.
+            base = trip_id.rsplit("_", 1)[0]
+            base_trips = _get_trip_shard("trips", base, n_shards)
+            shape_id = base_trips.get(base) if base_trips else None
+        if trips is None:
+            shape_error = "Couldn't load route lookup"
+        elif shape_id is None:
+            shape_error = "Trip not in this week's timetable"
+        else:
+            geom = _get_trip_shard("geom", shape_id, n_shards)
+            shape = geom.get(shape_id) if geom is not None else None
+            if shape is None:
+                shape_error = "Route shape unavailable"
+
+    route_id = trip_rows[0]["route_id"] if trip_rows else None
+    route_num, route_operator = split_route(route_id, agency_names) if route_id else ("", "")
+    return {
+        "trip_id": trip_id,
+        "route_id": route_id,
+        "route_num": route_num,
+        "route_operator": route_operator,
+        "headsign": trip_headsigns.get(trip_id) if trip_headsigns else None,
+        "shape": shape,
+        "shape_error": shape_error,
+        "stops": stops,
+    }
+
+
+@app.route("/api/trip/<path:trip_id>")
+def api_trip(trip_id):
+    """Route shape and upcoming stops (with predicted delays) for one live
+    trip — what the map draws when a bus marker is clicked."""
+    if not API_KEY:
+        return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
+    try:
+        return jsonify(compute_trip_detail(trip_id))
+    except Exception as e:
+        return jsonify({"trip_id": trip_id, "shape": None, "stops": [], "error": f"Server error: {e}"}), 200
 
 
 @app.route("/api/heatmap")

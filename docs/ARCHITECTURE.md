@@ -12,6 +12,7 @@ The app is organised into three main layers:
 - Uses short-lived, lock-protected in-memory caches to reduce repeated API requests and prevent concurrent duplicate fetches.
 - Fetches historical daily CSV data from the `gtfs-r-scrape` repository for the heatmap: `data/` (GitHub Actions scrape, 3–6 snapshots a day) and `data-local/` (same format, from `local_collector.py` on a home machine every 15 minutes, pushed manually). Both are read for every day in the window.
 - Records trip-update readings in `CIVL3704/delay_log.csv`.
+- For a clicked bus, fetches only the matching shards of gtfs-r-scrape's per-trip lookup (`shapes/trips/NNN.json` for trip → shape, `shapes/geom/NNN.json` for the shape, shard = `zlib.crc32(id) % 128`) plus `shapes/stops.json` once, held in a bounded LRU cache so the full timetable never loads into the 512 MB instance.
 
 ## 2. Processing layer
 
@@ -25,13 +26,15 @@ The app is organised into three main layers:
 - Aggregates historical readings into geographic grid cells.
 - Calculates historical heatmap values for average delay, delay burden (total lateness), % not on time (TfNSW KPI window, -59s to +5:59), speed and bus density. Average delay and % not on time are sent as raw per-cell values weighted by reading count, plus a network prior (`metric_prior`) the client uses for per-pixel empirical-Bayes shrinkage (`SHRINK_PRIOR_N`). Median and SD are still accepted by `/api/heatmap` but no longer offered in the UI (at ~1.3 readings per cell they add nothing over the mean).
 - Prepares vehicle data for both the dashboard and the `/api/vehicles` endpoint.
+- Builds a selected trip's detail (`/api/trip/<trip_id>`): every remaining stop-time update for the trip from the cached live feed, in stop order with predicted delays, joined to stop names and locations and to the trip's timetable shape.
 
 ## 3. Visualisation layer
 
-- Flask serves the dashboard, `/api/vehicles`, `/api/heatmap` (`window=1|24|168|720` or `window=custom&start=&end=`), `/api/validation` (on-time running by operator from the scraped history, JSON or `&format=csv`, for comparison with TfNSW's published results), `/api/route_shapes`, `/status`, `/health` and `/ping` endpoints.
+- Flask serves the dashboard, `/api/vehicles`, `/api/heatmap` (`window=1|24|168|720` or `window=custom&start=&end=`), `/api/validation` (on-time running by operator from the scraped history, JSON or `&format=csv`, for comparison with TfNSW's published results), `/api/route_shapes`, `/api/trip/<trip_id>`, `/status`, `/health` and `/ping` endpoints.
 - Jinja renders summary tables for operators, routes and individual trips.
 - Leaflet displays live vehicle markers on an interactive map.
 - Marker outlines show whether a vehicle is on time, late, early or has no delay data.
+- Clicking a marker draws that trip's route in its own pane between the heat layers and the markers, split at the vehicle's nearest shape vertex (dashed behind, solid with a white casing ahead), with upcoming stops coloured by predicted delay against the on-time window. The popup summarises the next stop, the last predicted stop and the expected change in delay; it refreshes with each vehicle poll and clears when the popup closes.
 - Value metrics (average delay, % not on time, speed) render through a custom `FieldLayer`: a confidence- and Gaussian-weighted mean per pixel (normalised convolution) with opacity from data support, coloured with perceptually ordered ramps interpolated in OKLab. Density stays on Leaflet.heat, whose additive stacking is correct only for counts.
 - Leaflet.heat displays the additive metrics (delay burden, bus density).
 - An optional route mask clips both heat layers to the bus road network: `gtfs-r-scrape/build_route_shapes.py` (weekly GitHub Action) de-duplicates TfNSW GTFS `shapes.txt` within 12 km of the CBD into `shapes/route_shapes.json`; the app serves it gzipped from `/api/route_shapes` and the client strokes it with a `destination-in` composite after each heat redraw.

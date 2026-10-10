@@ -34,6 +34,7 @@ Open [http://localhost:5000](http://localhost:5000) in a browser. The first page
 - Live bus delay information, with on time defined by the TfNSW on-time running KPI (no more than 59 seconds early or 5 minutes 59 seconds late)
 - Operator and route summaries
 - Interactive vehicle map with delay-status marker colours
+- Click a bus to see its route and upcoming stops, coloured by predicted delay
 - Live and historical heatmaps: average delay, delay burden, not on time, speed and bus density
 - Historical windows from the last hour to 30 days, custom date ranges and time-of-day filters
 - Heatmaps clipped to the bus road network so delay reads along corridors
@@ -45,6 +46,7 @@ The dashboard automatically refreshes vehicle positions every 15 seconds and the
 ## Visualisations
 
 - **Live map:** Each marker represents a currently reporting bus. The label shows its route, and the arrow shows its direction of travel. Marker outlines indicate the bus status: white for on time (0:59 early to 5:59 late, matching the TfNSW on-time KPI), red for late, green for early, and grey when delay data is unavailable or anomalous.
+- **Selected bus:** Clicking a bus draws its route (dashed behind the bus, solid ahead) and the stops it still has to serve. Each stop is coloured by the delay TfNSW currently predicts the bus will have there, using the same on-time window: blue on time, red late, green early, grey no prediction. The popup names the next stop and the last predicted stop, and says how much time the bus is expected to lose or recover by then. Hover a stop for its name and predicted delay. The route and stops refresh with each 15-second update and clear when the popup closes.
 - **Heatmap metric:** The Heatmap section of the map menu offers five metrics. *Average delay* (0–5 min scale) and *Not on time* (share of readings outside the TfNSW on-time window, 0–60% scale) are drawn as an averaged field: colour is the local mean of readings within 250 m, shrunk toward the network average where data is thin so a single late bus can't paint a hotspot, and opacity shows how much data backs it. *Speed* (0–80 km/h; amber = CBD streets, pink = arterials, purple = motorways) is averaged the same way over 160 m. *Delay burden* (total bus-minutes late) and *Bus density* are additive heatmaps, so busy corridors rank high by design. The live layer shows each bus's current value. "About the heatmaps" under the map explains each metric.
 - **Route clipping:** "Route clip" trims both heat layers to within ±15–100 m of the bus road network (TfNSW GTFS route shapes, rebuilt weekly in gtfs-r-scrape), so delay reads along corridors instead of as round blobs. Set it to Off for the unclipped view.
 - **Historical heatmap:** Historical data can be viewed over the last hour, 24 hours, 7 days, 30 days (the default — the GitHub scraper only gets 3–6 snapshots a day, so shorter windows are sparse) or a custom date range of up to 62 days, and filtered to a time of day (AM peak 06:00–10:00, midday 10:00–15:00, PM peak 15:00–19:00, evening 19:00–06:00). The map aggregates vehicle readings into geographic cells, so each coloured area represents activity within a small location rather than a single bus.
@@ -66,6 +68,7 @@ The calibration is saved in that browser. The calibration box also shows a link 
 - **Live data:** TfNSW GTFS-Realtime bus trip updates (delays) and vehicle positions, joined on trip ID. The static GTFS timetable supplies operator names and trip destinations.
 - **Historical data:** Vehicle positions with delays are collected by the separate [gtfs-r-scrape](https://github.com/Joey-Hain/gtfs-r-scrape) repository into daily CSV files (`data/` from a GitHub Action, `data-local/` from a home machine running `local_collector.py`). The dashboard reads both for each day in the selected window.
 - **Route shapes:** gtfs-r-scrape also builds `shapes/route_shapes.json`, a de-duplicated bus road network within 12 km of the CBD, used for route clipping.
+- **Selected-bus route and stops:** upcoming stops and their predicted delays come from the live trip update feed. The same gtfs-r-scrape job writes a per-trip lookup (trip to route shape, each route's shape, and stop names and locations) split into small files, so the dashboard downloads only the piece a click needs.
 
 ## API
 
@@ -79,6 +82,7 @@ All endpoints return JSON unless noted.
 | `/api/heatmap` | Historical heatmap points. `window=1`, `24`, `168` or `720` (hours), or `window=custom&start=YYYY-MM-DD&end=YYYY-MM-DD`; `metric=delay`, `delay_total`, `frequency`, `speed` or `density`; `period=all`, `am_peak`, `midday`, `pm_peak` or `evening`. |
 | `/api/validation` | On-time, early and late percentages and mean lateness by operator from the historical data, for comparison with TfNSW's published on-time running. Same `window` parameters; `format=csv` for a spreadsheet. |
 | `/api/route_shapes` | The bus road network used for route clipping. |
+| `/api/trip/<trip_id>` | One live trip: its route shape (`shape`, encoded like `/api/route_shapes`, or null with `shape_error` explaining why), headsign, operator, and upcoming `stops` in order, each with `stop_id`, `name`, `lat`, `lon`, `seq` and predicted `delay_sec`. |
 | `/status` | Cache and timetable diagnostics. |
 | `/ping` | Health check; returns `pong`. |
 
