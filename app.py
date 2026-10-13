@@ -1441,6 +1441,7 @@ HEATMAP_SCRIPT = """\
     // having more readings. kind 'sum' = classic additive heatmap
     // (Leaflet.heat), which is exactly right for density and only density.
     const DELAY_TICKS = ['0', '1', '2', '3', '4', `${DELAY_CAP_MIN}+ min`];
+    const SEVERITY_TICKS = ['0', '2', '4', '6', '8', `${SEVERITY_CAP_MIN}+ min`];
     // radiusM / fullSupport (field metrics only): delay and not-on-time
     // pool over a wider radius and need more data before reaching full
     // opacity, because individual delay readings are noisy and sparse;
@@ -1454,6 +1455,22 @@ HEATMAP_SCRIPT = """\
         liveTitle: 'Live: current delay (min)',
         histTitle: 'Historical: average delay (min)',
         ticks: DELAY_TICKS,
+      },
+      delay_median: {
+        label: 'Median delay', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
+        desc: 'Historical: median lateness of readings within 250 m (early running counts as 0). The live map shows current delay because it has only one reading per bus.',
+        radiusM: 250, fullSupport: 3,
+        liveTitle: 'Live: current delay (min)',
+        histTitle: 'Historical: median delay (min)',
+        ticks: SEVERITY_TICKS,
+      },
+      delay_std: {
+        label: 'Delay standard deviation', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
+        desc: 'Historical: variation in lateness within 250 m, measured as standard deviation (early running counts as 0). The live map shows current delay because it has only one reading per bus.',
+        radiusM: 250, fullSupport: 3,
+        liveTitle: 'Live: current delay (min)',
+        histTitle: 'Historical: delay standard deviation (min)',
+        ticks: SEVERITY_TICKS,
       },
       delay_total: {
         label: 'Delay burden', kind: 'sum', hist: 'RdPu', live: 'PuBu',
@@ -2067,8 +2084,8 @@ HEATMAP_SCRIPT = """\
         if (v.delay_min == null || v.anomaly || v.on_time == null) return null;
         return v.on_time ? 0 : 1;
       }
-      // delay (default): weight by this vehicle's own lateness, not by
-      // 1-per-vehicle — otherwise the heat layer just draws the route
+      // Delay metrics use each vehicle's own lateness, not one point per
+      // vehicle — otherwise the heat layer just draws the route
       // network (wherever buses happen to be) rather than where they're
       // currently running late. Vehicles with no delay reading or a
       // flagged anomaly don't contribute a heat point (still shown as a
