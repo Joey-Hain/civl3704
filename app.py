@@ -2387,6 +2387,7 @@ PAGE = """
   .heat-help { margin:10px 0 0; font-size:0.85rem; color:#444; }
   .heat-help summary { cursor:pointer; font-weight:600; }
   .heat-help p { margin:8px 0; }
+  .heat-help p, .heat-help dd, .heat-panel .hp-desc { text-align:justify; text-justify:inter-word; hyphens:auto; }
   .heat-help dl { margin:6px 0 0; display:grid; grid-template-columns:max-content 1fr; gap:4px 14px; }
   .heat-help dt { font-weight:600; }
   .heat-help dd { margin:0; }
