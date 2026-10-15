@@ -56,10 +56,10 @@ The dashboard automatically refreshes vehicle positions every 15 seconds and the
 
 ## Projector calibration
 
-By default `/project` places the model exactly where TransportLab's smart-city rig does, using the projector settings in its [`params.json5`](https://github.com/TransportLab/smart-city/blob/main/params.json5): the model's 2:1 box spans the full window width, is vertically centred and shifted down by `vertical_offset` (50 px, which moves the box 25 px because of the centring), and is stretched horizontally by `horizontal_scale` (1.184) about the centre. On a 1920×1080 projector this leaves black bands above and below the model, and the model's east and west edges run slightly past the sides of the projector image, matching the rig. These values are set in `app.py` (`SMART_CITY_*`). Manual calibration is only needed if the projector has moved.
+By default `/project` places the model exactly where TransportLab's smart-city rig does, using the projector settings in its [`params.json5`](https://github.com/TransportLab/smart-city/blob/main/params.json5): the model's 2:1 box spans the full window width, is vertically centred and shifted down by `vertical_offset` (50 px, which moves the box 25 px because of the centring), and is stretched horizontally by `horizontal_scale` (1.184) about the centre. At those settings the stretched box would be wider than a 1920×1080 image, so it is shrunk (same stretch ratio, same centre) until all four corners are on screen: the model spans the full width with black bands above and below. These values are set in `app.py` (`SMART_CITY_*`). Manual calibration is only needed if the projector has moved.
 
 1. Open `/project` on the computer connected to the projector, full screen (F11) at the projector's native resolution.
-2. Press C (or "Calibrate projection" in the menu). A crosshair appears on each corner of the model's area (the east and west crosshairs start off-screen at the default geometry; select them with Tab and move them with the arrow keys).
+2. Press C (or "Calibrate projection" in the menu). A crosshair appears on each corner of the model's area.
 3. Drag each crosshair onto the matching corner of the physical model. Tab selects the next crosshair and the arrow keys nudge it by 1 px (Shift for 10 px). Align to street-level corners rather than building tops, as the buildings stand above the table.
 4. Press C again to finish. The map is warped so the model's corners land on the crosshairs, and nothing is projected outside them.
 

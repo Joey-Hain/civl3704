@@ -2605,10 +2605,9 @@ PROJECT_PAGE = """
     // smart-city rig puts it (params.json5): a full-width box with the
     // model's aspect ratio, vertically centred and nudged down by
     // vertical_offset, the bounds fitted inside it, then stretched
-    // horizontally by horizontal_scale about the centre. Everything outside
-    // the box is black (bands top/bottom, or at the sides if the window's
-    // aspect differs), and the box's east/west edges may run off-screen,
-    // exactly as on the rig. In calibration mode (C, or the
+    // horizontally by horizontal_scale about the centre. If that leaves a
+    // corner off-screen the box is shrunk (same stretch ratio and centre)
+    // until all four are on screen. Everything outside the box is black. In calibration mode (C, or the
     // "Calibrate" button) a crosshair sits on each model corner; drag them
     // (or select one and use the arrow keys, Shift = 10 px) until each lands
     // on the matching corner of the physical model. The map is then warped
@@ -2656,9 +2655,16 @@ PROJECT_PAGE = """
       const [[sx0, sy0], , [sx1, sy1]] = srcCorners();
       const bw = sx1 - sx0, bh = sy1 - sy0;
       const s = Math.min(W / bw, Hc / bh);
-      const w = bw * s * H_SCALE, h = bh * s;
+      let w = bw * s * H_SCALE, h = bh * s;
+      const cy = top + Hc / 2;  // smart-city's vertical centre of the box
+      // At the rig's settings the stretched box is wider than the screen,
+      // which would put the east/west corners (and their crosshairs) off the
+      // page. Shrink it uniformly, keeping the stretch ratio and the box's
+      // centre, until all four corners are on screen.
+      const fit = Math.min(1, W / w, H / h, 2 * cy / h, 2 * (H - cy) / h);
+      w *= fit; h *= fit;
       const x0 = W / 2 - w / 2, x1 = W / 2 + w / 2;
-      const y0 = top + (Hc - h) / 2, y1 = y0 + h;
+      const y0 = cy - h / 2, y1 = cy + h / 2;
       return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
     }
 
@@ -2763,8 +2769,7 @@ PROJECT_PAGE = """
       const hd = document.createElement('div');
       hd.className = `cal-handle c-${name.toLowerCase()}`;
       // The transparent rect makes the whole 80 px square grabbable, not just
-      // the drawn lines. With the default geometry the east/west corners can
-      // sit off-screen; select them with Tab and nudge with the arrow keys.
+      // the drawn lines — the default corners can sit right on the window edge.
       hd.innerHTML = `<svg width="80" height="80"><rect width="80" height="80" fill="transparent" pointer-events="all"/><circle cx="40" cy="40" r="14" fill="none" stroke="#fff" stroke-width="3"/><circle cx="40" cy="40" r="14" fill="none" stroke="#d0021b" stroke-width="1.5"/><path d="M0 40H80M40 0V80" stroke="#fff" stroke-width="3"/><path d="M0 40H80M40 0V80" stroke="#d0021b" stroke-width="1.5"/></svg><span class="cal-label">${name}</span>`;
       document.body.appendChild(hd);
       hd.addEventListener('pointerdown', e => {
