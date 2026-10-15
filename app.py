@@ -2543,7 +2543,7 @@ PROJECT_PAGE = """
   .heat-legend .heat-legend-title { font-weight:600; margin-bottom:2px; }
   .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
-  #heatLoadingBanner { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:900; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
+  #heatLoadingBanner { position:fixed; top:10px; left:50%; transform:translateX(-50%); z-index:1050; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
   /* Calibration: black everywhere outside the four corner crosshairs, the
      crosshairs themselves (calibration mode only) and the help box. */
   #projMask { position:fixed; inset:0; width:100%; height:100%; z-index:850; pointer-events:none; }
@@ -2627,6 +2627,10 @@ PROJECT_PAGE = """
     projControls.id = 'projControls';
     document.body.appendChild(projControls);
     projControls.appendChild(layersControl.getContainer());
+    // Same for the "Updating heatmap…" banner: inside the map it would be
+    // warped and sit in the masked band above the model. Pinned to the
+    // screen instead, just inside the model's top edge (applyCalibration).
+    document.body.appendChild(heatLoadingBanner);
 
     const CORNERS = ['NW', 'NE', 'SE', 'SW'];
     // v2: calibrations saved before the smart-city default geometry were
@@ -2723,6 +2727,11 @@ PROJECT_PAGE = """
       const W = window.innerWidth, H = window.innerHeight;
       maskSvg.setAttribute('viewBox', `0 0 ${W} ${H}`);
       maskPath.setAttribute('d', `M0 0H${W}V${H}H0Z M${q.map(p => p.join(' ')).join(' L')} Z`);
+      // Banner: centred on the visible part of the model's top edge.
+      const topY = Math.max(q[0][1], q[1][1]);
+      const midX = (Math.max(0, Math.min(q[0][0], q[3][0])) + Math.min(W, Math.max(q[1][0], q[2][0]))) / 2;
+      heatLoadingBanner.style.top = Math.min(Math.max(topY, 0) + 10, H - 40) + 'px';
+      heatLoadingBanner.style.left = midX + 'px';
       handles.forEach((hd, i) => {
         hd.style.left = q[i][0] + 'px'; hd.style.top = q[i][1] + 'px';
         hd.classList.toggle('selected', i === selected);
