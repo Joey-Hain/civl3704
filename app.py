@@ -303,11 +303,20 @@ TRIP_SHARD_CACHE_MAX = 64
 # it can be checked against the physical model for alignment. Hardcoded
 # from that project's params.json5 (model.corners.ne / model.corners.sw:
 # https://github.com/TransportLab/smart-city/blob/main/params.json5) rather
-# than fetched live — Donald only needs these two corners, not the rest of
-# that repo's config, and it's one number pair that only changes if the
-# physical model itself is rebuilt.
+# than fetched live; they only change if the physical model is rebuilt or
+# the rig is re-tuned.
 SMART_CITY_CORNER_NE = (-33.83512300658737, 151.27599316594075)
 SMART_CITY_CORNER_SW = (-33.894722633376766, 151.13296645445593)
+# Projector geometry from the same file. smart-city lays the map out as a
+# full-width box with the model's aspect ratio (model.width / model.height),
+# vertically centred (flexbox, so margin-top: vertical_offset shifts it by
+# half that), then stretches it horizontally with transform: scaleX(
+# horizontal_scale) about its centre — values hand-tuned on the real rig.
+# /project reproduces that layout exactly as its default (uncalibrated)
+# projection, so the model's corners land where the rig expects them.
+SMART_CITY_MODEL_MM = (2400, 1200)            # model.width, model.height
+SMART_CITY_PROJ_VERTICAL_OFFSET_PX = 50       # projector.vertical_offset
+SMART_CITY_PROJ_HORIZONTAL_SCALE = 1.1839999999999904  # projector.horizontal_scale
 
 COLOR_FILL = "#00B3F0"
 OUTLINE_ON_TIME = "#ffffff"
@@ -2590,10 +2599,16 @@ PROJECT_PAGE = """
     map.setMaxBounds(PROJECT_BOUNDS);
 """ + HEATMAP_SCRIPT + """
 
-    // ---- Projector calibration (corner pin) ----
+    // ---- Projector geometry + calibration (corner pin) ----
     // The physical model's four corners are PROJECT_BOUNDS' corners. With no
-    // calibration the page behaves as before: the box fills the window and
-    // everything outside it is black. In calibration mode (C, or the
+    // manual calibration the box is placed exactly where TransportLab's
+    // smart-city rig puts it (params.json5): a full-width box with the
+    // model's aspect ratio, vertically centred and nudged down by
+    // vertical_offset, the bounds fitted inside it, then stretched
+    // horizontally by horizontal_scale about the centre. Everything outside
+    // the box is black (bands top/bottom, or at the sides if the window's
+    // aspect differs), and the box's east/west edges may run off-screen,
+    // exactly as on the rig. In calibration mode (C, or the
     // "Calibrate" button) a crosshair sits on each model corner; drag them
     // (or select one and use the arrow keys, Shift = 10 px) until each lands
     // on the matching corner of the physical model. The map is then warped
@@ -2614,15 +2629,42 @@ PROJECT_PAGE = """
     projControls.appendChild(layersControl.getContainer());
 
     const CORNERS = ['NW', 'NE', 'SE', 'SW'];
-    const CAL_KEY = 'projector.calibration';
+    // v2: calibrations saved before the smart-city default geometry were
+    // relative to the old fill-the-window layout, so they're not reused.
+    const CAL_KEY = 'projector.calibration.v2';
     const mapEl = document.getElementById('dashmap');
-    let dst = null;        // [[x,y] x4] screen px, NW NE SE SW; null = uncalibrated
+    let dst = null;        // [[x,y] x4] screen px, NW NE SE SW; null = smart-city default
     let selected = 0;
 
+    const MODEL_ASPECT = {{ model_aspect }};   // model.width / model.height
+    const V_OFFSET = {{ v_offset }};           // projector.vertical_offset (px)
+    const H_SCALE = {{ h_scale }};             // projector.horizontal_scale
+
+    // Where smart-city's CSS/Leaflet layout puts the model box on screen
+    // (NW NE SE SW): #map is 100vw x 100vw/aspect, flex-centred with
+    // margin-top: V_OFFSET (so the box moves down V_OFFSET/2), fitBounds()
+    // with zoomSnap 0 centres the bounds inside it, and scaleX(H_SCALE)
+    // stretches about the container's centre.
+    function defaultQuad() {
+      const W = window.innerWidth, H = window.innerHeight;
+      const Hc = W / MODEL_ASPECT;
+      const top = (H - (Hc + V_OFFSET)) / 2 + V_OFFSET;
+      const [[sx0, sy0], , [sx1, sy1]] = srcCorners();
+      const bw = sx1 - sx0, bh = sy1 - sy0;
+      const s = Math.min(W / bw, Hc / bh);
+      const w = bw * s * H_SCALE, h = bh * s;
+      const x0 = W / 2 - w / 2, x1 = W / 2 + w / 2;
+      const y0 = top + (Hc - h) / 2, y1 = y0 + h;
+      return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+    }
+
     // Unwarped pixel corners of the model box (what the warp maps FROM).
+    // latLngToContainerPoint() rounds to whole pixels, which is ~1 px off at
+    // the projector's scale, so project without rounding.
+    const exactPoint = ll => map.layerPointToContainerPoint(map.project(ll).subtract(map.getPixelOrigin()));
     function srcCorners() {
-      const nw = map.latLngToContainerPoint(PROJECT_BOUNDS.getNorthWest());
-      const se = map.latLngToContainerPoint(PROJECT_BOUNDS.getSouthEast());
+      const nw = exactPoint(PROJECT_BOUNDS.getNorthWest());
+      const se = exactPoint(PROJECT_BOUNDS.getSouthEast());
       return [[nw.x, nw.y], [se.x, nw.y], [se.x, se.y], [nw.x, se.y]];
     }
 
@@ -2661,21 +2703,24 @@ PROJECT_PAGE = """
     maskSvg.appendChild(maskPath);
     document.body.appendChild(maskSvg);
 
-    function currentQuad() { return dst || srcCorners(); }
+    function currentQuad() { return dst || defaultQuad(); }
 
     function applyCalibration() {
       const src = srcCorners();
-      let ok = true;
-      if (dst) {
-        const h = homography(src, dst);
-        if (h && h.every(Number.isFinite)) {
-          const [h11, h12, h13, h21, h22, h23, h31, h32] = h;
-          mapEl.style.transform = `matrix3d(${h11},${h21},0,${h31},${h12},${h22},0,${h32},0,0,1,0,${h13},${h23},0,1)`;
-        } else { ok = false; }
+      let q = currentQuad();
+      let h = homography(src, q);
+      if (!(h && h.every(Number.isFinite))) {  // degenerate manual quad: fall back
+        q = defaultQuad();
+        h = homography(src, q);
       }
-      if (!dst || !ok) mapEl.style.transform = '';
+      if (h && h.every(Number.isFinite)) {
+        const [h11, h12, h13, h21, h22, h23, h31, h32] = h;
+        mapEl.style.transform = `matrix3d(${h11},${h21},0,${h31},${h12},${h22},0,${h32},0,0,1,0,${h13},${h23},0,1)`;
+      } else {
+        mapEl.style.transform = '';
+      }
       // Black everywhere except inside the quadrilateral.
-      const W = window.innerWidth, H = window.innerHeight, q = currentQuad();
+      const W = window.innerWidth, H = window.innerHeight;
       maskSvg.setAttribute('viewBox', `0 0 ${W} ${H}`);
       maskPath.setAttribute('d', `M0 0H${W}V${H}H0Z M${q.map(p => p.join(' ')).join(' L')} Z`);
       handles.forEach((hd, i) => {
@@ -2709,13 +2754,14 @@ PROJECT_PAGE = """
       const hd = document.createElement('div');
       hd.className = `cal-handle c-${name.toLowerCase()}`;
       // The transparent rect makes the whole 80 px square grabbable, not just
-      // the drawn lines — the uncalibrated corners sit right on the window edge.
+      // the drawn lines. With the default geometry the east/west corners can
+      // sit off-screen; select them with Tab and nudge with the arrow keys.
       hd.innerHTML = `<svg width="80" height="80"><rect width="80" height="80" fill="transparent" pointer-events="all"/><circle cx="40" cy="40" r="14" fill="none" stroke="#fff" stroke-width="3"/><circle cx="40" cy="40" r="14" fill="none" stroke="#d0021b" stroke-width="1.5"/><path d="M0 40H80M40 0V80" stroke="#fff" stroke-width="3"/><path d="M0 40H80M40 0V80" stroke="#d0021b" stroke-width="1.5"/></svg><span class="cal-label">${name}</span>`;
       document.body.appendChild(hd);
       hd.addEventListener('pointerdown', e => {
         e.preventDefault();
         selected = i;
-        if (!dst) dst = srcCorners();
+        if (!dst) dst = defaultQuad();
         const start = [e.clientX, e.clientY], orig = dst[i].slice();
         const move = ev => { dst[i] = [orig[0] + ev.clientX - start[0], orig[1] + ev.clientY - start[1]]; applyCalibration(); };
         const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); saveCalibration(); };
@@ -2771,7 +2817,7 @@ PROJECT_PAGE = """
       const d = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key];
       if (!d) return;
       e.preventDefault();
-      if (!dst) dst = srcCorners();
+      if (!dst) dst = defaultQuad();
       dst[selected] = [dst[selected][0] + d[0], dst[selected][1] + d[1]];
       applyCalibration();
       saveCalibration();
@@ -2845,11 +2891,15 @@ def project():
     vehicles, map_error = compute_vehicles(data)
     ne_lat, ne_lng = SMART_CITY_CORNER_NE
     sw_lat, sw_lng = SMART_CITY_CORNER_SW
+    model_w, model_h = SMART_CITY_MODEL_MM
     return render_template_string(
         PROJECT_PAGE,
         vehicles=vehicles, vehicles_json=json.dumps(vehicles),
         color_fill=COLOR_FILL,
         ne_lat=ne_lat, ne_lng=ne_lng, sw_lat=sw_lat, sw_lng=sw_lng,
+        model_aspect=model_w / model_h,
+        v_offset=SMART_CITY_PROJ_VERTICAL_OFFSET_PX,
+        h_scale=SMART_CITY_PROJ_HORIZONTAL_SCALE,
     )
 
 
