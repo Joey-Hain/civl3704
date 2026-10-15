@@ -305,8 +305,8 @@ TRIP_SHARD_CACHE_MAX = 64
 # https://github.com/TransportLab/smart-city/blob/main/params.json5) rather
 # than fetched live; they only change if the physical model is rebuilt or
 # the rig is re-tuned.
-SMART_CITY_CORNER_NE = (-33.83512300658737, 151.27599316594075)
-SMART_CITY_CORNER_SW = (-33.894722633376766, 151.13296645445593)
+SMART_CITY_CORNER_NE = (-33.833633, 151.264819)
+SMART_CITY_CORNER_SW = (-33.896399, 151.142800)
 # Projector geometry from the same file. smart-city lays the map out as a
 # full-width box with the model's aspect ratio (model.width / model.height),
 # vertically centred (flexbox, so margin-top: vertical_offset shifts it by
