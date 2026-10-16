@@ -165,16 +165,19 @@ ON_TIME_LATE_SEC = 359
 GRID_DECIMALS = 4
 # Daily CSVs are DOWNLOADED this many at a time but PARSED one at a time
 # into a single set of cells (see fetch_historical_cells) — parallel
-# downloads hide GitHub's per-request latency for the 30-day window
+# downloads hide GitHub's per-request latency for the 7-day window
 # (~31 files; ~13 MB/day since the collector went 24/7, cached on disk)
 # without each worker holding its own copy of the aggregated cells, which is what kept the old parse-in-workers design at 1.
 HEATMAP_DOWNLOAD_CONCURRENCY = 6
 HEATMAP_DEADLINE_SEC = 20
-# Historical windows offered (hours). 720 = 30 days: GitHub's scheduler only
-# runs the "every 5 minutes" scrape 3-6 times a day, so 7 days averages
-# ~1.3 readings per 10 m cell; 30 days gives the averaged maps ~5x more.
-HEATMAP_WINDOWS = (1, 24, 168, 720)
-HEATMAP_DEFAULT_WINDOW = 720
+# Historical windows offered (hours). A 30-day window (720) was added when
+# the scrape only ran 3-6 times a day and 7 days averaged ~1.3 readings per
+# 10 m cell. Since 12 Oct the collector snapshots every 5 minutes around the
+# clock (~130k rows a day), so 7 days now holds more readings than 30 days
+# used to, while 30 days (~4M rows) is too much to parse on Render's free
+# CPU. The longest window, and custom ranges, are therefore capped at 7 days.
+HEATMAP_WINDOWS = (1, 24, 168)
+HEATMAP_DEFAULT_WINDOW = 168
 # Mean lateness (seconds) at which the heat gradient saturates. Chosen
 # well above ON_TIME_LATE_SEC (359s) so the ramp has room to distinguish
 # "mildly late" from "genuinely stuck" before it maxes out.
@@ -1252,24 +1255,24 @@ class WindowSpec:
             # pushed for it; one that includes today keeps refreshing.
             today = datetime.now(tz=SYDNEY_TZ).date()
             return HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if self.end_date < today else HEATMAP_WINDOW_CACHE_TTL_SECONDS
-        return HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if self.hours > 168 else HEATMAP_WINDOW_CACHE_TTL_SECONDS
+        return HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if self.hours >= 168 else HEATMAP_WINDOW_CACHE_TTL_SECONDS
 
     def describe(self):
         if self.is_custom:
             return f"{self.start_date:%d %b %Y} to {self.end_date:%d %b %Y}"
-        return {1: "last hour", 24: "last 24 hours", 168: "last 7 days", 720: "last 30 days"}.get(
+        return {1: "last hour", 24: "last 24 hours", 168: "last 7 days"}.get(
             self.hours, f"last {self.hours} hours")
 
 
 # Custom ranges: at most this many days, starting no earlier than the scrape
 # keeps data for (gtfs-r-scrape COLLECTOR_RETENTION_DAYS = 60).
-CUSTOM_WINDOW_MAX_DAYS = 62
+CUSTOM_WINDOW_MAX_DAYS = 7  # same cap as the longest preset window
 CUSTOM_WINDOW_LOOKBACK_DAYS = 62
 CUSTOM_CACHE_MAX_ENTRIES = 4  # bound memory: each cached window holds its cells
 
 
 def parse_window_args(args):
-    """WindowSpec from ?window=1|24|168|720 or ?window=custom&start=&end=
+    """WindowSpec from ?window=1|24|168 or ?window=custom&start=&end=
     (YYYY-MM-DD, inclusive). Returns (spec, error_message_or_None)."""
     w = args.get("window", str(HEATMAP_DEFAULT_WINDOW))
     if w != "custom":
@@ -1314,6 +1317,15 @@ def get_historical_cells_cached(window):
     cached = _heatmap_cells_cache.get(key)
     if cached is not None and _is_fresh(cached, ttl, now):
         return cached
+    if cached is not None:
+        # Stale-while-revalidate: if another thread is already rebuilding,
+        # serve the previous build now instead of queueing behind the lock.
+        # Otherwise every open dashboard and the projector page would park
+        # a gunicorn thread here for the whole rebuild (tens of seconds on
+        # Render's free CPU), leaving none for /ping or /api/vehicles.
+        if not _heatmap_lock.acquire(blocking=False):
+            return cached
+        _heatmap_lock.release()
 
     with _heatmap_lock:
         now = datetime.now(tz=SYDNEY_TZ)
@@ -1986,8 +1998,7 @@ HEATMAP_SCRIPT = """\
         <select id="histWindowSelect">
           <option value="1">Last hour</option>
           <option value="24">Last 24 hours</option>
-          <option value="168">Last 7 days</option>
-          <option value="720" selected>Last 30 days</option>
+          <option value="168" selected>Last 7 days</option>
           <option value="custom">Custom dates\u2026</option>
         </select>
         <label class="hp-custom" for="histStartDate" hidden>From</label>
@@ -2017,14 +2028,15 @@ HEATMAP_SCRIPT = """\
 
     // Custom history range: date inputs appear when "Custom dates…" is
     // picked. Bounds mirror the server's (CUSTOM_WINDOW_LOOKBACK_DAYS /
-    // CUSTOM_WINDOW_MAX_DAYS, ~62 days kept by the scraper).
+    // CUSTOM_WINDOW_MAX_DAYS = 7 days long, starting within the ~62 days
+    // the scraper keeps).
     const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     const startInput = heatPanel.querySelector('#histStartDate');
     const endInput = heatPanel.querySelector('#histEndDate');
     {
       const today = new Date(), earliest = new Date(), weekAgo = new Date();
       earliest.setDate(today.getDate() - 62);
-      weekAgo.setDate(today.getDate() - 13);
+      weekAgo.setDate(today.getDate() - 6);
       for (const el of [startInput, endInput]) { el.min = isoDate(earliest); el.max = isoDate(today); }
       startInput.value = isoDate(weekAgo);
       endInput.value = isoDate(today);
@@ -2682,7 +2694,7 @@ PAGE = """
 
   <details class="heat-help">
     <summary>About the heatmaps</summary>
-    <p><strong>Live heatmap</strong> colours each bus by its current value. <strong>Historical heatmap</strong> uses every scraped reading in the chosen history window (default 30 days), optionally limited to a time of day. <strong>Route clip</strong> trims colour to within the chosen distance of a bus route, so results read along corridors.</p>
+    <p><strong>Live heatmap</strong> colours each bus by its current value. <strong>Historical heatmap</strong> uses every scraped reading in the chosen history window (default 7 days), optionally limited to a time of day. <strong>Route clip</strong> trims colour to within the chosen distance of a bus route, so results read along corridors.</p>
     <dl>
       <dt>Average delay</dt><dd>How late buses typically run in each area: mean lateness of readings within 250 m, with early running counted as on time (0). Where data is thin, the estimate is pulled toward the network average, so a single late bus can&rsquo;t create a hotspot. Scale 0&ndash;5 min.</dd>
       <dt>Delay burden</dt><dd>Where the most delay accumulates: total bus-minutes late, scaled to the same overall heat as Bus density. Busy corridors rank high even when each bus is only slightly late. An area hotter here than on Bus density carries more than its share of the network&rsquo;s delay.</dd>
@@ -3527,7 +3539,7 @@ def api_validation():
     """On-time running by operator from the scraped history, for comparing
     against TfNSW's published monthly on-time running results.
 
-    ?window=1|24|168|720 or ?window=custom&start=YYYY-MM-DD&end=YYYY-MM-DD;
+    ?window=1|24|168 or ?window=custom&start=YYYY-MM-DD&end=YYYY-MM-DD;
     &format=csv for a spreadsheet-ready table. Operators are grouped by NAME
     (several agency ids can share one, e.g. multiple Transit Systems
     contracts), using the timetable's agency.txt.
