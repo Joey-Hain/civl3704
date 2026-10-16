@@ -166,8 +166,8 @@ GRID_DECIMALS = 4
 # Daily CSVs are DOWNLOADED this many at a time but PARSED one at a time
 # into a single set of cells (see fetch_historical_cells) — parallel
 # downloads hide GitHub's per-request latency for the 30-day window
-# (~31 files of ~200 kB) without each worker holding its own copy of the
-# aggregated cells, which is what kept the old parse-in-workers design at 1.
+# (~31 files; ~13 MB/day since the collector went 24/7, cached on disk)
+# without each worker holding its own copy of the aggregated cells, which is what kept the old parse-in-workers design at 1.
 HEATMAP_DOWNLOAD_CONCURRENCY = 6
 HEATMAP_DEADLINE_SEC = 20
 # Historical windows offered (hours). 720 = 30 days: GitHub's scheduler only
@@ -753,113 +753,193 @@ def get_vehicles_cached(agency_names, trip_headsigns):
         return [dict(v) for v in vehicles]
 
 
-def _new_cell():
-    """Empty cell accumulator — see _fetch_one_day_into for the layout.
-    delay_values is a compact float array rather than a list: every reading
-    is now stored twice (its "all" bucket and its time-of-day bucket), and
-    a Python float in a list costs ~32 bytes vs 4 here, which matters on a
-    512MB instance with a 7-day window."""
-    return [0.0, 0.0, 0, 0.0, 0, 0.0, 0, array("f")]
+# --- Historical cell storage -------------------------------------------------
+# Column layout of one grid cell's accumulator (see CellGrid):
+#   LAT_SUM/LON_SUM/N_TOTAL  - plotted position (mean vehicle location) and ping
+#                              count; N_TOTAL alone is what density weights by.
+#   LATE_SUM/N_DELAY         - mean lateness: seconds late floored at 0 (early or
+#                              on-time readings add 0, never a negative that would
+#                              mask a late reading elsewhere in the cell).
+#   SPEED_SUM/N_SPEED        - mean speed; a 0 km/h reading is kept (a real stop),
+#                              a missing one is not.
+#   N_OFF                    - readings outside the TfNSW on-time window, for the
+#                              "not on time" (frequency) metric.
+#
+# MEMORY: until 16 Oct each cell kept every raw delay reading (an array) so the
+# frequency metric could count off-time readings later, and cells lived in a
+# dict of Python lists. That was sized for ~200 kB/day of scrape data. Since the
+# collector went 24/7 (12 Oct) a day is ~13 MB / ~130k rows, and building the
+# 24 h + 7 day + 30 day windows peaked at ~570 MB, over Render's 512 MB, so the
+# instance was OOM-killed and restarted (the 503s). Off-time readings are now
+# counted as they arrive, and a finished grid is frozen into 8 flat double
+# arrays (64 bytes per cell), so memory scales with the number of cells, which
+# levels off as the network fills in, not with the number of readings.
+LAT_SUM, LON_SUM, N_TOTAL, LATE_SUM, N_DELAY, SPEED_SUM, N_SPEED, N_OFF = range(8)
+_CELL_COLS = 8
+
+
+class CellGrid:
+    """Grid-cell accumulators for one period bucket, as 8 parallel array('d')
+    columns. While building, `index` maps a packed integer cell key to its
+    row; freeze() drops that map once the window is complete, because nothing
+    after aggregation needs to look a cell up by position."""
+
+    __slots__ = ("index", "cols")
+
+    def __init__(self):
+        self.index = {}
+        self.cols = [array("d") for _ in range(_CELL_COLS)]
+
+    def __len__(self):
+        return len(self.cols[0])
+
+    def add(self, key, lat, lon, delay_sec, speed_kmh, off_time):
+        i = self.index.get(key)
+        cols = self.cols
+        if i is None:
+            i = len(cols[0])
+            self.index[key] = i
+            for col in cols:
+                col.append(0.0)
+        cols[LAT_SUM][i] += lat
+        cols[LON_SUM][i] += lon
+        cols[N_TOTAL][i] += 1
+        if delay_sec is not None:
+            cols[LATE_SUM][i] += delay_sec if delay_sec > 0 else 0.0
+            cols[N_DELAY][i] += 1
+            if off_time:
+                cols[N_OFF][i] += 1
+        if speed_kmh is not None and speed_kmh >= 0:
+            cols[SPEED_SUM][i] += speed_kmh
+            cols[N_SPEED][i] += 1
+
+    def freeze(self):
+        self.index = None
+        return self
+
+    def rows(self):
+        """One tuple per cell, indexed by the column constants above."""
+        return zip(*self.cols)
 
 
 def _new_period_cells():
-    return {p: defaultdict(_new_cell) for p in VALID_HEATMAP_PERIODS}
+    return {p: CellGrid() for p in VALID_HEATMAP_PERIODS}
 
 
-def _add_reading(c, lat, lon, delay_sec, speed_kmh):
-    """Fold one CSV row into a single cell accumulator. Shared by every
-    period bucket a reading lands in, so "all" and its matching time-of-day
-    bucket always agree on how a reading is counted."""
-    c[0] += lat
-    c[1] += lon
-    c[2] += 1
-    if delay_sec is not None:
-        c[3] += max(delay_sec, 0.0)
-        c[4] += 1
-        c[7].append(delay_sec)  # raw/signed — floored later where needed
-    if speed_kmh is not None and speed_kmh >= 0:
-        c[5] += speed_kmh
-        c[6] += 1
+_GRID_SCALE = 10 ** GRID_DECIMALS
 
 
-class _Prefetched:
-    """A downloaded daily CSV, shaped like the streaming requests response
-    _fetch_one_day_into reads, so parsing is identical either way."""
-
-    def __init__(self, status_code, content):
-        self.status_code = status_code
-        self._content = content
-        self.encoding = "utf-8"
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise requests.HTTPError(f"HTTP {self.status_code}")
-
-    def iter_lines(self, decode_unicode=True):
-        return iter(self._content.decode("utf-8").splitlines())
+def _cell_key(lat, lon):
+    # One int instead of a (lat, lon) float tuple: a fraction of the memory
+    # per dict entry while the grid is being built. |lon| * 10^4 < 10^7.
+    return round(lat * _GRID_SCALE) * 10_000_000 + round(lon * _GRID_SCALE)
 
 
-def _download_day(date_str, base=SCRAPE_RAW_BASE):
-    """(date_str, _Prefetched or None, error). Network only — safe to run
-    in a thread pool."""
-    url = f"{base}/{date_str}.csv"
+# --- Fetching the daily CSVs --------------------------------------------------
+# REQUESTS / 429s: every rebuild used to re-download every day in the window
+# from both data/ and data-local/ (62 requests for 30 days, ~60 MB now), every
+# 5-30 minutes, from Render's shared outbound IPs, and raw.githubusercontent.com
+# started answering 429 Too Many Requests. Days before yesterday never change
+# once the collector has moved on, so each is downloaded once per instance and
+# kept gzipped on local disk; only today and yesterday are re-fetched. A 404
+# (no data-local file for that day, the usual case) is remembered for a few
+# hours instead of being asked again each rebuild. If a re-fetch of today or
+# yesterday fails, the copy already on disk is used. Set GITHUB_TOKEN (a
+# fine-grained token with no permissions is enough) to send authenticated
+# requests, which GitHub rate-limits per token rather than per shared IP.
+HEATMAP_DISK_CACHE_DIR = Path(os.getenv(
+    "HEATMAP_DISK_CACHE_DIR", os.path.join(tempfile.gettempdir(), "civl3704_days")))
+HEATMAP_MUTABLE_DAYS = 1           # today and yesterday are always re-fetched
+MISSING_FILE_RECHECK_SEC = 6 * 3600         # older days
+MISSING_RECENT_FILE_RECHECK_SEC = 30 * 60   # today/yesterday
+RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+RAW_HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
+_missing_files = {}  # cache path -> time.monotonic() the 404 was seen
+
+
+def _day_cache_path(base, date_str):
+    return HEATMAP_DISK_CACHE_DIR / f"{base.rsplit('/', 1)[-1]}_{date_str}.csv.gz"
+
+
+def _retry_after_sec(resp, default=2.0, cap=5.0):
     try:
-        r = requests.get(url, timeout=30)
-        print(f"[heatmap] GET {url} -> HTTP {r.status_code}", flush=True)
-        return date_str, _Prefetched(r.status_code, r.content if r.status_code == 200 else b""), None
-    except requests.RequestException as e:
-        return date_str, None, f"{date_str}: {e}"
+        return min(float(resp.headers.get("Retry-After", default)), cap)
+    except (TypeError, ValueError):
+        return default
 
 
-def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None,
-                        end=None, agency_stats=None):
-    """Aggregate one day's CSV into local_cells_by_period: a dict keyed by
-    VALID_HEATMAP_PERIODS ("all" plus each TIME_PERIODS bucket), each value
-    a dict-of-cells keyed by rounded (lat, lon). Every row is folded into
-    BOTH its "all" cell and its time-of-day cell (time_of_day_bucket(ts)) —
-    one pass, no extra fetching.
+def _download_day(date_str, base, mutable):
+    """(date_str, local gzip path or None, error or None). A None path with
+    no error means the file doesn't exist. Network + disk only, so it is safe
+    to run in a thread pool."""
+    path = _day_cache_path(base, date_str)
+    if not mutable and path.exists():
+        return date_str, path, None
+    seen = _missing_files.get(path)
+    recheck = MISSING_RECENT_FILE_RECHECK_SEC if mutable else MISSING_FILE_RECHECK_SEC
+    if seen is not None and time.monotonic() - seen < recheck:
+        return date_str, None, None
+    url = f"{base}/{date_str}.csv"
+    error = None
+    for attempt in range(2):
+        try:
+            with requests.get(url, headers=RAW_HEADERS, timeout=30, stream=True) as r:
+                print(f"[heatmap] GET {url} -> HTTP {r.status_code}", flush=True)
+                if r.status_code == 404:
+                    _missing_files[path] = time.monotonic()
+                    return date_str, None, None
+                if r.status_code in RETRYABLE_STATUS and attempt == 0:
+                    time.sleep(_retry_after_sec(r))
+                    continue
+                r.raise_for_status()
+                HEATMAP_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+                with gzip.open(tmp, "wb", compresslevel=1) as f:
+                    for chunk in r.iter_content(256 * 1024):
+                        f.write(chunk)
+                os.replace(tmp, path)
+                _missing_files.pop(path, None)
+                return date_str, path, None
+        except (requests.RequestException, OSError) as e:
+            error = f"{date_str}: {e}"
+            if attempt == 0:
+                time.sleep(1)
+    if path.exists():
+        # Today's/yesterday's refresh failed: an older copy beats a hole.
+        return date_str, path, f"{error} (used the copy from an earlier fetch)"
+    if path in _missing_files:
+        return date_str, None, None  # was a 404 last time; still assume missing
+    return date_str, None, error
 
-    Each cell accumulates [lat_sum, lon_sum, n_total, late_sum_sec, n_delay,
-    speed_sum_kmh, n_speed, delay_values]:
-      - lat_sum/lon_sum/n_total: for the cell's plotted position (its mean
-        vehicle location) and its ping count, independent of whether delay
-        or speed data was present. n_total alone is what the density metric
-        weights by.
-      - late_sum_sec/n_delay: for mean lateness, seconds late floored at 0
-        (an early or on-time reading contributes 0, never a negative that
-        would mask a late reading elsewhere in the same cell). Anomalous
-        readings already arrive as an empty delay_sec from the collector,
-        so they're naturally excluded here.
-      - delay_values: every raw (signed) delay reading, used by the
-        frequency metric (signed, so early running counts against on-time).
-      - speed_sum_kmh/n_speed: for mean speed. Zero and missing speed
-        readings are common (a bus stopped at a light, or a feed gap) —
-        zero is kept (it's a real reading), missing/unparseable is not.
-    """
-    url = f"{SCRAPE_RAW_BASE}/{date_str}.csv"
+
+def _prune_disk_cache(keep_days=None):
+    if keep_days is None:
+        keep_days = CUSTOM_WINDOW_LOOKBACK_DAYS + 2
+    cutoff = (datetime.now(tz=SYDNEY_TZ).date() - timedelta(days=keep_days)).isoformat()
+    try:
+        for p in HEATMAP_DISK_CACHE_DIR.glob("*.csv.gz"):
+            if p.name.split("_", 1)[-1][:10] < cutoff:
+                p.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _fetch_one_day_into(date_str, path, cutoff, cells_by_period, end=None, agency_stats=None):
+    """Stream one day's (gzipped, on-disk) CSV into cells_by_period: every
+    row lands in its "all" grid and its time-of-day grid
+    (time_of_day_bucket(ts)) in a single pass. Returns
+    (date_str, rows_seen, points_added, error)."""
     rows_seen = 0
     points_added = 0
+    grid_all = cells_by_period["all"]
     try:
-        resp_cm = prefetched if prefetched is not None else requests.get(url, timeout=30, stream=True)
-        with resp_cm as resp:
-            if prefetched is None:
-                print(f"[heatmap] GET {url} -> HTTP {resp.status_code}", flush=True)
-            if resp.status_code == 404:
-                return date_str, 0, 0, None
-            resp.raise_for_status()
-            resp.encoding = "utf-8"
-            lines = resp.iter_lines(decode_unicode=True)
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
             try:
-                header_line = next(lines)
+                header = [h.strip() for h in next(reader)]
             except StopIteration:
                 return date_str, 0, 0, None
-            header = [h.strip() for h in next(csv.reader([header_line]))]
             try:
                 ts_idx = header.index("timestamp")
                 lat_idx = header.index("lat")
@@ -870,9 +950,9 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
             speed_idx = header.index("speed_kmh") if "speed_kmh" in header else None
             route_idx = header.index("route_id") if "route_id" in header else None
             max_idx = max(ts_idx, lat_idx, lon_idx)
-            for i, row in enumerate(csv.reader(lines)):
+            for i, row in enumerate(reader):
                 if i % 2000 == 0:
-                    time.sleep(PARSE_YIELD_SEC)
+                    time.sleep(PARSE_YIELD_SEC)  # let request threads in
                 rows_seen += 1
                 if len(row) <= max_idx:
                     continue
@@ -884,20 +964,20 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
                     lon = float(row[lon_idx])
                 except ValueError:
                     continue
-                key = (round(lat, GRID_DECIMALS), round(lon, GRID_DECIMALS))
 
                 delay_sec = None
-                if delay_idx is not None and len(row) > delay_idx and row[delay_idx].strip():
+                if delay_idx is not None and len(row) > delay_idx and row[delay_idx]:
                     try:
                         delay_sec = float(row[delay_idx])
                     except ValueError:
                         delay_sec = None
                 speed_kmh = None
-                if speed_idx is not None and len(row) > speed_idx and row[speed_idx].strip():
+                if speed_idx is not None and len(row) > speed_idx and row[speed_idx]:
                     try:
                         speed_kmh = float(row[speed_idx])
                     except ValueError:
                         speed_kmh = None
+                off_time = delay_sec is not None and not is_on_time(delay_sec)
 
                 if agency_stats is not None and delay_sec is not None and route_idx is not None \
                         and len(row) > route_idx and "_" in row[route_idx]:
@@ -913,13 +993,17 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
                         st[2] += 1
                     st[4] += max(delay_sec, 0.0)
 
-                period = time_of_day_bucket(ts)
-                _add_reading(local_cells_by_period["all"][key], lat, lon, delay_sec, speed_kmh)
-                _add_reading(local_cells_by_period[period][key], lat, lon, delay_sec, speed_kmh)
+                key = _cell_key(lat, lon)
+                grid_all.add(key, lat, lon, delay_sec, speed_kmh, off_time)
+                cells_by_period[time_of_day_bucket(ts)].add(key, lat, lon, delay_sec, speed_kmh, off_time)
                 points_added += 1
             return date_str, rows_seen, points_added, None
-    except requests.RequestException as e:
-        return date_str, 0, 0, f"{date_str}: {e}"
+    except (OSError, EOFError, csv.Error, UnicodeDecodeError) as e:
+        try:
+            path.unlink(missing_ok=True)  # corrupt cache file: re-fetch next time
+        except OSError:
+            pass
+        return date_str, rows_seen, points_added, f"{date_str}: {e}"
 
 
 def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
@@ -938,41 +1022,45 @@ def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
     else:
         cutoff = start_dt
     last_day = min((end_dt - timedelta(microseconds=1)).date() if end_dt else now.date(), now.date())
+    first_mutable = now.date() - timedelta(days=HEATMAP_MUTABLE_DAYS)
     dates_needed = []
     d = cutoff.date()
     while d <= last_day:
-        dates_needed.append(d.isoformat())
+        dates_needed.append(d)
         d += timedelta(days=1)
     # agency id -> [n_with_delay, n_early, n_on_time, n_late, late_sum_sec]
     agency_stats = defaultdict(lambda: [0, 0, 0, 0, 0.0])
+    _prune_disk_cache()
 
-    # Downloads run in parallel; parsing happens here, one file at a time,
-    # into a single set of period buckets (a reading lands in "all" and in
-    # its time-of-day bucket).
+    # Downloads (or disk-cache hits) run in parallel; parsing happens here,
+    # one file at a time, into a single set of period grids.
     cells_by_period = _new_period_cells()
     files_fetched = 0
     rows_seen_total = 0
     points_added_total = 0
-    last_error = None
+    errors = []
+    files_lost = 0  # failed to download and no copy on disk
     deadline_hit = False
 
-    workers = max(1, min(HEATMAP_DOWNLOAD_CONCURRENCY, len(dates_needed)))
+    workers = max(1, min(HEATMAP_DOWNLOAD_CONCURRENCY, 2 * len(dates_needed)))
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
-        futures = [pool.submit(_download_day, ds, base)
-                   for ds in dates_needed for base in SCRAPE_RAW_BASES]
+        futures = {pool.submit(_download_day, d.isoformat(), base, d >= first_mutable)
+                   for d in dates_needed for base in SCRAPE_RAW_BASES}
         for future in as_completed(futures):
             if time.monotonic() - start > HEATMAP_DEADLINE_SEC:
                 deadline_hit = True
                 break
-            date_str, body, error = future.result()
-            if error is None:
-                date_str, rows_seen, points_added, error = _fetch_one_day_into(
-                    date_str, cutoff, cells_by_period, prefetched=body,
-                    end=end_dt, agency_stats=agency_stats)
+            date_str, path, error = future.result()
             if error is not None:
-                last_error = error
+                errors.append(error)
+            if path is None:
+                files_lost += error is not None
                 continue
+            date_str, rows_seen, points_added, error = _fetch_one_day_into(
+                date_str, path, cutoff, cells_by_period, end=end_dt, agency_stats=agency_stats)
+            if error is not None:
+                errors.append(error)
             if rows_seen == 0 and points_added == 0:
                 continue
             files_fetched += 1
@@ -980,24 +1068,33 @@ def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
             points_added_total += points_added
     finally:
         # Don't block the request on downloads still in flight after a
-        # deadline hit; they finish (or time out) in the background.
+        # deadline hit; they finish (or time out) in the background and land
+        # in the disk cache for the next rebuild.
         pool.shutdown(wait=False, cancel_futures=True)
 
+    for grid in cells_by_period.values():
+        grid.freeze()
     cells = cells_by_period["all"]
-    cells_with_delay = sum(1 for c in cells.values() if c[4] > 0)
-    cells_with_speed = sum(1 for c in cells.values() if c[6] > 0)
+    cells_with_delay = sum(1 for n in cells.cols[N_DELAY] if n > 0)
+    cells_with_speed = sum(1 for n in cells.cols[N_SPEED] if n > 0)
     print(f"[heatmap] window={window_hours}h files={files_fetched} "
           f"rows={rows_seen_total} points={points_added_total} cells={len(cells)} "
           f"cells_with_delay={cells_with_delay} cells_with_speed={cells_with_speed} "
           f"by_period=({', '.join(f'{p}={len(cells_by_period[p])}' for p in TIME_PERIODS)}) "
-          f"elapsed={time.monotonic() - start:.1f}s deadline_hit={deadline_hit}", flush=True)
+          f"errors={len(errors)} lost={files_lost} elapsed={time.monotonic() - start:.1f}s "
+          f"deadline_hit={deadline_hit}", flush=True)
+    for e in errors[:5]:
+        print(f"[heatmap]   {e}", flush=True)
+    _log_rss(f"heatmap window={window_hours}h")
 
     return {
         "cells": cells_by_period,
         "agency_stats": dict(agency_stats),
         "files_fetched": files_fetched,
         "rows_seen_total": rows_seen_total,
-        "last_error": last_error,
+        "last_error": errors[-1] if errors else None,
+        "n_errors": len(errors),
+        "files_lost": files_lost,
         "deadline_hit": deadline_hit,
     }
 
@@ -1020,7 +1117,7 @@ def compute_metric_points(cells, metric):
         # the sample size, unlike the mean-based delay/speed metrics. This
         # is the simplest of the three metrics by design — mainly useful
         # for confirming the heatmap rendering pipeline itself is correct.
-        eligible = [c for c in cells.values() if c[2] > 0]
+        eligible = [c for c in cells.rows() if c[2] > 0]
         if not eligible:
             return []
         max_count = max(c[2] for c in eligible)
@@ -1032,7 +1129,7 @@ def compute_metric_points(cells, metric):
         # delay metric. Scaled by the same confidence factor as delay so a
         # single fast/slow ping can't paint a full-strength cell.
         points = []
-        for c in cells.values():
+        for c in cells.rows():
             if c[6] <= 0:
                 continue
             mean_speed = c[5] / c[6]
@@ -1057,7 +1154,7 @@ def compute_metric_points(cells, metric):
         # map everywhere; this keeps it window-independent, and it reads
         # directly against Bus density — an area hotter here than on density
         # carries more than its share of the network's delay.
-        eligible = [c for c in cells.values() if c[2] > 0]
+        eligible = [c for c in cells.rows() if c[2] > 0]
         late_cells = [c for c in eligible if c[4] > 0 and c[3] > 0]
         total_late = sum(c[3] for c in late_cells)
         if not late_cells or not total_late:
@@ -1082,10 +1179,10 @@ def compute_metric_points(cells, metric):
         # reading count (not capped confidence) because the client pools
         # these and shrinks per pixel toward metric_prior().
         points = []
-        for c in cells.values():
+        for c in cells.rows():
             if c[4] <= 0:
                 continue
-            off_time = sum(1 for d in c[7] if not is_on_time(d))
+            off_time = c[N_OFF]
             points.append([c[0] / c[2], c[1] / c[2], (off_time / c[4]) / NOT_ON_TIME_CAP, c[4]])
         return points
 
@@ -1102,19 +1199,19 @@ def compute_metric_points(cells, metric):
     # Not clamped here: the client clamps AFTER averaging, so one extreme
     # cell can't be silently capped before it's pooled with its neighbours.
     return [[c[0] / c[2], c[1] / c[2], (c[3] / c[4]) / DELAY_FIELD_CAP_SEC, c[4]]
-            for c in cells.values() if c[4] > 0]
+            for c in cells.rows() if c[4] > 0]
 
 
 def metric_prior(cells, metric):
     """[network value (normalised like the metric's points), SHRINK_PRIOR_N]
     for the metrics the client shrinks per pixel, else None."""
-    n = sum(c[4] for c in cells.values())
+    n = sum(cells.cols[N_DELAY])
     if not n:
         return None
     if metric in ("delay", "delay_mean"):
-        return [sum(c[3] for c in cells.values()) / n / DELAY_FIELD_CAP_SEC, SHRINK_PRIOR_N]
+        return [sum(cells.cols[LATE_SUM]) / n / DELAY_FIELD_CAP_SEC, SHRINK_PRIOR_N]
     if metric == "frequency":
-        off = sum(sum(1 for d in c[7] if not is_on_time(d)) for c in cells.values())
+        off = sum(cells.cols[N_OFF])
         return [off / n / NOT_ON_TIME_CAP, SHRINK_PRIOR_N]
     return None
 
@@ -1198,24 +1295,46 @@ def parse_window_args(args):
     return WindowSpec(start_date=start, end_date=end), None
 
 
+# A build that lost files (429/5xx with no disk copy) or hit the deadline is
+# retried after this long instead of being cached for the window's full
+# 5-30 minute TTL. Previously one burst of 429s blanked the map for up to
+# 30 minutes.
+HEATMAP_RETRY_AFTER_FAILURE_SEC = 60
+
+
+def _is_fresh(entry, ttl, now):
+    return (now - entry["fetched_at"]).total_seconds() < entry.get("ttl_override", ttl)
+
+
 def get_historical_cells_cached(window):
     if not isinstance(window, WindowSpec):
         window = WindowSpec(window)
     key, ttl = window.key, window.ttl()
     now = datetime.now(tz=SYDNEY_TZ)
     cached = _heatmap_cells_cache.get(key)
-    if cached is not None and (now - cached["fetched_at"]).total_seconds() < ttl:
+    if cached is not None and _is_fresh(cached, ttl, now):
         return cached
 
     with _heatmap_lock:
         now = datetime.now(tz=SYDNEY_TZ)
         cached = _heatmap_cells_cache.get(key)
-        if cached is not None and (now - cached["fetched_at"]).total_seconds() < ttl:
+        if cached is not None and _is_fresh(cached, ttl, now):
             return cached
 
         start_dt, end_dt = window.bounds()
         meta = fetch_historical_cells(window.hours, start_dt, end_dt)
         meta["fetched_at"] = now
+        if meta["deadline_hit"] or meta["files_lost"]:
+            meta["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
+            if cached is not None and cached["files_fetched"] > meta["files_fetched"]:
+                # Keep serving the last good build rather than a worse one;
+                # try again in a minute.
+                cached["fetched_at"] = now
+                cached["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
+                print(f"[heatmap] window={key}: rebuild degraded "
+                      f"({meta['files_fetched']} files, {meta['files_lost']} lost); "
+                      f"keeping previous build", flush=True)
+                return cached
         if window.is_custom:
             custom_keys = [k for k in _heatmap_cells_cache if isinstance(k, str)]
             while len(custom_keys) >= CUSTOM_CACHE_MAX_ENTRIES:
@@ -1249,6 +1368,9 @@ def get_heatmap_points_cached(window, metric, period="all"):
 
     if meta["deadline_hit"]:
         note = f"Partial data (deadline hit after {HEATMAP_DEADLINE_SEC}s)"
+    elif meta.get("files_lost"):
+        note = (f"Partial data: {meta['files_lost']} day file(s) couldn't be downloaded "
+                f"(GitHub said: {meta['last_error']}); retrying in a minute")
     elif not points:
         label = _METRIC_LABELS.get(metric, metric)
         note = f"Fetched {meta['files_fetched']} file(s) but no rows had {label} data yet"
