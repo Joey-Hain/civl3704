@@ -2907,7 +2907,7 @@ PAGE = """
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <style>
-  :root { --bg:#f7f6f2; --text:#111; --muted:#666; --line:#ccc; --late:#b3261e; --early:#1e6b3c; --fill-blue: {{ color_fill }}; --sans: Helvetica, Arial, sans-serif; }
+  :root { --bg:#fff; --text:#111; --muted:#666; --line:#ccc; --late:#b3261e; --early:#1e6b3c; --fill-blue: {{ color_fill }}; --sans: Helvetica, Arial, sans-serif; }
   * { box-sizing: border-box; }
   body { background:var(--bg); color:var(--text); font-family:var(--sans); margin:0; padding:24px 32px 60px; }
   h1 { font-size:1.4rem; font-weight:bold; border-bottom:2px solid var(--text); padding-bottom:10px; margin-bottom:4px; }
@@ -2933,12 +2933,12 @@ PAGE = """
   th[aria-sort] .sort-btn { color:var(--text); }
   th[aria-sort] .sort-btn .arr { opacity:1; }
   .table-note { color:var(--muted); font-size:0.8rem; margin-top:6px; }
-  tr:hover { background:#eeece5; }
+  tr:hover { background:#f4f4f4; }
   td.late { color:var(--late); }
   td.early { color:var(--early); }
   .flag { color:var(--muted); font-size:0.75rem; }
   .toggle { color:#555; text-decoration:underline; font-size:0.85rem; }
-  #dashmap { height:600px; border:1px solid var(--line); margin-top:10px; background:#e5e3dc; }
+  #dashmap { height:600px; border:1px solid var(--line); margin-top:10px; background:#eee; }
   .map-legend { display:flex; gap:16px; align-items:center; font-size:0.8rem; color:var(--muted); margin-top:8px; flex-wrap:wrap; }
   .map-legend .swatch { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:4px; vertical-align:middle; background:var(--fill-blue); border:2px solid #999; }
   .map-error { color:var(--late); font-size:0.85rem; margin-top:8px; }
