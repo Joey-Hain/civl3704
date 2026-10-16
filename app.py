@@ -53,7 +53,7 @@ size and memory regardless of how many readings a window covers. The
 frontend auto-loads it on page view and every 5 minutes after.
 
 /api/heatmap takes a &metric= of "delay_mean" (or legacy "delay"),
-"delay_median", "delay_std", "frequency", "density", or "speed", and a
+"delay_total", "frequency", "density", or "speed", and a
 &period= of "all" (default), "am_peak", "midday", "pm_peak", or "evening"
 (see TIME_PERIODS). Fetching and aggregating a window's CSVs into grid
 cells is the expensive part (network + parse), and is identical regardless
@@ -73,7 +73,6 @@ Per-metric weighting:
     interchange with mostly on-time buses should not outrank a quiet
     corridor where buses are consistently 15 minutes late. See
     HEATMAP_SEVERITY_CAP_SEC for the value that saturates the gradient.
-    delay_median / delay_std use the same floored-at-0 lateness.
   - frequency: share of a cell's readings that were NOT on time under the
     TfNSW KPI window (ON_TIME_EARLY_SEC..ON_TIME_LATE_SEC) — i.e. 1 minus
     the on-time KPI for that cell. Unlike the delay metrics this uses the
@@ -191,7 +190,7 @@ HEATMAP_CONFIDENT_SAMPLES = 3
 # cell means incl. dwell/signal stops): CBD streets ~7-10 km/h, arterials
 # ~18-22, motorway sections ~40-45 (medians ~54, p90 ~66).
 HEATMAP_SPEED_CAP_KMH = 80.0
-VALID_HEATMAP_METRICS = ("delay", "delay_mean", "delay_median", "delay_std", "delay_total",
+VALID_HEATMAP_METRICS = ("delay", "delay_mean", "delay_total",
                          "frequency", "density", "speed")
 # Empirical-Bayes shrinkage for the average-delay and not-on-time maps.
 # The scrape is sparse (7 days ~ 1.3 readings per 10 m cell; 83% of cells
@@ -837,9 +836,8 @@ def _fetch_one_day_into(date_str, cutoff, local_cells_by_period, prefetched=None
         would mask a late reading elsewhere in the same cell). Anomalous
         readings already arrive as an empty delay_sec from the collector,
         so they're naturally excluded here.
-      - delay_values: every raw (signed) delay reading. Median/SD floor
-        these at 0 when computed (same rule as the mean); the frequency
-        metric uses them signed so early running counts against on-time.
+      - delay_values: every raw (signed) delay reading, used by the
+        frequency metric (signed, so early running counts against on-time).
       - speed_sum_kmh/n_speed: for mean speed. Zero and missing speed
         readings are common (a bus stopped at a light, or a feed gap) —
         zero is kept (it's a real reading), missing/unparseable is not.
@@ -1091,21 +1089,6 @@ def compute_metric_points(cells, metric):
             points.append([c[0] / c[2], c[1] / c[2], (off_time / c[4]) / NOT_ON_TIME_CAP, c[4]])
         return points
 
-    if metric in ("delay_median", "delay_std"):
-        points = []
-        for c in cells.values():
-            if c[4] <= 0:
-                continue
-            late = [max(d, 0.0) for d in c[7]]
-            if metric == "delay_median":
-                delay_value = statistics.median(late)
-            else:
-                delay_value = statistics.stdev(late) if c[4] > 1 else 0.0
-            severity = min(delay_value / HEATMAP_SEVERITY_CAP_SEC, 1.0)
-            confidence = min(c[4] / HEATMAP_CONFIDENT_SAMPLES, 1.0)
-            points.append([c[0] / c[2], c[1] / c[2], severity, confidence])
-        return points
-
     # metric == "delay" or "delay_mean" (default/fallback): mean lateness (seconds late,
     # floored at 0), normalised against HEATMAP_SEVERITY_CAP_SEC — NOT ping
     # density. A cell with plenty of on-time traffic should stay cool; a
@@ -1137,8 +1120,8 @@ def metric_prior(cells, metric):
 
 
 _METRIC_LABELS = {
-    "delay": "delay", "delay_mean": "mean delay", "delay_median": "median delay",
-    "delay_std": "delay standard deviation", "delay_total": "delay", "frequency": "on-time",
+    "delay": "delay", "delay_mean": "mean delay",
+    "delay_total": "delay", "frequency": "on-time",
     "density": "vehicle", "speed": "speed",
 }
 
@@ -1452,7 +1435,6 @@ HEATMAP_SCRIPT = """\
     // having more readings. kind 'sum' = classic additive heatmap
     // (Leaflet.heat), which is exactly right for density and only density.
     const DELAY_TICKS = ['0', '1', '2', '3', '4', `${DELAY_CAP_MIN}+ min`];
-    const SEVERITY_TICKS = ['0', '2', '4', '6', '8', `${SEVERITY_CAP_MIN}+ min`];
     // radiusM / fullSupport (field metrics only): delay and not-on-time
     // pool over a wider radius and need more data before reaching full
     // opacity, because individual delay readings are noisy and sparse;
@@ -1466,22 +1448,6 @@ HEATMAP_SCRIPT = """\
         liveTitle: 'Live: current delay (min)',
         histTitle: 'Historical: average delay (min)',
         ticks: DELAY_TICKS,
-      },
-      delay_median: {
-        label: 'Median delay', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
-        desc: 'Historical: median lateness of readings within 250 m (early running counts as 0). The live map shows current delay because it has only one reading per bus.',
-        radiusM: 250, fullSupport: 3,
-        liveTitle: 'Live: current delay (min)',
-        histTitle: 'Historical: median delay (min)',
-        ticks: SEVERITY_TICKS,
-      },
-      delay_std: {
-        label: 'Delay standard deviation', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
-        desc: 'Historical: variation in lateness within 250 m, measured as standard deviation (early running counts as 0). The live map shows current delay because it has only one reading per bus.',
-        radiusM: 250, fullSupport: 3,
-        liveTitle: 'Live: current delay (min)',
-        histTitle: 'Historical: delay standard deviation (min)',
-        ticks: SEVERITY_TICKS,
       },
       delay_total: {
         label: 'Delay burden', kind: 'sum', hist: 'RdPu', live: 'PuBu',

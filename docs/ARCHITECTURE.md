@@ -24,7 +24,7 @@ The app is organised into three main layers:
 - Joins vehicle positions with delays using `trip_id`.
 - Applies route, stop, operator, anomaly and geographic-bound filters.
 - Aggregates historical readings into geographic grid cells.
-- Calculates historical heatmap values for average delay, delay burden (total lateness), % not on time (TfNSW KPI window, -59s to +5:59), speed and bus density. Average delay and % not on time are sent as raw per-cell values weighted by reading count, plus a network prior (`metric_prior`) the client uses for per-pixel empirical-Bayes shrinkage (`SHRINK_PRIOR_N`). Median and SD are still accepted by `/api/heatmap` but no longer offered in the UI (at ~1.3 readings per cell they add nothing over the mean).
+- Calculates historical heatmap values for average delay, delay burden (total lateness), % not on time (TfNSW KPI window, -59s to +5:59), speed and bus density. Average delay and % not on time are sent as raw per-cell values weighted by reading count, plus a network prior (`metric_prior`) the client uses for per-pixel empirical-Bayes shrinkage (`SHRINK_PRIOR_N`). Median and SD were tried and removed: at ~1.3 readings per cell they add nothing over the mean.
 - Prepares vehicle data for both the dashboard and the `/api/vehicles` endpoint.
 - Builds a selected trip's detail (`/api/trip/<trip_id>`): every remaining stop-time update for the trip from the cached live feed, in stop order with predicted delays, joined to stop names and locations and to the trip's timetable shape.
 
