@@ -2462,6 +2462,18 @@ PAGE = """
   th a { color:inherit; text-decoration:underline; }
   th a:hover { color:var(--late); }
   th.help { text-decoration:underline dotted; text-underline-offset:2px; cursor:help; }
+  /* Sortable column headers: click the header to sort; the arrow shows
+     the active column and direction, a faint double arrow the others. */
+  th.sortable { padding:0; }
+  th .sort-btn { all:unset; box-sizing:border-box; display:flex; align-items:center; justify-content:flex-end; gap:4px; width:100%; padding:6px 12px; cursor:pointer; white-space:nowrap; }
+  th:first-child .sort-btn { justify-content:flex-start; }
+  th.help .sort-btn .lbl { text-decoration:underline dotted; text-underline-offset:2px; }
+  th .sort-btn:hover, th .sort-btn:focus-visible { color:var(--text); }
+  th .sort-btn:focus-visible { outline:2px solid var(--fill-blue); outline-offset:-2px; }
+  th .sort-btn .arr { display:inline-block; width:0.8em; text-align:center; font-size:0.75rem; opacity:0.35; }
+  th[aria-sort] .sort-btn { color:var(--text); }
+  th[aria-sort] .sort-btn .arr { opacity:1; }
+  .table-note { color:var(--muted); font-size:0.8rem; margin-top:6px; }
   tr:hover { background:#eeece5; }
   td.late { color:var(--late); }
   td.early { color:var(--early); }
@@ -2559,37 +2571,103 @@ PAGE = """
   </details>
 
   <h2>By operator</h2>
-  <table>
-    <tr><th>Operator</th><th class="help" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded.">n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th class="help" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window).">on time</th><th>range</th></tr>
+  <table class="sortable-table" data-sort-col="2" data-sort-dir="desc">
+    <tr><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Operator</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded."><button type="button" class="sort-btn"><span class="lbl">n</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="num" data-first="desc"><button type="button" class="sort-btn"><span class="lbl">avg delay</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others."><button type="button" class="sort-btn"><span class="lbl">spread (&plusmn;min)</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="asc" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window)."><button type="button" class="sort-btn"><span class="lbl">on time</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Earliest to latest bus. Sorts by the gap between them."><button type="button" class="sort-btn"><span class="lbl">range</span><span class="arr" aria-hidden="true"></span></button></th></tr>
     {% for r in operators %}
-    <tr><td>{{ r.operator }}</td><td>{{ r.n }}</td>
-      <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
-      <td>{{ '%.1f'|format(r.stdev_min) }} min</td>
-      <td>{{ '%.0f'|format(r.on_time_pct) }}%</td>
-      <td>{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
+    <tr><td>{{ r.operator }}</td><td data-v="{{ r.n }}">{{ r.n }}</td>
+      <td data-v="{{ r.mean_min }}" class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
+      <td data-v="{{ r.stdev_min }}">{{ '%.1f'|format(r.stdev_min) }} min</td>
+      <td data-v="{{ r.on_time_pct }}">{{ '%.0f'|format(r.on_time_pct) }}%</td>
+      <td data-v="{{ r.max_min - r.min_min }}">{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
     {% endfor %}
   </table>
 
-  <h2>By route &mdash; worst variance first (sort: <a class="toggle" href="?sort=stdev_min&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">spread</a> / <a class="toggle" href="?sort=mean_min&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">avg delay</a> / <a class="toggle" href="?sort=on_time_pct&amp;asc=1&amp;hide_anomalies={{ 1 if hide_anomalies else 0 }}&amp;route={{ q_route }}&amp;stop={{ q_stop }}&amp;operator={{ q_operator }}">worst on-time %</a>)</h2>
-  <table>
-    <tr><th>Route</th><th>Operator</th><th class="help" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded.">n</th><th>avg delay</th><th class="help" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others.">spread (&plusmn;min)</th><th class="help" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window).">on time</th><th>range</th></tr>
-    {% for r in routes[:60] %}
-    <tr><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td>{{ r.n }}</td>
-      <td class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
-      <td>{{ '%.1f'|format(r.stdev_min) }} min</td>
-      <td>{{ '%.0f'|format(r.on_time_pct) }}%</td>
-      <td>{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
+  <h2>By route</h2>
+  <table class="sortable-table" data-limit="60" data-sort-col="{{ {'mean_min': 3, 'stdev_min': 4, 'on_time_pct': 5}.get(sort_key, 4) }}" data-sort-dir="{{ 'asc' if ascending else 'desc' }}">
+    <tr><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Route</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Operator</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded."><button type="button" class="sort-btn"><span class="lbl">n</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="num" data-first="desc"><button type="button" class="sort-btn"><span class="lbl">avg delay</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others."><button type="button" class="sort-btn"><span class="lbl">spread (&plusmn;min)</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="asc" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window)."><button type="button" class="sort-btn"><span class="lbl">on time</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Earliest to latest bus. Sorts by the gap between them."><button type="button" class="sort-btn"><span class="lbl">range</span><span class="arr" aria-hidden="true"></span></button></th></tr>
+    {% for r in routes %}
+    <tr><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td data-v="{{ r.n }}">{{ r.n }}</td>
+      <td data-v="{{ r.mean_min }}" class="{{ 'late' if r.mean_min > 0 else 'early' }}">{{ '%+.1f'|format(r.mean_min) }} min</td>
+      <td data-v="{{ r.stdev_min }}">{{ '%.1f'|format(r.stdev_min) }} min</td>
+      <td data-v="{{ r.on_time_pct }}">{{ '%.0f'|format(r.on_time_pct) }}%</td>
+      <td data-v="{{ r.max_min - r.min_min }}">{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
     {% endfor %}
   </table>
+  {% if routes|length > 60 %}<div class="table-note">Showing the top 60 of {{ routes|length }} routes for the current sort. Click a column heading to sort; click again to reverse.</div>{% endif %}
 
   <h2>Individual trips &mdash; largest single delays</h2>
-  <table>
-    <tr><th>Trip</th><th>Route</th><th>Operator</th><th>Most recent stop</th><th>delay</th></tr>
+  <table class="sortable-table" data-sort-col="4" data-sort-dir="desc">
+    <tr><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Trip</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Route</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Operator</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Most recent stop</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Sorts by size of delay, early or late."><button type="button" class="sort-btn"><span class="lbl">delay</span><span class="arr" aria-hidden="true"></span></button></th></tr>
     {% for r in worst_trips[:30] %}
     <tr><td>{{ r.trip_id }}</td><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td>{{ r.stop_id }}</td>
-      <td class="{{ 'late' if r.delay > 0 else 'early' }}">{{ '%+.1f'|format(r.delay / 60) }} min{% if r.anomaly %} <span class="flag">(flagged)</span>{% endif %}</td></tr>
+      <td data-v="{{ (r.delay|abs) / 60 }}" class="{{ 'late' if r.delay > 0 else 'early' }}">{{ '%+.1f'|format(r.delay / 60) }} min{% if r.anomaly %} <span class="flag">(flagged)</span>{% endif %}</td></tr>
     {% endfor %}
   </table>
+
+  <script>
+  // Click-to-sort column headers (Wikipedia-style). Sorting happens in the
+  // browser, so it doesn't reload the page or reset the map. Numeric cells
+  // carry their raw value in data-v; text cells sort naturally ("M30" < "M50",
+  // "301" < "1000"). data-limit shows only the top N rows after each sort.
+  (function () {
+    const ARROWS = { asc: '▲', desc: '▼', none: '⇅' };
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+    document.querySelectorAll('table.sortable-table').forEach(function (table) {
+      const headers = Array.from(table.rows[0].cells);
+      const limit = parseInt(table.dataset.limit || '0', 10);
+      function cellKey(row, i, type) {
+        const c = row.cells[i];
+        if (type === 'num') {
+          const v = parseFloat(c.dataset.v !== undefined ? c.dataset.v : c.textContent);
+          return isNaN(v) ? -Infinity : v;
+        }
+        return c.textContent.trim();
+      }
+      function render(col, dir) {
+        headers.forEach(function (th, i) {
+          const arr = th.querySelector('.arr');
+          if (!arr) return;
+          if (i === col) {
+            th.setAttribute('aria-sort', dir === 'asc' ? 'ascending' : 'descending');
+            arr.textContent = ARROWS[dir];
+          } else {
+            th.removeAttribute('aria-sort');
+            arr.textContent = ARROWS.none;
+          }
+        });
+      }
+      function sortBy(col, dir) {
+        const type = headers[col].dataset.type;
+        const body = table.rows[0].parentNode;
+        const rows = Array.from(table.rows).slice(1);
+        rows.sort(function (a, b) {
+          const ka = cellKey(a, col, type), kb = cellKey(b, col, type);
+          const r = type === 'num' ? ka - kb : collator.compare(ka, kb);
+          return dir === 'asc' ? r : -r;
+        });
+        rows.forEach(function (row, i) {
+          row.hidden = limit > 0 && i >= limit;
+          body.appendChild(row);
+        });
+        table.dataset.sortCol = col;
+        table.dataset.sortDir = dir;
+        render(col, dir);
+      }
+      headers.forEach(function (th, i) {
+        const btn = th.querySelector('.sort-btn');
+        if (!btn) return;
+        btn.addEventListener('click', function () {
+          const same = parseInt(table.dataset.sortCol, 10) === i;
+          const dir = same
+            ? (table.dataset.sortDir === 'asc' ? 'desc' : 'asc')
+            : (th.dataset.first || 'desc');
+          sortBy(i, dir);
+        });
+      });
+      sortBy(parseInt(table.dataset.sortCol || '0', 10), table.dataset.sortDir || 'desc');
+    });
+  })();
+  </script>
 
   <script>
 """ + render_map_script(
@@ -3108,6 +3186,7 @@ def dashboard():
         q_route=data["q_route"], q_stop=data["q_stop"], q_operator=data["q_operator"],
         agency_error=data["agency_error"],
         operators=operators, routes=routes, worst_trips=worst_trips,
+        sort_key=data["sort_key"], ascending=data["ascending"],
         vehicles=vehicles, vehicles_json=json.dumps(vehicles),
         filters_active=data["filters_active"], apply_bounds=data["apply_bounds"],
         operator_options=data["operator_options"],
