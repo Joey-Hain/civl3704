@@ -128,6 +128,7 @@ import csv
 import gzip
 import io
 import json
+import struct
 import os
 import shutil
 import statistics
@@ -816,6 +817,19 @@ class CellGrid:
             cols[SPEED_SUM][i] += speed_kmh
             cols[N_SPEED][i] += 1
 
+    def add_cells(self, keys, cols):
+        """Sum another grid's cells (keys + 8 columns) into this one."""
+        index, mine = self.index, self.cols
+        for j, key in enumerate(keys):
+            i = index.get(key)
+            if i is None:
+                index[key] = len(mine[0])
+                for c, src in zip(mine, cols):
+                    c.append(src[j])
+            else:
+                for c, src in zip(mine, cols):
+                    c[i] += src[j]
+
     def freeze(self):
         self.index = None
         return self
@@ -1102,6 +1116,177 @@ def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
     }
 
 
+# --- Pre-aggregated cells (the normal path) ------------------------------------
+# PARSING ON RENDER WAS THE BOTTLENECK: even with the memory fixes, a 7-day
+# window is ~640k CSV rows, and Render's Free instance (a fraction of one CPU)
+# couldn't parse them inside HEATMAP_DEADLINE_SEC, so the map came back
+# partial and the instance stayed busy enough to fail health checks. The
+# gtfs-r-scrape Action now does the aggregation after every data push
+# (build_cells.py, ~8 s on GitHub's runners) and force-pushes the result to
+# its `cells` branch: windows/{1,24,168}.bin.gz for the preset windows (ending
+# at the newest snapshot) and days/YYYY-MM-DD.bin.gz per Sydney day for custom
+# ranges. Here a preset window is one download (conditional, so usually a 304)
+# and a few array.frombytes calls; a custom range merges at most 7 day files.
+# fetch_historical_cells() above is only the fallback for when the `cells`
+# branch doesn't exist yet. File format: see build_cells.py.
+CELLS_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/cells"
+CELLS_MAGIC = b"CELLS1\n"
+CELLS_CHECK_SEC = 300   # how often to ask GitHub whether a cells file changed
+_cells_state = {}       # path -> {"etag": str or None, "checked": monotonic time}
+
+
+def _fetch_cells_file(path, immutable=False):
+    """(local Path or None, error or None) for one file on the cells branch,
+    re-checked with a conditional GET at most every CELLS_CHECK_SEC (never,
+    for finished days). (None, None) means the file doesn't exist."""
+    local = HEATMAP_DISK_CACHE_DIR / "cells" / path
+    st = _cells_state.get(path)
+    now = time.monotonic()
+    if st is not None and local.exists() and (immutable or now - st["checked"] < CELLS_CHECK_SEC):
+        return local, None
+    if st is not None and st.get("missing") and now - st["checked"] < CELLS_CHECK_SEC:
+        return None, None
+    headers = dict(RAW_HEADERS)
+    if st is not None and st.get("etag") and local.exists():
+        headers["If-None-Match"] = st["etag"]
+    url = f"{CELLS_BASE}/{path}"
+    try:
+        with requests.get(url, headers=headers, timeout=30, stream=True) as r:
+            print(f"[cells] GET {path} -> HTTP {r.status_code}", flush=True)
+            if r.status_code == 304:
+                st["checked"] = now
+                return local, None
+            if r.status_code == 404:
+                _cells_state[path] = {"etag": None, "checked": now, "missing": True}
+                return None, None
+            r.raise_for_status()
+            local.parent.mkdir(parents=True, exist_ok=True)
+            tmp = local.with_name(f"{local.name}.{threading.get_ident()}.tmp")
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(256 * 1024):
+                    f.write(chunk)
+            os.replace(tmp, local)
+            _cells_state[path] = {"etag": r.headers.get("ETag"), "checked": now}
+            return local, None
+    except (requests.RequestException, OSError) as e:
+        if local.exists():
+            if st is not None:
+                st["checked"] = now - CELLS_CHECK_SEC + HEATMAP_RETRY_AFTER_FAILURE_SEC
+            return local, f"{path}: {e} (used the copy from an earlier fetch)"
+        return None, f"{path}: {e}"
+
+
+def _read_cells_file(local, keep_keys=False):
+    """(header, {period: (CellGrid, keys or None)}) from a build_cells.py file."""
+    with gzip.open(local, "rb") as f:
+        data = f.read()
+    if not data.startswith(CELLS_MAGIC):
+        raise ValueError(f"{local.name}: not a cells file")
+    mv = memoryview(data)
+    off = len(CELLS_MAGIC)
+    (hlen,) = struct.unpack_from("<I", data, off)
+    off += 4
+    header = json.loads(bytes(mv[off:off + hlen]))
+    off += hlen
+    grids = {}
+    for p in header["periods"]:
+        n = int(header["counts"][p])
+        keys = array("q")
+        keys.frombytes(mv[off:off + 8 * n])
+        off += 8 * n
+        g = CellGrid()
+        g.index = None
+        g.cols = []
+        for _ in range(_CELL_COLS):
+            col = array("d")
+            col.frombytes(mv[off:off + 8 * n])
+            off += 8 * n
+            g.cols.append(col)
+        grids[p] = (g, keys if keep_keys else None)
+    if off != len(data):
+        raise ValueError(f"{local.name}: {len(data) - off} trailing bytes")
+    return header, grids
+
+
+def _cells_meta(cells, agency_stats, files, rows, errors, lost, version, data_end=None):
+    for p in VALID_HEATMAP_PERIODS:
+        cells.setdefault(p, CellGrid().freeze())
+    return {
+        "cells": cells,
+        "agency_stats": agency_stats,
+        "files_fetched": files,
+        "rows_seen_total": rows,
+        "last_error": errors[-1] if errors else None,
+        "n_errors": len(errors),
+        "files_lost": lost,
+        "deadline_hit": False,
+        "data_end": data_end,
+        "version": version,
+        "source": "cells",
+    }
+
+
+def cells_from_prebuilt(window, previous=None):
+    """Window meta (same shape as fetch_historical_cells) from the cells
+    branch, or None if it isn't available so the caller falls back to the
+    raw CSVs. Returns `previous` unchanged when the file hasn't changed."""
+    start = time.monotonic()
+    if not window.is_custom:
+        local, err = _fetch_cells_file(f"windows/{window.hours}.bin.gz")
+        if local is None:
+            if err:
+                print(f"[cells] {err}; falling back to raw CSVs", flush=True)
+            return None
+        version = f"{local.stat().st_mtime_ns}"
+        if previous is not None and previous.get("version") == version and not err:
+            return previous
+        header, grids = _read_cells_file(local)
+        meta = _cells_meta({p: g for p, (g, _) in grids.items()}, header.get("agency_stats", {}),
+                           header.get("files", 0), header.get("rows", 0), [err] if err else [], 0,
+                           version, header.get("data_end"))
+    else:
+        today = datetime.now(tz=SYDNEY_TZ).date()
+        merged = _new_period_cells()
+        agency = defaultdict(lambda: [0, 0, 0, 0, 0.0])
+        files = rows = lost = found = 0
+        errors, parts = [], []
+        d = window.start_date
+        while d <= window.end_date:
+            local, err = _fetch_cells_file(f"days/{d.isoformat()}.bin.gz",
+                                           immutable=d < today - timedelta(days=HEATMAP_MUTABLE_DAYS))
+            if err:
+                errors.append(err)
+            if local is None:
+                lost += err is not None
+            else:
+                found += 1
+                header, grids = _read_cells_file(local, keep_keys=True)
+                for p, (g, keys) in grids.items():
+                    if p in merged:
+                        merged[p].add_cells(keys, g.cols)
+                for aid, st in header.get("agency_stats", {}).items():
+                    acc = agency[aid]
+                    for i in range(5):
+                        acc[i] += st[i]
+                files += header.get("files", 0)
+                rows += header.get("rows", 0)
+                parts.append(f"{d}:{local.stat().st_mtime_ns}")
+            d += timedelta(days=1)
+        if not found and not errors and "windows/168.bin.gz" not in _cells_state:
+            # Can't tell "no data those days" from "no cells branch": check.
+            if _fetch_cells_file("windows/168.bin.gz")[0] is None:
+                return None
+        for g in merged.values():
+            g.freeze()
+        meta = _cells_meta(merged, dict(agency), files, rows, errors, lost, "|".join(parts))
+    cells = meta["cells"]["all"]
+    print(f"[cells] window={window.key} cells={len(cells)} rows={meta['rows_seen_total']} "
+          f"files={meta['files_fetched']} errors={meta['n_errors']} "
+          f"data_end={meta['data_end']} elapsed={time.monotonic() - start:.2f}s", flush=True)
+    _log_rss(f"cells window={window.key}")
+    return meta
+
+
 def compute_metric_points(cells, metric):
     return [_compact_point(p) for p in _compute_metric_points(cells, metric)]
 
@@ -1323,6 +1508,16 @@ def _is_fresh(entry, ttl, now):
     return (now - entry["fetched_at"]).total_seconds() < entry.get("ttl_override", ttl)
 
 
+def _store_window(key, window, meta):
+    if window.is_custom:
+        custom_keys = [k for k in _heatmap_cells_cache if isinstance(k, str) and k != key]
+        while len(custom_keys) >= CUSTOM_CACHE_MAX_ENTRIES:
+            oldest = min(custom_keys, key=lambda k: _heatmap_cells_cache[k]["fetched_at"])
+            _heatmap_cells_cache.pop(oldest, None)
+            custom_keys.remove(oldest)
+    _heatmap_cells_cache[key] = meta
+
+
 def get_historical_cells_cached(window):
     if not isinstance(window, WindowSpec):
         window = WindowSpec(window)
@@ -1347,9 +1542,27 @@ def get_historical_cells_cached(window):
         if cached is not None and _is_fresh(cached, ttl, now):
             return cached
 
+        meta = None
+        try:
+            meta = cells_from_prebuilt(window, cached)
+        except Exception as e:  # a corrupt or unexpected file must not take the map down
+            print(f"[cells] window={key}: {e!r}; falling back to raw CSVs", flush=True)
+        if meta is not None:
+            if meta is cached:  # file unchanged since the last check
+                cached["fetched_at"] = now
+                cached["ttl_override"] = CELLS_CHECK_SEC
+                return cached
+            meta["fetched_at"] = now
+            if not window.is_custom:
+                meta["ttl_override"] = CELLS_CHECK_SEC
+            if meta["files_lost"]:
+                meta["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
+            _store_window(key, window, meta)
+            return meta
         start_dt, end_dt = window.bounds()
         meta = fetch_historical_cells(window.hours, start_dt, end_dt)
         meta["fetched_at"] = now
+        meta["version"] = now.isoformat()
         if meta["deadline_hit"] or meta["files_lost"]:
             meta["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
             if cached is not None and cached["files_fetched"] > meta["files_fetched"]:
@@ -1361,13 +1574,7 @@ def get_historical_cells_cached(window):
                       f"({meta['files_fetched']} files, {meta['files_lost']} lost); "
                       f"keeping previous build", flush=True)
                 return cached
-        if window.is_custom:
-            custom_keys = [k for k in _heatmap_cells_cache if isinstance(k, str)]
-            while len(custom_keys) >= CUSTOM_CACHE_MAX_ENTRIES:
-                oldest = min(custom_keys, key=lambda k: _heatmap_cells_cache[k]["fetched_at"])
-                _heatmap_cells_cache.pop(oldest, None)
-                custom_keys.remove(oldest)
-        _heatmap_cells_cache[key] = meta
+        _store_window(key, window, meta)
         return meta
 
 
@@ -2176,7 +2383,12 @@ HEATMAP_SCRIPT = """\
         histHeatLayer.setLatLngs(points);
         if (data.error) { statusDiv.textContent = data.error; statusDiv.style.color = '#b3261e'; }
         else if (points.length === 0) { statusDiv.textContent = 'No data in this window yet'; statusDiv.style.color = '#b3261e'; }
-        else { statusDiv.textContent = `${points.length.toLocaleString('en-AU')} cells loaded`; statusDiv.style.color = ''; }
+        else {
+          // Preset windows end at the newest collected snapshot (the
+          // scraper pushes roughly hourly), so say how current they are.
+          const asOf = data.data_end ? ` \u00b7 data to ${new Date(data.data_end).toLocaleString('en-AU', {weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Australia/Sydney'})}` : '';
+          statusDiv.textContent = `${points.length.toLocaleString('en-AU')} cells loaded${asOf}`; statusDiv.style.color = '';
+        }
       } catch (e) {
         if (seq !== histRequestSeq) return;
         statusDiv.textContent = 'Fetch failed: ' + e; statusDiv.style.color = '#b3261e';
@@ -3594,7 +3806,7 @@ def api_heatmap():
             period = "all"
 
         meta = get_historical_cells_cached(window)
-        body_key = (window.key, metric, period, meta["fetched_at"].timestamp(), meta.get("ttl_override"))
+        body_key = (window.key, metric, period, meta.get("version"), meta.get("last_error"))
         with _heatmap_body_lock:
             hit = _heatmap_body_cache.get(body_key)
             if hit is not None:
@@ -3603,7 +3815,8 @@ def api_heatmap():
             points, error, prior = get_heatmap_points_cached(window, metric, period)
             body = json.dumps({"points": points, "prior": prior, "window_hours": window_hours,
                                "window": str(window.key), "metric": metric, "period": period,
-                               "error": error}, separators=(",", ":")).encode()
+                               "data_end": meta.get("data_end"), "error": error},
+                              separators=(",", ":")).encode()
             etag = f"{zlib.crc32(repr(body_key).encode()):08x}-{len(body)}"
             hit = (etag, gzip.compress(body, 6))
             with _heatmap_body_lock:
