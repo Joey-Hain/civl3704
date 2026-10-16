@@ -1103,6 +1103,20 @@ def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
 
 
 def compute_metric_points(cells, metric):
+    return [_compact_point(p) for p in _compute_metric_points(cells, metric)]
+
+
+def _compact_point(p):
+    """Round a point for the wire: 5 dp of lat/lon is ~1 m (cells are 10 m),
+    4 dp of a 0..1 value is far below a colour step, and sample counts are
+    whole numbers. Full float reprs made the 7-day response ~6.5 MB."""
+    out = [round(p[0], 5), round(p[1], 5), round(p[2], 4)]
+    if len(p) > 3:
+        out.append(int(p[3]) if p[3] >= 1 else round(p[3], 3))
+    return out
+
+
+def _compute_metric_points(cells, metric):
     """Turn aggregated cells into points for one metric.
     Pure/cheap — no network — so switching the metric dropdown client-side
     never re-triggers a CSV fetch (see get_heatmap_points_cached).
@@ -3247,6 +3261,33 @@ def project():
     )
 
 
+# Compress large text responses. The dashboard page is ~1.2 MB of HTML and
+# /api/vehicles is polled every 15 s by every open tab; uncompressed, a
+# dashboard or projector left open all day sent gigabytes a day, and Render
+# suspends Free services that use up their monthly outbound bandwidth.
+GZIP_MIN_BYTES = 1024
+_GZIP_TYPES = ("text/html", "application/json", "text/csv", "text/plain", "application/javascript")
+
+
+@app.after_request
+def _gzip_response(resp):
+    try:
+        if (resp.status_code != 200 or resp.direct_passthrough
+                or "Content-Encoding" in resp.headers
+                or "gzip" not in request.headers.get("Accept-Encoding", "")
+                or resp.mimetype not in _GZIP_TYPES):
+            return resp
+        data = resp.get_data()
+        if len(data) < GZIP_MIN_BYTES:
+            return resp
+        resp.set_data(gzip.compress(data, 5))
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Vary"] = "Accept-Encoding"
+    except Exception as e:  # never let compression break a response
+        print(f"[gzip] skipped: {e}", flush=True)
+    return resp
+
+
 @app.route("/ping")
 def ping():
     return "pong", 200
@@ -3513,6 +3554,31 @@ def api_trip(trip_id):
         return jsonify({"trip_id": trip_id, "shape": None, "stops": [], "error": f"Server error: {e}"}), 200
 
 
+# Built /api/heatmap bodies, gzipped once and reused until the window is
+# rebuilt: key (window, metric, period, build time) -> (etag, gz bytes).
+# Every open dashboard re-polls every 5 minutes, but a window only changes
+# every 5-30 minutes, so most polls are answered 304 Not Modified (no body)
+# and the rest get a pre-compressed body without recomputing anything.
+_heatmap_body_cache = OrderedDict()
+_heatmap_body_lock = threading.Lock()
+HEATMAP_BODY_CACHE_MAX = 24
+
+
+def _gzip_json_response(gz, etag=None):
+    if "gzip" in request.headers.get("Accept-Encoding", ""):
+        resp = Response(gz, mimetype="application/json")
+        resp.headers["Content-Encoding"] = "gzip"
+    else:
+        resp = Response(gzip.decompress(gz), mimetype="application/json")
+    resp.headers["Vary"] = "Accept-Encoding"
+    resp.direct_passthrough = False
+    if etag:
+        resp.headers["ETag"] = f'"{etag}"'
+        # Browser keeps the body and revalidates every time: 304 when unchanged.
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 @app.route("/api/heatmap")
 def api_heatmap():
     try:
@@ -3526,9 +3592,31 @@ def api_heatmap():
         period = request.args.get("period", "all")
         if period not in VALID_HEATMAP_PERIODS:
             period = "all"
-        points, error, prior = get_heatmap_points_cached(window, metric, period)
-        return jsonify({"points": points, "prior": prior, "window_hours": window_hours,
-                        "window": str(window.key), "metric": metric, "period": period, "error": error})
+
+        meta = get_historical_cells_cached(window)
+        body_key = (window.key, metric, period, meta["fetched_at"].timestamp(), meta.get("ttl_override"))
+        with _heatmap_body_lock:
+            hit = _heatmap_body_cache.get(body_key)
+            if hit is not None:
+                _heatmap_body_cache.move_to_end(body_key)
+        if hit is None:
+            points, error, prior = get_heatmap_points_cached(window, metric, period)
+            body = json.dumps({"points": points, "prior": prior, "window_hours": window_hours,
+                               "window": str(window.key), "metric": metric, "period": period,
+                               "error": error}, separators=(",", ":")).encode()
+            etag = f"{zlib.crc32(repr(body_key).encode()):08x}-{len(body)}"
+            hit = (etag, gzip.compress(body, 6))
+            with _heatmap_body_lock:
+                _heatmap_body_cache[body_key] = hit
+                while len(_heatmap_body_cache) > HEATMAP_BODY_CACHE_MAX:
+                    _heatmap_body_cache.popitem(last=False)
+        etag, gz = hit
+        if request.if_none_match.contains(etag):
+            resp = Response(status=304)
+            resp.headers["ETag"] = f'"{etag}"'
+            resp.headers["Cache-Control"] = "no-cache"
+            return resp
+        return _gzip_json_response(gz, etag)
     except Exception as e:
         return jsonify({"points": [], "window_hours": None, "metric": None, "period": None,
                         "error": f"Server error: {e}"}), 200
