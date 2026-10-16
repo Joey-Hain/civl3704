@@ -2912,7 +2912,7 @@ PAGE = """
   body { background:var(--bg); color:var(--text); font-family:var(--sans); margin:0; padding:24px 32px 60px; }
   h1 { font-size:1.4rem; font-weight:bold; border-bottom:2px solid var(--text); padding-bottom:10px; margin-bottom:4px; }
   .meta { color:var(--muted); font-size:0.85rem; margin-bottom:24px; }
-  .meta a { color:var(--text); }
+  .meta a { color:#555; }
   h2 { font-size:1rem; font-weight:bold; margin-top:36px; border-bottom:1px solid var(--line); padding-bottom:4px; }
   table { border-collapse:collapse; width:100%; margin-top:10px; }
   th, td { padding:6px 12px; text-align:right; }
@@ -2937,7 +2937,7 @@ PAGE = """
   td.late { color:var(--late); }
   td.early { color:var(--early); }
   .flag { color:var(--muted); font-size:0.75rem; }
-  .toggle { color:var(--text); text-decoration:underline; font-size:0.85rem; }
+  .toggle { color:#555; text-decoration:underline; font-size:0.85rem; }
   #dashmap { height:600px; border:1px solid var(--line); margin-top:10px; background:#e5e3dc; }
   .map-legend { display:flex; gap:16px; align-items:center; font-size:0.8rem; color:var(--muted); margin-top:8px; flex-wrap:wrap; }
   .map-legend .swatch { display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:4px; vertical-align:middle; background:var(--fill-blue); border:2px solid #999; }
@@ -2948,6 +2948,8 @@ PAGE = """
   .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
   .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
+  .leaflet-control-attribution a { color:#555; }
+  .leaflet-control-attribution a[target="_blank"]::after { content:"\2197"; display:inline-block; padding-left:0.2em; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
@@ -2985,7 +2987,7 @@ PAGE = """
 </style>
 </head>
 <body>
-  <h1>Delay Board <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/project">Projector mode &rarr;</a></h1>
+  <h1>Delay Board <a class="toggle" style="float:right; font-size:0.8rem; font-weight:normal; border-bottom:none;" href="/project">Projector mode</a></h1>
   <div class="meta">
     Data fetched {{ pulled_at }}
     {% if agency_error %}<br><span style="color:#b3261e">Operator names unavailable: {{ agency_error }}</span>{% endif %}
@@ -3130,7 +3132,8 @@ PAGE = """
 
   <script>
 """ + render_map_script(
-"""    const map = L.map('dashmap').setView([-33.8688, 151.2093], 11);"""
+"""    const map = L.map('dashmap').setView([-33.8688, 151.2093], 11);
+    map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');"""
 ) + """
   </script>
 </body>
@@ -3160,6 +3163,8 @@ PROJECT_PAGE = """
   .bus-arrow-only { position:absolute; top:0; left:50%; transform:translateX(-50%); width:24px; height:24px; display:flex; align-items:center; justify-content:center; }
   .bus-arrow-only .arrow-glyph { display:inline-block; font-size:20px; line-height:1; text-shadow:0 0 2px #fff, 0 0 4px #fff, 0 1px 2px rgba(0,0,0,0.35); }
   .leaflet-popup-content { font:13px/1.4 -apple-system, Helvetica, Arial, sans-serif; }
+  .leaflet-control-attribution a { color:#555; }
+  .leaflet-control-attribution a[target="_blank"]::after { content:"\2197"; display:inline-block; padding-left:0.2em; }
   .glass-tooltip { background:rgba(255,255,255,0.55) !important; -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45) !important; border-radius:12px !important; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:7px 11px; }
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
