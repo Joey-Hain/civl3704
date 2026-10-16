@@ -1328,6 +1328,9 @@ def compute_vehicles(data):
 # layer rebuild-on-metric-switch logic, bus markers, popups, polling — is
 # this exact text in both.
 HEATMAP_SCRIPT = """\
+    // Text scale for map popups: the projector page sets PROJECTOR_UI_SCALE
+    // (its CSS doubles the text) so popups get room to grow; 1 elsewhere.
+    const UI_SCALE = (typeof PROJECTOR_UI_SCALE !== 'undefined') ? PROJECTOR_UI_SCALE : 1;
     // Plainer basemap than stock OSM tiles. Was CartoDB Positron
     // (basemaps.cartocdn.com) — CARTO started requiring an API key for
     // that raster endpoint (see docs.carto.com/faqs/carto-basemaps), which
@@ -2142,6 +2145,7 @@ HEATMAP_SCRIPT = """\
     const STATUS_LATE = '{{ status_late }}', STATUS_EARLY = '{{ status_early }}', STATUS_ON_TIME = '{{ status_on_time }}';
     const ROUTE_AHEAD = '#1f2a44', ROUTE_BEHIND = '#5b6474';
     let selectedKey = null, selectedTripId = null, tripDetail = null, tripReq = 0;
+    let tripGeom = null;  // {ahead, behind, stops} as [lat, lon] lists, for popup placement
 
     function escHtml(t) {
       return String(t).replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
@@ -2196,12 +2200,14 @@ HEATMAP_SCRIPT = """\
     }
     function drawTrip(detail, v) {
       tripLayer.clearLayers();
+      tripGeom = { ahead: [], behind: [], stops: [] };
       if (detail.shape && detail.shape.length >= 4) {
         const flat = decodeRouteLines([detail.shape])[0].pts;
         const pts = [];
         for (let i = 0; i < flat.length; i += 2) pts.push([flat[i], flat[i + 1]]);
         const cut = (v && v.lat != null) ? nearestVertex(pts, v.lat, v.lon) : 0;
         const behind = pts.slice(0, cut + 1), ahead = pts.slice(cut);
+        tripGeom.ahead = ahead; tripGeom.behind = behind;
         const opts = { renderer: tripRenderer, interactive: false, lineCap: 'round', lineJoin: 'round' };
         if (behind.length > 1) L.polyline(behind, { ...opts, color: ROUTE_BEHIND, weight: 3, opacity: 0.55, dashArray: '4 6' }).addTo(tripLayer);
         if (ahead.length > 1) {
@@ -2213,6 +2219,7 @@ HEATMAP_SCRIPT = """\
       }
       (detail.stops || []).forEach((s, i) => {
         if (s.lat == null || s.lon == null) return;
+        tripGeom.stops.push([s.lat, s.lon]);
         L.circleMarker([s.lat, s.lon], {
           renderer: tripRenderer, radius: i === 0 ? 7 : 5, weight: 2, color: '#fff',
           fillColor: stopColour(s.delay_sec), fillOpacity: 1,
@@ -2221,6 +2228,132 @@ HEATMAP_SCRIPT = """\
           .addTo(tripLayer);
       });
     }
+
+    // ---- Keep the bus info popup off the selected route ----
+    // Leaflet always puts a popup directly above its marker, which is
+    // usually right on top of the route line and the next few stops. Once
+    // the popup is open (and again whenever its content, the route or the
+    // view changes) we try eight positions around the bus and keep the one
+    // that covers the least of the route ahead (route behind and stops are
+    // weighted too), stays inside the visible map (the model box in
+    // projector mode) and doesn't sit under the menu. Scored in container
+    // pixels; the menu test maps points through the projector warp.
+    const POPUP_GAP = 8, MARKER_HW = 28, MARKER_HH = 12;
+    // Leaflet geometry: the popup's content box ends 20 px (tip) above
+    // the anchor, and the anchor is popupAnchor = 12 px above the marker.
+    const POPUP_TIP_DROP = 32;
+    function popupCandidates(W, H) {
+      const vx = MARKER_HW + POPUP_GAP + W / 2, vy = MARKER_HH + POPUP_GAP + H / 2;
+      const dx = W / 2 + POPUP_GAP;
+      return [
+        { name: 'top',          dx: 0,   dy: -(H / 2 + POPUP_TIP_DROP), bias: 0 },
+        { name: 'bottom',       dx: 0,   dy: vy,  bias: 4 },
+        { name: 'right',        dx: vx,  dy: 0,   bias: 6 },
+        { name: 'left',         dx: -vx, dy: 0,   bias: 6 },
+        { name: 'top-right',    dx: dx,  dy: -vy, bias: 8 },
+        { name: 'top-left',     dx: -dx, dy: -vy, bias: 8 },
+        { name: 'bottom-right', dx: dx,  dy: vy,  bias: 9 },
+        { name: 'bottom-left',  dx: -dx, dy: vy,  bias: 9 },
+      ];
+    }
+    // Length of segment a-b inside rect r (Liang-Barsky clip).
+    function clipLen(ax, ay, bx, by, r) {
+      let t0 = 0, t1 = 1;
+      const dx = bx - ax, dy = by - ay;
+      const p = [-dx, dx, -dy, dy], q = [ax - r.x0, r.x1 - ax, ay - r.y0, r.y1 - ay];
+      for (let i = 0; i < 4; i++) {
+        if (p[i] === 0) { if (q[i] < 0) return 0; continue; }
+        const t = q[i] / p[i];
+        if (p[i] < 0) { if (t > t1) return 0; if (t > t0) t0 = t; }
+        else { if (t < t0) return 0; if (t < t1) t1 = t; }
+      }
+      return (t1 - t0) * Math.hypot(dx, dy);
+    }
+    function polyLenIn(pts, r) {
+      let len = 0;
+      for (let i = 1; i < pts.length; i++) len += clipLen(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, r);
+      return len;
+    }
+    // The part of the map container that's actually seen: the model box
+    // in projector mode, else the whole container.
+    function popupViewRect() {
+      if (typeof PROJECT_BOUNDS !== 'undefined') {
+        const a = map.latLngToContainerPoint(PROJECT_BOUNDS.getNorthWest());
+        const b = map.latLngToContainerPoint(PROJECT_BOUNDS.getSouthEast());
+        return { x0: a.x, y0: a.y, x1: b.x, y1: b.y };
+      }
+      const sz = map.getSize();
+      return { x0: 0, y0: 0, x1: sz.x, y1: sz.y };
+    }
+    // Container px -> screen px, through the projector's perspective warp
+    // if there is one, so we can test against the (unwarped) menu.
+    function containerToScreenFn() {
+      const el = map.getContainer();
+      const t = getComputedStyle(el).transform;
+      if (!t || t === 'none') {
+        const r = el.getBoundingClientRect();
+        return (x, y) => [r.left + x, r.top + y];
+      }
+      const m = new DOMMatrix(t), ox = el.offsetLeft, oy = el.offsetTop;
+      return (x, y) => { const p = m.transformPoint(new DOMPoint(x, y, 0, 1)); return [p.x / p.w + ox, p.y / p.w + oy]; };
+    }
+    function menuRects() {
+      return Array.from(document.querySelectorAll('.leaflet-control-container .leaflet-control, #projControls'))
+        .map(e => e.getBoundingClientRect()).filter(r => r.width > 0 && r.height > 0);
+    }
+    function placePopup(m) {
+      const popup = m && m.getPopup();
+      if (!popup || !popup.isOpen()) return;
+      const el = popup.getElement();
+      const wrap = el && el.querySelector('.leaflet-popup-content-wrapper');
+      if (!wrap) return;
+      const W = wrap.offsetWidth, H = wrap.offsetHeight;
+      const c = map.latLngToContainerPoint(m.getLatLng());
+      const toPx = ll => map.latLngToContainerPoint(ll);
+      const g = tripGeom || { ahead: [], behind: [], stops: [] };
+      const ahead = g.ahead.map(toPx), behind = g.behind.map(toPx), stops = g.stops.map(toPx);
+      const view = popupViewRect(), toScreen = containerToScreenFn(), menus = menuRects();
+      const pad = 6;
+      function scoreOf(cand) {
+        const cx = c.x + cand.dx, cy = c.y + cand.dy;
+        const r = { x0: cx - W / 2 - pad, x1: cx + W / 2 + pad, y0: cy - H / 2 - pad, y1: cy + H / 2 + pad };
+        let score = cand.bias + polyLenIn(ahead, r) + 0.35 * polyLenIn(behind, r);
+        for (const s of stops) if (s.x >= r.x0 && s.x <= r.x1 && s.y >= r.y0 && s.y <= r.y1) score += 30;
+        // Off the visible map: share of the box outside it.
+        const ix = Math.max(0, Math.min(r.x1, view.x1) - Math.max(r.x0, view.x0));
+        const iy = Math.max(0, Math.min(r.y1, view.y1) - Math.max(r.y0, view.y0));
+        score += 5000 * (1 - (ix * iy) / ((r.x1 - r.x0) * (r.y1 - r.y0)));
+        // Under the menu: sample a grid of points across the box.
+        if (menus.length) {
+          let hit = 0, n = 0;
+          for (let i = 0; i <= 4; i++) for (let j = 0; j <= 3; j++) {
+            const [sx, sy] = toScreen(r.x0 + (r.x1 - r.x0) * i / 4, r.y0 + (r.y1 - r.y0) * j / 3);
+            n++;
+            if (menus.some(mr => sx >= mr.left && sx <= mr.right && sy >= mr.top && sy <= mr.bottom)) hit++;
+          }
+          score += 3000 * hit / n;
+        }
+        return score;
+      }
+      const scored = popupCandidates(W, H).map(cand => ({ ...cand, score: scoreOf(cand) }));
+      let chosen = scored.reduce((x, y) => (y.score < x.score ? y : x));
+      // Small hysteresis so the popup doesn't hop sides on every poll.
+      const cur = scored.find(cd => cd.name === m._popupPlace);
+      if (cur && cur.score <= chosen.score + 15) chosen = cur;
+      m._popupPlace = chosen.name;
+      L.DomUtil[chosen.name === 'top' ? 'removeClass' : 'addClass'](el, 'popup-side');
+      popup.options.offset = L.point(Math.round(chosen.dx), Math.round(chosen.dy + H / 2 + POPUP_TIP_DROP));
+      // Reposition without letting autoPan drag the map around (it would
+      // fight the placement, and must never move the projector view).
+      const autoPan = popup.options.autoPan;
+      popup.options.autoPan = false;
+      popup.update();
+      popup.options.autoPan = autoPan;
+    }
+    function placeSelectedPopup() {
+      if (selectedKey != null) placePopup(markers.get(selectedKey));
+    }
+    map.on('zoomend moveend resize', placeSelectedPopup);
     async function loadTrip() {
       const tripId = selectedTripId, key = selectedKey, req = ++tripReq;
       if (!tripId) return;
@@ -2232,18 +2365,18 @@ HEATMAP_SCRIPT = """\
         const v = lastVehicles.find(x => (x.vehicle_id || x.trip_id) === key);
         drawTrip(detail, v);
         const m = markers.get(key);
-        if (m && v && m.isPopupOpen()) m.getPopup().setContent(popupContent(v));
+        if (m && v && m.isPopupOpen()) { m.getPopup().setContent(popupContent(v)); placePopup(m); }
       } catch (e) { console.warn('Trip load failed', e); }
     }
     function selectTrip(key, v) {
       if (!v.trip_id) return;
-      if (selectedKey !== key || selectedTripId !== v.trip_id) { tripDetail = null; tripLayer.clearLayers(); }
+      if (selectedKey !== key || selectedTripId !== v.trip_id) { tripDetail = tripGeom = null; tripLayer.clearLayers(); }
       selectedKey = key; selectedTripId = v.trip_id;
       loadTrip();
     }
     function clearTrip(key) {
       if (key != null && key !== selectedKey) return;  // a different popup closing
-      selectedKey = selectedTripId = tripDetail = null;
+      selectedKey = selectedTripId = tripDetail = tripGeom = null;
       tripReq++;
       tripLayer.clearLayers();
     }
@@ -2264,11 +2397,14 @@ HEATMAP_SCRIPT = """\
           m.getPopup().setContent(popup); m.getTooltip().setContent(tooltip);
         } else {
           const m = L.marker([v.lat, v.lon], { icon }).addTo(markersLayer)
-            .bindPopup(popup, { className:'glass-popup' })
+            .bindPopup(popup, { className:'glass-popup', maxWidth: 300 * UI_SCALE,
+                                autoPan: typeof PROJECT_BOUNDS === 'undefined' })
             .bindTooltip(tooltip, { direction:'top', offset:[0,-20], className:'glass-tooltip' });
           m.on('popupopen', () => {
+            m._popupPlace = null;
             const cur = lastVehicles.find(x => (x.vehicle_id || x.trip_id) === key);
             if (cur) selectTrip(key, cur);
+            placePopup(m);
           });
           m.on('popupclose', () => clearTrip(key));
           markers.set(key, m);
@@ -2281,7 +2417,7 @@ HEATMAP_SCRIPT = """\
       if (selectedKey != null) {
         const v = vehicles.find(x => (x.vehicle_id || x.trip_id) === selectedKey);
         if (!v || !v.trip_id) clearTrip();
-        else selectTrip(selectedKey, v);
+        else { selectTrip(selectedKey, v); placeSelectedPopup(); }
       }
     }
     async function pollVehicles() {
@@ -2345,6 +2481,7 @@ PAGE = """
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
+  .leaflet-popup.popup-side .leaflet-popup-tip-container { display:none; }  /* moved off the route: no pointer */
   .trip-summary { margin-top:6px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12); }
   .trip-summary .trip-delay { font-weight:600; }
   .trip-muted { color:#666; }
@@ -2490,6 +2627,7 @@ PROJECT_PAGE = """
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
+  .leaflet-popup.popup-side .leaflet-popup-tip-container { display:none; }  /* moved off the route: no pointer */
   .trip-summary { margin-top:6px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12); }
   .trip-summary .trip-delay { font-weight:600; }
   .trip-muted { color:#666; }
@@ -2538,11 +2676,23 @@ PROJECT_PAGE = """
   .heat-panel .hp-hide { display:block; width:100%; margin-top:10px; font:inherit; cursor:pointer; }
   .menu-hint { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; opacity:0; transition:opacity 0.4s; pointer-events:none; }
   .menu-hint.show { opacity:1; }
+  /* Readability on the projected model: every panel and label is twice the
+     dashboard size. The menu is scaled as a block (it lives outside the
+     warped map, so zoom is safe); popups/tooltips inside the map get larger
+     fonts instead, since zoom there would throw off Leaflet's positioning. */
+  #projControls { zoom:2; max-height:calc(50vh - 10px); overflow-y:auto; }
+  .leaflet-popup-content { font-size:26px; margin:20px 30px 20px 24px; }
+  .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { border-radius:20px; }
+  .leaflet-container a.leaflet-popup-close-button { font-size:32px; width:40px; height:40px; line-height:40px; }
+  .glass-tooltip { font-size:24px; padding:12px 18px; border-radius:18px !important; }
+  #heatLoadingBanner { font-size:24px; padding:10px 24px; border-radius:24px; }
+  .menu-hint { font-size:26px; padding:10px 24px; border-radius:24px; }
 </style>
 </head>
 <body>
   <div id="dashmap"></div>
   <script>
+    const PROJECTOR_UI_SCALE = 2;
     const map = L.map('dashmap', {
       // This view just loads the projector's area and sits there — no
       // panning, no zooming, in or out. Bus markers, both heat layers and
