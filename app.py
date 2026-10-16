@@ -152,9 +152,6 @@ from google.transit import gtfs_realtime_pb2
 
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 UTC_TZ = ZoneInfo("UTC")
-DATA_DIR = Path("CIVL3704")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = DATA_DIR / "delay_log.csv"
 ANOMALY_ABS_SEC = 3600
 # "On time" window, matching the TfNSW bus on-time running KPI: from 59s
 # early through 5:59 late, inclusive. A bus a full minute early (-60s) or
@@ -263,6 +260,28 @@ PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
 
 load_dotenv()
+
+# MEMORY (16 Oct): Render killed the instance for using over 512 MB about
+# three minutes after every restart, although the RSS logged at each
+# milestone stayed near 100 MB. The live trip-update feed is rebuilt every
+# 12 s into tens of thousands of dicts, from up to six gunicorn threads, and
+# glibc gives each thread its own malloc arena that keeps freed memory, so
+# the process grew with every rebuild. Two arenas, plus malloc_trim() after
+# each big rebuild, hand that memory back. Linux/glibc only; a no-op elsewhere.
+try:
+    import ctypes
+    _libc = ctypes.CDLL("libc.so.6")
+    _libc.mallopt(-8, 2)  # M_ARENA_MAX = 2
+except (OSError, AttributeError):
+    _libc = None
+
+
+def _trim_memory():
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
@@ -339,6 +358,29 @@ ENABLE_TRIP_HEADSIGNS = os.getenv("ENABLE_TRIP_HEADSIGNS", "1") == "1"
 # be cached forever as "loaded successfully with zero agencies" — this is
 # the fix for "headsigns and operator codes missing" persisting indefinitely.
 SCHEDULE_RETRY_BACKOFF_SEC = 300
+
+
+def _rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return None
+
+
+_last_rss_log = [0.0]
+
+
+def _log_rss_every(tag, period_sec=60):
+    """Log RSS at most once a minute, so a slow climb shows up in Render's
+    logs before an out-of-memory kill rather than only at milestones."""
+    now = time.monotonic()
+    if now - _last_rss_log[0] >= period_sec:
+        _last_rss_log[0] = now
+        _log_rss(tag)
 
 
 def _log_rss(tag):
@@ -647,15 +689,6 @@ def merge_vehicle_delays(vehicles, delay_by_trip):
             veh["outline_color"] = OUTLINE_EARLY
 
 
-def append_to_log(rows):
-    file_exists = LOG_FILE.exists()
-    with LOG_FILE.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["pulled_at", "operator", "route_id", "trip_id", "stop_id", "stop_sequence", "delay", "anomaly"])
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(rows)
-
-
 def summarise(rows, key):
     grouped = defaultdict(list)
     for r in rows:
@@ -731,11 +764,15 @@ def get_all_rows_cached():
         agency_names, trip_headsigns, agency_error = get_schedule_lookups()
         feed = fetch_feed()
         all_rows = extract_rows(feed, agency_names)
-        if all_rows:
-            append_to_log(all_rows)
+        del feed
+        # (The CSV append of every row to CIVL3704/delay_log.csv that used
+        # to happen here was removed: nothing read it, Render's disk is
+        # wiped on every restart, and it wrote MBs every 12 s.)
 
         _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
                             agency_error=agency_error, fetched_at=now)
+        _trim_memory()
+        _log_rss_every(f"live feed rows={len(all_rows)}")
         return all_rows, agency_names, trip_headsigns, agency_error
 
 
@@ -1151,7 +1188,14 @@ def _fetch_cells_file(path, immutable=False):
         headers["If-None-Match"] = st["etag"]
     url = f"{CELLS_BASE}/{path}"
     try:
-        with requests.get(url, headers=headers, timeout=30, stream=True) as r:
+        r = requests.get(url, headers=headers, timeout=30, stream=True)
+        if r.status_code in RETRYABLE_STATUS:
+            print(f"[cells] GET {path} -> HTTP {r.status_code}, retrying once", flush=True)
+            wait = _retry_after_sec(r)
+            r.close()
+            time.sleep(wait)
+            r = requests.get(url, headers=headers, timeout=30, stream=True)
+        with r:
             print(f"[cells] GET {path} -> HTTP {r.status_code}", flush=True)
             if r.status_code == 304:
                 st["checked"] = now
@@ -1234,9 +1278,14 @@ def cells_from_prebuilt(window, previous=None):
     if not window.is_custom:
         local, err = _fetch_cells_file(f"windows/{window.hours}.bin.gz")
         if local is None:
-            if err:
-                print(f"[cells] {err}; falling back to raw CSVs", flush=True)
-            return None
+            if err is None:
+                return None  # 404: no cells branch yet, so parse the CSVs instead
+            # GitHub refused or timed out (typically 429 right after a
+            # restart, when the disk copy is gone). Do NOT fall back to
+            # parsing a week of CSVs here: that's the CPU load that used to
+            # starve the instance. Report it and retry in a minute.
+            print(f"[cells] {err}; will retry", flush=True)
+            return _cells_meta({}, {}, 0, 0, [err], 1, "error")
         version = f"{local.stat().st_mtime_ns}"
         if previous is not None and previous.get("version") == version and not err:
             return previous
@@ -1557,6 +1606,10 @@ def get_historical_cells_cached(window):
                 meta["ttl_override"] = CELLS_CHECK_SEC
             if meta["files_lost"]:
                 meta["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
+                if cached is not None and cached["files_fetched"] > meta["files_fetched"]:
+                    cached["fetched_at"] = now  # keep showing the last good build
+                    cached["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
+                    return cached
             _store_window(key, window, meta)
             return meta
         start_dt, end_dt = window.bounds()
@@ -1601,7 +1654,7 @@ def get_heatmap_points_cached(window, metric, period="all"):
 
     if meta["deadline_hit"]:
         note = f"Partial data (deadline hit after {HEATMAP_DEADLINE_SEC}s)"
-    elif meta.get("files_lost"):
+    elif meta.get("files_lost") and meta.get("source") != "cells":
         note = (f"Partial data: {meta['files_lost']} day file(s) couldn't be downloaded "
                 f"(GitHub said: {meta['last_error']}); retrying in a minute")
     elif not points:
@@ -2528,6 +2581,7 @@ HEATMAP_SCRIPT = """\
     function tripSummaryHtml(v) {
       if (!v.trip_id || v.trip_id !== selectedTripId) return '';
       if (!tripDetail) return '<div class="trip-summary trip-muted">Loading route&hellip;</div>';
+      if (tripDetail.load_error) return `<div class="trip-summary trip-muted">Route unavailable (${escHtml(tripDetail.load_error)}); retrying&hellip;</div>`;
       const st = tripDetail.stops || [];
       let html = '<div class="trip-summary">';
       if (st.length) {
@@ -2714,23 +2768,49 @@ HEATMAP_SCRIPT = """\
       if (selectedKey != null) placePopup(markers.get(selectedKey));
     }
     map.on('zoomend moveend resize', placeSelectedPopup);
+    // One /api/trip request at a time: the selected bus is re-fetched on
+    // every 15 s poll (its upcoming stops change), and a slow response used
+    // to stack a new request on top of each unanswered one.
+    let tripInFlight = false;
+    function refreshSelectedPopup(key) {
+      const v = lastVehicles.find(x => (x.vehicle_id || x.trip_id) === key);
+      const m = markers.get(key);
+      if (m && v && m.isPopupOpen()) { m.getPopup().setContent(popupContent(v)); placePopup(m); }
+      return v;
+    }
     async function loadTrip() {
-      const tripId = selectedTripId, key = selectedKey, req = ++tripReq;
-      if (!tripId) return;
+      const tripId = selectedTripId, key = selectedKey;
+      if (!tripId || tripInFlight) return;
+      const req = ++tripReq;
+      tripInFlight = true;
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 20000);
       try {
-        const res = await fetch('/api/trip/' + encodeURIComponent(tripId));
+        const res = await fetch('/api/trip/' + encodeURIComponent(tripId), { signal: ctl.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const detail = await res.json();
         if (req !== tripReq || tripId !== selectedTripId) return;  // superseded by a newer click/poll
         tripDetail = detail;
-        const v = lastVehicles.find(x => (x.vehicle_id || x.trip_id) === key);
-        drawTrip(detail, v);
-        const m = markers.get(key);
-        if (m && v && m.isPopupOpen()) { m.getPopup().setContent(popupContent(v)); placePopup(m); }
-      } catch (e) { console.warn('Trip load failed', e); }
+        drawTrip(detail, refreshSelectedPopup(key));
+      } catch (e) {
+        console.warn('Trip load failed', e);
+        if (req !== tripReq || tripId !== selectedTripId) return;
+        // Keep a route we already drew; otherwise say why it's missing.
+        if (!tripDetail || tripDetail.load_error) {
+          tripDetail = { load_error: e.name === 'AbortError' ? 'server slow to respond' : String(e.message || e) };
+          refreshSelectedPopup(key);
+        }
+      } finally {
+        clearTimeout(timer);
+        tripInFlight = false;
+      }
     }
     function selectTrip(key, v) {
       if (!v.trip_id) return;
-      if (selectedKey !== key || selectedTripId !== v.trip_id) { tripDetail = tripGeom = null; tripLayer.clearLayers(); }
+      if (selectedKey !== key || selectedTripId !== v.trip_id) {
+        tripDetail = tripGeom = null; tripLayer.clearLayers();
+        tripInFlight = false;  // a request for the previous bus is now irrelevant
+      }
       selectedKey = key; selectedTripId = v.trip_id;
       loadTrip();
     }
@@ -2763,7 +2843,12 @@ HEATMAP_SCRIPT = """\
           m.on('popupopen', () => {
             m._popupPlace = null;
             const cur = lastVehicles.find(x => (x.vehicle_id || x.trip_id) === key);
-            if (cur) selectTrip(key, cur);
+            if (cur) {
+              selectTrip(key, cur);
+              // The popup HTML was built before this bus was selected, so it
+              // had no route section until the next poll; rebuild it now.
+              m.getPopup().setContent(popupContent(cur));
+            }
             placePopup(m);
           });
           m.on('popupclose', () => clearTrip(key));
@@ -2780,9 +2865,23 @@ HEATMAP_SCRIPT = """\
         else { selectTrip(selectedKey, v); placeSelectedPopup(); }
       }
     }
+    // Skip a poll while the previous one is still waiting, and give up on
+    // a request after 20 s. Without this, a slow server got a new request
+    // every 15 s on top of the unanswered ones, from every open tab, which
+    // tied up all six server threads and made the slowdown worse.
+    let vehiclePollInFlight = false;
     async function pollVehicles() {
-      try { const res = await fetch('/api/vehicles' + window.location.search); const data = await res.json(); renderVehicles(data.vehicles || []); }
-      catch (e) { console.warn('Vehicle poll failed', e); }
+      if (vehiclePollInFlight) return;
+      vehiclePollInFlight = true;
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 20000);
+      try {
+        const res = await fetch('/api/vehicles' + window.location.search, { signal: ctl.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderVehicles(data.vehicles || []);
+      } catch (e) { console.warn('Vehicle poll failed', e); }
+      finally { clearTimeout(timer); vehiclePollInFlight = false; }
     }
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
@@ -3524,6 +3623,7 @@ def status():
     agencies = _schedule_cache["agency_names"]
     headsigns = _schedule_cache["trip_headsigns"]
     return jsonify({
+        "rss_mb": round(_rss_mb() or 0),
         "schedule_loaded": bool(agencies),
         "schedule_agencies": len(agencies) if agencies else 0,
         "schedule_headsigns": len(headsigns) if headsigns else 0,
@@ -3637,7 +3737,11 @@ def _fetch_scrape_json(path, timeout=20):
     """GET a JSON file from gtfs-r-scrape's shapes/ folder; None on any failure."""
     url = f"{TRIP_LOOKUP_BASE}/{path}"
     try:
-        r = requests.get(url, timeout=timeout)
+        r = requests.get(url, headers=RAW_HEADERS, timeout=timeout)
+        if r.status_code in RETRYABLE_STATUS:
+            print(f"[trip] GET {url} -> HTTP {r.status_code}, retrying once", flush=True)
+            time.sleep(_retry_after_sec(r))
+            r = requests.get(url, headers=RAW_HEADERS, timeout=timeout)
         if r.status_code != 200:
             print(f"[trip] GET {url} -> HTTP {r.status_code}", flush=True)
             return None
@@ -3819,6 +3923,9 @@ def api_heatmap():
                               separators=(",", ":")).encode()
             etag = f"{zlib.crc32(repr(body_key).encode()):08x}-{len(body)}"
             hit = (etag, gzip.compress(body, 6))
+            del body, points
+            _trim_memory()
+            _log_rss(f"heatmap body {window.key}/{metric}/{period}")
             with _heatmap_body_lock:
                 _heatmap_body_cache[body_key] = hit
                 while len(_heatmap_body_cache) > HEATMAP_BODY_CACHE_MAX:
