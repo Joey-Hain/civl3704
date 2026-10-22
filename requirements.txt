@@ -4,4 +4,3 @@ requests
 python-dotenv
 gtfs-realtime-bindings
 tzdata
-pyserial

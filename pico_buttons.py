@@ -1,33 +1,44 @@
-"""MicroPython firmware for three debounced USB-serial dashboard buttons.
-
-Connect each button between its GPIO pin and GND. Copy this file to the
-Pico as main.py so it starts automatically when the board is powered.
-"""
-
+import time
 from machine import Pin
-from time import sleep_ms, ticks_diff, ticks_ms
+import usb.device
+from usb.device.keyboard import KeyboardInterface, KeyCode
 
-BUTTON_PINS = (14, 15, 16)
-DEBOUNCE_MS = 50
-POLL_MS = 10
+# GPIO pin -> key to send. Wire each button between the GPIO pin and GND.
+BUTTONS = [
+    (15, KeyCode.A),
+    (14, KeyCode.B),
+    (13, KeyCode.C),
+]
 
-buttons = [Pin(pin, Pin.IN, Pin.PULL_UP) for pin in BUTTON_PINS]
-last_readings = [button.value() for button in buttons]
-stable_readings = last_readings[:]
-changed_at = [ticks_ms() for _ in buttons]
+# Internal pull-ups: pin reads 1 (HIGH) when idle, 0 (LOW) when pressed
+buttons = [(gp, Pin(gp, Pin.IN, Pin.PULL_UP), key) for gp, key in BUTTONS]
+
+kb = KeyboardInterface()
+usb.device.get().init(kb, builtin_driver=True)  # keeps the USB serial REPL available
+
+
+def tap(key):
+    """Send one press and release, so the host never auto-repeats the key."""
+    kb.send_keys([key])
+    time.sleep_ms(20)
+    kb.send_keys([])
+
+
+last = [1] * len(buttons)
 
 while True:
-    now = ticks_ms()
-    for index, button in enumerate(buttons):
-        reading = button.value()
-        if reading != last_readings[index]:
-            last_readings[index] = reading
-            changed_at[index] = now
-        elif (
-            reading != stable_readings[index]
-            and ticks_diff(now, changed_at[index]) >= DEBOUNCE_MS
-        ):
-            stable_readings[index] = reading
-            if reading == 0:
-                print("B{}".format(index + 1))
-    sleep_ms(POLL_MS)
+    readings = [pin.value() for gp, pin, key in buttons]
+
+    if readings != last:
+        print(" ".join("GP{}={}".format(gp, "HIGH" if v else "LOW")
+                       for (gp, pin, key), v in zip(buttons, readings)))
+
+        if kb.is_open():
+            for (gp, pin, key), before, now in zip(buttons, last, readings):
+                if before == 1 and now == 0:  # button just pressed
+                    tap(key)
+
+        last = readings
+        time.sleep_ms(30)  # debounce
+
+    time.sleep_ms(10)

@@ -45,20 +45,15 @@ The dashboard automatically refreshes vehicle positions every 15 seconds and the
 
 ### Raspberry Pi Pico buttons
 
-Three physical buttons can control the map when Flask is running on a computer connected to a standard Raspberry Pi Pico over USB. The Pico sends debounced button presses over its USB serial connection; this does not control a remotely hosted Render instance.
+The Pico firmware emulates a USB keyboard. Connect the Pico by USB to the computer displaying the dashboard, then copy [`pico_buttons.py`](pico_buttons.py) to the Pico as `main.py`. No serial-port setting or extra app dependency is needed. Keep the dashboard browser window focused while using the buttons.
 
-1. Connect momentary buttons from Pico GPIO 14, 15 and 16 to GND. The firmware enables the internal pull-ups.
-2. Copy [`pico_buttons.py`](pico_buttons.py) to the Pico as `main.py` so it runs on power-up.
-3. Find the Pico's serial port (for example, `COM3` on Windows or `/dev/ttyACM0` on Linux) and set `PICO_SERIAL_PORT` in the app's `.env`.
-4. Install the app requirements and run `python app.py`. The dashboard and `/project` page will follow the connected buttons.
+Connect each momentary button between its GPIO pin and GND; the firmware uses internal pull-ups.
 
 | Button | Action |
 |---|---|
-| GPIO 14 (button 1) | Switch between live and historical heatmaps |
-| GPIO 15 (button 2) | Switch between average delay and delay burden |
-| GPIO 16 (button 3) | Show or hide bus markers |
-
-The serial port setting is optional. Without `PICO_SERIAL_PORT`, the dashboard behaves as before and does not start a Pico reader.
+| GPIO 15 (A) | Cycle live heatmap → historical heatmap → no heatmap |
+| GPIO 14 (B) | Cycle through average delay, delay burden, not on time, speed and bus density |
+| GPIO 13 (C) | Show or hide bus markers |
 
 ## Visualisations
 
@@ -76,9 +71,9 @@ The serial port setting is optional. Without `PICO_SERIAL_PORT`, the dashboard b
 By default `/project` places the model exactly where TransportLab's smart-city rig does, using the projector settings in its [`params.json5`](https://github.com/TransportLab/smart-city/blob/main/params.json5): the model's 2:1 box spans the full window width, is vertically centred and shifted down by `vertical_offset` (50 px, which moves the box 25 px because of the centring), and is stretched horizontally by `horizontal_scale` (1.184) about the centre. At those settings the stretched box would be wider than a 1920×1080 image, so it is shrunk (same stretch ratio, same centre) until all four corners are on screen: the model spans the full width with black bands above and below. These values are set in `app.py` (`SMART_CITY_*`). Manual calibration is only needed if the projector has moved.
 
 1. Open `/project` on the computer connected to the projector, full screen (F11) at the projector's native resolution.
-2. Press C (or "Calibrate projection" in the menu). A crosshair appears on each corner of the model's area.
+2. Press K (or "Calibrate projection" in the menu). A crosshair appears on each corner of the model's area.
 3. Drag each crosshair onto the matching corner of the physical model. Tab selects the next crosshair and the arrow keys nudge it by 1 px (Shift for 10 px). Align to street-level corners rather than building tops, as the buildings stand above the table.
-4. Press C again to finish. The map is warped so the model's corners land on the crosshairs, and nothing is projected outside them.
+4. Press K again to finish. The map is warped so the model's corners land on the crosshairs, and nothing is projected outside them.
 
 The calibration is saved in that browser. The calibration box also shows a link containing it; bookmark that link on the projector computer so the calibration can be restored anywhere. R resets it to the smart-city default.
 

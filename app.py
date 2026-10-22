@@ -283,7 +283,6 @@ def _trim_memory():
         except Exception:
             pass
 API_KEY = os.getenv("TFNSW_API_KEY")
-PICO_SERIAL_PORT = os.getenv("PICO_SERIAL_PORT", "").strip()
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
 VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
@@ -432,80 +431,6 @@ def parse_ts(raw):
 _parse_ts_cached = lru_cache(maxsize=8192)(parse_ts)
 
 app = Flask(__name__)
-
-_pico_state_lock = threading.Lock()
-_pico_state = {
-    "data_mode": "live",
-    "metric": "delay",
-    "markers_visible": True,
-}
-_pico_reader_start_lock = threading.Lock()
-_pico_reader_started = False
-
-
-def _handle_pico_command(command):
-    """Apply one debounced button command received over USB serial."""
-    with _pico_state_lock:
-        if command == "B1":
-            _pico_state["data_mode"] = (
-                "historical" if _pico_state["data_mode"] == "live" else "live"
-            )
-        elif command == "B2":
-            _pico_state["metric"] = (
-                "delay_total" if _pico_state["metric"] == "delay" else "delay"
-            )
-        elif command == "B3":
-            _pico_state["markers_visible"] = not _pico_state["markers_visible"]
-        else:
-            return False
-    return True
-
-
-def _pico_serial_reader():
-    """Read button commands from the configured Pico USB serial port."""
-    try:
-        import serial
-    except ImportError:
-        print("[pico] pyserial is required when PICO_SERIAL_PORT is configured", flush=True)
-        return
-
-    while True:
-        try:
-            with serial.Serial(PICO_SERIAL_PORT, 115200, timeout=1) as connection:
-                print(f"[pico] listening on {PICO_SERIAL_PORT}", flush=True)
-                while True:
-                    raw_command = connection.readline()
-                    if not raw_command:
-                        continue
-                    command = raw_command.decode("ascii", errors="replace").strip().upper()
-                    if _handle_pico_command(command):
-                        with _pico_state_lock:
-                            state = dict(_pico_state)
-                        print(f"[pico] {command}: {state}", flush=True)
-                    elif command:
-                        print(f"[pico] ignored unknown command: {command!r}", flush=True)
-        except serial.SerialException as error:
-            print(f"[pico] serial port {PICO_SERIAL_PORT} unavailable: {error}", flush=True)
-            time.sleep(5)
-
-
-def _ensure_pico_reader_started():
-    global _pico_reader_started
-    if not PICO_SERIAL_PORT or _pico_reader_started:
-        return
-    with _pico_reader_start_lock:
-        if _pico_reader_started:
-            return
-        reader = threading.Thread(target=_pico_serial_reader, name="pico-buttons", daemon=True)
-        reader.start()
-        _pico_reader_started = True
-
-
-@app.before_request
-def start_pico_reader():
-    if PICO_SERIAL_PORT:
-        _ensure_pico_reader_started()
-
 
 # Values the shared map script (HEATMAP_SCRIPT, used by both "/" and
 # "/project") needs on every page, so each page's render call doesn't
@@ -1811,7 +1736,6 @@ def compute_vehicles(data):
 # layer rebuild-on-metric-switch logic, bus markers, popups, polling — is
 # this exact text in both.
 HEATMAP_SCRIPT = """\
-    const PICO_CONTROLS_ENABLED = {{ pico_controls_enabled|tojson }};
     // Text scale for map popups: the projector page sets PROJECTOR_UI_SCALE
     // (its CSS doubles the text) so popups get room to grow; 1 elsewhere.
     const UI_SCALE = (typeof PROJECTOR_UI_SCALE !== 'undefined') ? PROJECTOR_UI_SCALE : 1;
@@ -2962,47 +2886,37 @@ HEATMAP_SCRIPT = """\
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
     setInterval(loadHistoricalHeatmap, 300000);
-    if (PICO_CONTROLS_ENABLED) {
-      let lastPicoState = null;
-      function applyPicoState(state) {
-        if (!state || !['live', 'historical'].includes(state.data_mode)
-            || !['delay', 'delay_total'].includes(state.metric)
-            || typeof state.markers_visible !== 'boolean') return;
+    document.addEventListener('keydown', e => {
+      if (e.repeat || e.altKey || e.ctrlKey || e.metaKey) return;
+      if (e.target instanceof HTMLElement
+          && e.target.closest('input, select, textarea, button, [contenteditable="true"]')) return;
 
-        if (!lastPicoState || lastPicoState.data_mode !== state.data_mode) {
-          const showLive = state.data_mode === 'live';
-          const showHistorical = !showLive;
-          if (map.hasLayer(heatLayer) !== showLive)
-            (showLive ? map.addLayer(heatLayer) : map.removeLayer(heatLayer));
-          if (map.hasLayer(histHeatLayer) !== showHistorical)
-            (showHistorical ? map.addLayer(histHeatLayer) : map.removeLayer(histHeatLayer));
+      if (e.code === 'KeyA') {
+        const hasLive = map.hasLayer(heatLayer);
+        const hasHistorical = map.hasLayer(histHeatLayer);
+        if (hasLive && !hasHistorical) {
+          map.removeLayer(heatLayer);
+          map.addLayer(histHeatLayer);
+        } else if (!hasLive && hasHistorical) {
+          map.removeLayer(histHeatLayer);
+        } else {
+          if (hasHistorical) map.removeLayer(histHeatLayer);
+          if (!hasLive) map.addLayer(heatLayer);
         }
-        if (currentMetric !== state.metric) {
-          const metricSelect = document.getElementById('heatMetricSelect');
-          metricSelect.value = state.metric;
-          applyMetric(state.metric);
-        }
-        if (!lastPicoState || lastPicoState.markers_visible !== state.markers_visible) {
-          if (map.hasLayer(markersLayer) !== state.markers_visible) {
-            (state.markers_visible ? map.addLayer(markersLayer) : map.removeLayer(markersLayer));
-          }
-        }
-        lastPicoState = state;
+        e.preventDefault();
+      } else if (e.code === 'KeyB') {
+        const metrics = Object.keys(METRICS);
+        const nextMetricIndex = (metrics.indexOf(currentMetric) + 1) % metrics.length;
+        const metric = metrics[nextMetricIndex];
+        document.getElementById('heatMetricSelect').value = metric;
+        applyMetric(metric);
+        e.preventDefault();
+      } else if (e.code === 'KeyC') {
+        if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer);
+        else map.addLayer(markersLayer);
+        e.preventDefault();
       }
-
-      async function pollPicoControls() {
-        try {
-          const response = await fetch('/api/pico-controls', { cache: 'no-store' });
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          applyPicoState(await response.json());
-        } catch (error) {
-          console.warn('Pico control poll failed', error);
-        }
-      }
-
-      pollPicoControls();
-      setInterval(pollPicoControls, 1000);
-    }
+    });
 """
 
 
@@ -3570,7 +3484,7 @@ PROJECT_PAGE = """
       Align to street-level corners, not building tops.</div>
       <div style="margin-top:6px">Bookmark this link on the projector laptop to restore this calibration:</div>
       <input id="calLink" readonly>
-      <div><button type="button" id="calDone">Done (C)</button><button type="button" id="calReset">Reset (R)</button></div>`;
+      <div><button type="button" id="calDone">Done (K)</button><button type="button" id="calReset">Reset (R)</button></div>`;
     document.body.appendChild(calHelp);
     const calLink = calHelp.querySelector('#calLink');
     calLink.addEventListener('focus', () => calLink.select());
@@ -3592,14 +3506,14 @@ PROJECT_PAGE = """
     const calBtn = document.createElement('button');
     calBtn.type = 'button';
     calBtn.className = 'hp-hide';
-    calBtn.textContent = 'Calibrate projection (C)';
+    calBtn.textContent = 'Calibrate projection (K)';
     calBtn.addEventListener('click', () => setCalibrating(!document.body.classList.contains('calibrating')));
     document.querySelector('.heat-panel').appendChild(calBtn);
 
     document.addEventListener('keydown', e => {
       if (e.target.closest('input, select, textarea')) return;
       const calibrating = document.body.classList.contains('calibrating');
-      if (e.key === 'c' || e.key === 'C') { setCalibrating(!calibrating); e.preventDefault(); return; }
+      if (e.code === 'KeyK') { setCalibrating(!calibrating); e.preventDefault(); return; }
       if (!calibrating) return;
       if (e.key === 'Enter' || e.key === 'Escape') { setCalibrating(false); return; }
       if (e.key === 'r' || e.key === 'R') { dst = null; saveCalibration(); applyCalibration(); return; }
@@ -3687,11 +3601,10 @@ def project():
         PROJECT_PAGE,
         vehicles=vehicles, vehicles_json=json.dumps(vehicles),
         color_fill=COLOR_FILL,
-        ne_lat=ne_lat, ne_lng=ne_lng, sw_lat=sw_lat, sw_lng=sw_lng,
+        ne_lat=ne_lat, ne_lng=ne_lng,         sw_lat=sw_lat, sw_lng=sw_lng,
         model_aspect=model_w / model_h,
         v_offset=SMART_CITY_PROJ_VERTICAL_OFFSET_PX,
         h_scale=SMART_CITY_PROJ_HORIZONTAL_SCALE,
-        pico_controls_enabled=bool(PICO_SERIAL_PORT),
     )
 
 
@@ -3804,7 +3717,6 @@ def dashboard():
         color_fill=COLOR_FILL,
         outline_on_time=OUTLINE_ON_TIME, outline_late=OUTLINE_LATE,
         outline_early=OUTLINE_EARLY, outline_no_data=OUTLINE_NO_DATA,
-        pico_controls_enabled=bool(PICO_SERIAL_PORT),
     )
 
 
@@ -3815,13 +3727,6 @@ def api_vehicles():
     data = compute_delay_data(request.args)
     vehicles, map_error = compute_vehicles(data)
     return jsonify({"vehicles": vehicles, "error": map_error})
-
-
-@app.route("/api/pico-controls")
-def api_pico_controls():
-    with _pico_state_lock:
-        state = dict(_pico_state)
-    return jsonify(state)
 
 
 def get_route_shapes_gz():
