@@ -44,3 +44,4 @@ The app is organised into three main layers:
 - Projector geometry: by default the model box is laid out as smart-city's `params.json5` does (full-width box at the model's 2:1 aspect, `vertical_offset` 50 px, `horizontal_scale` 1.184, shrunk uniformly if needed so all four corners stay on screen), computed from unrounded Web Mercator positions and applied through the same warp below.
 - Projector calibration: a corner-pin warp (homography applied as a CSS `matrix3d` to the map) maps the model's four corners onto four draggable crosshairs, with an SVG mask blacking out everything outside them; saved per browser and shareable as a `?cal=` link.
 - HTML, CSS and JavaScript provide the dashboard layout, filters, layer controls, legends, popups and loading/error states.
+- The shared map script listens for USB HID keyboard keys A, B and C from `pico_buttons.py`: A cycles live/historical/no heatmap, B cycles all heatmap metrics, and C toggles bus-marker visibility.

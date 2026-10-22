@@ -43,6 +43,18 @@ Open [http://localhost:5000](http://localhost:5000) in a browser. The first page
 
 The dashboard automatically refreshes vehicle positions every 15 seconds and the historical heatmap every 5 minutes.
 
+### Raspberry Pi Pico buttons
+
+The Pico firmware emulates a USB keyboard. Connect the Pico by USB to the computer displaying the dashboard, then copy [`pico_buttons.py`](pico_buttons.py) to the Pico as `main.py`. No serial-port setting or extra app dependency is needed. Keep the dashboard browser window focused while using the buttons.
+
+Connect each momentary button between its GPIO pin and GND; the firmware uses internal pull-ups.
+
+| Button | Action |
+|---|---|
+| GPIO 15 (A) | Cycle live heatmap → historical heatmap → no heatmap |
+| GPIO 14 (B) | Cycle through average delay, delay burden, not on time, speed and bus density |
+| GPIO 13 (C) | Show or hide bus markers |
+
 ## Visualisations
 
 - **Live map:** Each marker represents a currently reporting bus. The label shows its route, and the arrow shows its direction of travel. Marker outlines indicate the bus status: white for on time (0:59 early to 5:59 late, matching the TfNSW on-time KPI), red for late, green for early, and grey when delay data is unavailable or anomalous.
@@ -59,9 +71,9 @@ The dashboard automatically refreshes vehicle positions every 15 seconds and the
 By default `/project` places the model exactly where TransportLab's smart-city rig does, using the projector settings in its [`params.json5`](https://github.com/TransportLab/smart-city/blob/main/params.json5): the model's 2:1 box spans the full window width, is vertically centred and shifted down by `vertical_offset` (50 px, which moves the box 25 px because of the centring), and is stretched horizontally by `horizontal_scale` (1.184) about the centre. At those settings the stretched box would be wider than a 1920×1080 image, so it is shrunk (same stretch ratio, same centre) until all four corners are on screen: the model spans the full width with black bands above and below. These values are set in `app.py` (`SMART_CITY_*`). Manual calibration is only needed if the projector has moved.
 
 1. Open `/project` on the computer connected to the projector, full screen (F11) at the projector's native resolution.
-2. Press C (or "Calibrate projection" in the menu). A crosshair appears on each corner of the model's area.
+2. Press K (or "Calibrate projection" in the menu). A crosshair appears on each corner of the model's area.
 3. Drag each crosshair onto the matching corner of the physical model. Tab selects the next crosshair and the arrow keys nudge it by 1 px (Shift for 10 px). Align to street-level corners rather than building tops, as the buildings stand above the table.
-4. Press C again to finish. The map is warped so the model's corners land on the crosshairs, and nothing is projected outside them.
+4. Press K again to finish. The map is warped so the model's corners land on the crosshairs, and nothing is projected outside them.
 
 The calibration is saved in that browser. The calibration box also shows a link containing it; bookmark that link on the projector computer so the calibration can be restored anywhere. R resets it to the smart-city default.
 

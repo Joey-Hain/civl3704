@@ -2900,6 +2900,37 @@ HEATMAP_SCRIPT = """\
     renderVehicles({{ vehicles_json|safe }});
     setInterval(pollVehicles, 15000);
     setInterval(loadHistoricalHeatmap, 300000);
+    document.addEventListener('keydown', e => {
+      if (e.repeat || e.altKey || e.ctrlKey || e.metaKey) return;
+      if (e.target instanceof HTMLElement
+          && e.target.closest('input, select, textarea, button, [contenteditable="true"]')) return;
+
+      if (e.code === 'KeyA') {
+        const hasLive = map.hasLayer(heatLayer);
+        const hasHistorical = map.hasLayer(histHeatLayer);
+        if (hasLive && !hasHistorical) {
+          map.removeLayer(heatLayer);
+          map.addLayer(histHeatLayer);
+        } else if (!hasLive && hasHistorical) {
+          map.removeLayer(histHeatLayer);
+        } else {
+          if (hasHistorical) map.removeLayer(histHeatLayer);
+          if (!hasLive) map.addLayer(heatLayer);
+        }
+        e.preventDefault();
+      } else if (e.code === 'KeyB') {
+        const metrics = Object.keys(METRICS);
+        const nextMetricIndex = (metrics.indexOf(currentMetric) + 1) % metrics.length;
+        const metric = metrics[nextMetricIndex];
+        document.getElementById('heatMetricSelect').value = metric;
+        applyMetric(metric);
+        e.preventDefault();
+      } else if (e.code === 'KeyC') {
+        if (map.hasLayer(markersLayer)) map.removeLayer(markersLayer);
+        else map.addLayer(markersLayer);
+        e.preventDefault();
+      }
+    });
 """
 
 
@@ -3509,7 +3540,7 @@ PROJECT_PAGE = """
       Align to street-level corners, not building tops.</div>
       <div style="margin-top:6px">Bookmark this link on the projector laptop to restore this calibration:</div>
       <input id="calLink" readonly>
-      <div><button type="button" id="calDone">Done (C)</button><button type="button" id="calReset">Reset (R)</button></div>`;
+      <div><button type="button" id="calDone">Done (K)</button><button type="button" id="calReset">Reset (R)</button></div>`;
     document.body.appendChild(calHelp);
     const calLink = calHelp.querySelector('#calLink');
     calLink.addEventListener('focus', () => calLink.select());
@@ -3531,14 +3562,14 @@ PROJECT_PAGE = """
     const calBtn = document.createElement('button');
     calBtn.type = 'button';
     calBtn.className = 'hp-hide';
-    calBtn.textContent = 'Calibrate projection (C)';
+    calBtn.textContent = 'Calibrate projection (K)';
     calBtn.addEventListener('click', () => setCalibrating(!document.body.classList.contains('calibrating')));
     document.querySelector('.heat-panel').appendChild(calBtn);
 
     document.addEventListener('keydown', e => {
       if (e.target.closest('input, select, textarea')) return;
       const calibrating = document.body.classList.contains('calibrating');
-      if (e.key === 'c' || e.key === 'C') { setCalibrating(!calibrating); e.preventDefault(); return; }
+      if (e.code === 'KeyK') { setCalibrating(!calibrating); e.preventDefault(); return; }
       if (!calibrating) return;
       if (e.key === 'Enter' || e.key === 'Escape') { setCalibrating(false); return; }
       if (e.key === 'r' || e.key === 'R') { dst = null; saveCalibration(); applyCalibration(); return; }
@@ -3626,7 +3657,7 @@ def project():
         PROJECT_PAGE,
         vehicles=vehicles, vehicles_json=json.dumps(vehicles),
         color_fill=COLOR_FILL,
-        ne_lat=ne_lat, ne_lng=ne_lng, sw_lat=sw_lat, sw_lng=sw_lng,
+        ne_lat=ne_lat, ne_lng=ne_lng,         sw_lat=sw_lat, sw_lng=sw_lng,
         model_aspect=model_w / model_h,
         v_offset=SMART_CITY_PROJ_VERTICAL_OFFSET_PX,
         h_scale=SMART_CITY_PROJ_HORIZONTAL_SCALE,
