@@ -63,7 +63,7 @@ Connect each momentary button between its GPIO pin and GND; the firmware uses in
 - **Route clipping:** "Route clip" trims both heat layers to within ±15–100 m of the bus road network (TfNSW GTFS route shapes, rebuilt weekly in gtfs-r-scrape), so delay reads along corridors instead of as round blobs. Set it to Off for the unclipped view.
 - **Historical heatmap:** Historical data can be viewed over the last hour, 24 hours or 7 days (the default), or a custom date range of up to 7 days within the last ~60 days, and filtered to a time of day (AM peak 06:00–10:00, midday 10:00–15:00, PM peak 15:00–19:00, evening 19:00–06:00). The map aggregates vehicle readings into geographic cells, so each coloured area represents activity within a small location rather than a single bus.
 - **Projector mode:** `/project` locks the map to the TransportLab model's extent and blacks out everything outside it. "Hide menu" (or the M key, or `?menu=0`) removes the menu so only the map is projected.
-- **Operator and route tables:** These show the number of distinct bus readings, average delay, variation in delay, percentage running on time, and the observed delay range. Routes can be sorted by delay, spread, or on-time percentage.
+- **Operator and route tables:** These show the number of distinct bus readings, average delay, standard deviation of delay, percentage running on time, and the observed delay range. Routes can be sorted by delay, spread, or on-time percentage.
 - **Individual trips table:** This lists the trips with the largest current delays and identifies their route, operator, most recent stop, and delay status.
 
 ## Projector calibration
