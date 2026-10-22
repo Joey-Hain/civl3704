@@ -2984,6 +2984,10 @@ PAGE = """
   .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
   #heatLoadingBanner { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:900; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
+  body.menu-hidden #dashmap .leaflet-control-layers { display:none !important; }
+  .heat-panel .hp-hide { display:block; width:100%; margin-top:10px; font:inherit; cursor:pointer; }
+  .menu-hint { position:absolute; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; opacity:0; transition:opacity 0.4s; pointer-events:none; }
+  .menu-hint.show { opacity:1; }
 </style>
 </head>
 <body>
@@ -3135,6 +3139,44 @@ PAGE = """
 """    const map = L.map('dashmap').setView([-33.8688, 151.2093], 11);
     map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');"""
 ) + """
+
+    // Hide the map menu for a clean view of the map, same as projector mode:
+    // "Hide menu" button in the menu, M to toggle, ?menu=0 / ?menu=1 in the
+    // URL to force it on load; otherwise the last choice is remembered in this
+    // browser (separately from the projector page's setting).
+    (function () {
+      const STORE_KEY = 'dashboard.menuHidden';
+      const params = new URLSearchParams(window.location.search);
+      let hidden;
+      if (params.has('menu')) hidden = params.get('menu') === '0';
+      else { try { hidden = localStorage.getItem(STORE_KEY) === '1'; } catch (e) { hidden = false; } }
+      const hint = document.createElement('div');
+      hint.className = 'menu-hint';
+      hint.textContent = 'Menu hidden \u2014 press M to show it';
+      document.getElementById('dashmap').appendChild(hint);
+      let hintTimer = null;
+      function apply(announce) {
+        document.body.classList.toggle('menu-hidden', hidden);
+        try { localStorage.setItem(STORE_KEY, hidden ? '1' : '0'); } catch (e) { /* storage unavailable */ }
+        clearTimeout(hintTimer);
+        hint.classList.toggle('show', hidden && announce);
+        if (hidden && announce) hintTimer = setTimeout(() => hint.classList.remove('show'), 2500);
+      }
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'hp-hide';
+      btn.textContent = 'Hide menu (M)';
+      btn.addEventListener('click', () => { hidden = true; apply(true); });
+      document.querySelector('.heat-panel').appendChild(btn);
+      document.addEventListener('keydown', e => {
+        if (e.key !== 'm' && e.key !== 'M') return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.target.closest('input, select, textarea')) return;
+        hidden = !hidden;
+        apply(true);
+      });
+      apply(false);
+    })();
   </script>
 </body>
 </html>
