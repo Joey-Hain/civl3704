@@ -2805,6 +2805,17 @@ HEATMAP_SCRIPT = """\
         tripInFlight = false;
       }
     }
+    // While a bus is selected, only it stays on the map so its route and
+    // stops read clearly; the rest come back when it's deselected (popup
+    // closed, or the bus leaves the feed). Hidden buses are just taken off
+    // the layer, so they keep updating and reappear at their current spot.
+    function applyBusFocus() {
+      for (const [k, m] of markers) {
+        const show = selectedKey == null || k === selectedKey;
+        if (show && !markersLayer.hasLayer(m)) markersLayer.addLayer(m);
+        else if (!show && markersLayer.hasLayer(m)) markersLayer.removeLayer(m);
+      }
+    }
     function selectTrip(key, v) {
       if (!v.trip_id) return;
       if (selectedKey !== key || selectedTripId !== v.trip_id) {
@@ -2812,6 +2823,7 @@ HEATMAP_SCRIPT = """\
         tripInFlight = false;  // a request for the previous bus is now irrelevant
       }
       selectedKey = key; selectedTripId = v.trip_id;
+      applyBusFocus();
       loadTrip();
     }
     function clearTrip(key) {
@@ -2819,6 +2831,7 @@ HEATMAP_SCRIPT = """\
       selectedKey = selectedTripId = tripDetail = tripGeom = null;
       tripReq++;
       tripLayer.clearLayers();
+      applyBusFocus();
     }
     function renderVehicles(vehicles) {
       lastVehicles = vehicles;
@@ -2864,6 +2877,7 @@ HEATMAP_SCRIPT = """\
         if (!v || !v.trip_id) clearTrip();
         else { selectTrip(selectedKey, v); placeSelectedPopup(); }
       }
+      applyBusFocus();  // buses that appeared this poll stay hidden too
     }
     // Skip a poll while the previous one is still waiting, and give up on
     // a request after 20 s. Without this, a slow server got a new request
