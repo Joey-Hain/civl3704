@@ -43,6 +43,23 @@ Open [http://localhost:5000](http://localhost:5000) in a browser. The first page
 
 The dashboard automatically refreshes vehicle positions every 15 seconds and the historical heatmap every 5 minutes.
 
+### Raspberry Pi Pico buttons
+
+Three physical buttons can control the map when Flask is running on a computer connected to a standard Raspberry Pi Pico over USB. The Pico sends debounced button presses over its USB serial connection; this does not control a remotely hosted Render instance.
+
+1. Connect momentary buttons from Pico GPIO 14, 15 and 16 to GND. The firmware enables the internal pull-ups.
+2. Copy [`pico_buttons.py`](pico_buttons.py) to the Pico as `main.py` so it runs on power-up.
+3. Find the Pico's serial port (for example, `COM3` on Windows or `/dev/ttyACM0` on Linux) and set `PICO_SERIAL_PORT` in the app's `.env`.
+4. Install the app requirements and run `python app.py`. The dashboard and `/project` page will follow the connected buttons.
+
+| Button | Action |
+|---|---|
+| GPIO 14 (button 1) | Switch between live and historical heatmaps |
+| GPIO 15 (button 2) | Switch between average delay and delay burden |
+| GPIO 16 (button 3) | Show or hide bus markers |
+
+The serial port setting is optional. Without `PICO_SERIAL_PORT`, the dashboard behaves as before and does not start a Pico reader.
+
 ## Visualisations
 
 - **Live map:** Each marker represents a currently reporting bus. The label shows its route, and the arrow shows its direction of travel. Marker outlines indicate the bus status: white for on time (0:59 early to 5:59 late, matching the TfNSW on-time KPI), red for late, green for early, and grey when delay data is unavailable or anomalous.

@@ -31,6 +31,7 @@ The app is organised into three main layers:
 ## 3. Visualisation layer
 
 - Flask serves the dashboard, `/api/vehicles`, `/api/heatmap` (`window=1|24|168` or `window=custom&start=&end=`), `/api/validation` (on-time running by operator from the scraped history, JSON or `&format=csv`, for comparison with TfNSW's published results), `/api/route_shapes`, `/api/trip/<trip_id>`, `/status`, `/health` and `/ping` endpoints.
+- When `PICO_SERIAL_PORT` is configured for a locally connected Pico, `/api/pico-controls` provides the shared live/historical, metric and marker state to both map pages.
 - Jinja renders summary tables for operators, routes and individual trips.
 - Leaflet displays live vehicle markers on an interactive map.
 - Marker outlines show whether a vehicle is on time, late, early or has no delay data.
@@ -44,3 +45,4 @@ The app is organised into three main layers:
 - Projector geometry: by default the model box is laid out as smart-city's `params.json5` does (full-width box at the model's 2:1 aspect, `vertical_offset` 50 px, `horizontal_scale` 1.184, shrunk uniformly if needed so all four corners stay on screen), computed from unrounded Web Mercator positions and applied through the same warp below.
 - Projector calibration: a corner-pin warp (homography applied as a CSS `matrix3d` to the map) maps the model's four corners onto four draggable crosshairs, with an SVG mask blacking out everything outside them; saved per browser and shareable as a `?cal=` link.
 - HTML, CSS and JavaScript provide the dashboard layout, filters, layer controls, legends, popups and loading/error states.
+- An optional USB-serial reader accepts debounced button commands from `pico_buttons.py`; button presses select live versus historical heatmaps, average delay versus delay burden, and bus-marker visibility.
