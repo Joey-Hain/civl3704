@@ -1,137 +1,14 @@
-"""
-Web dashboard for TfNSW GTFS-realtime delay/variance data.
-
-=== SCHEDULE LOADING ===
-
-Operators and trip headsigns come from the TfNSW schedule bundle, downloaded
-and parsed ON THE FIRST REQUEST that needs them, synchronously, under a lock.
-The first request after a cold start takes ~30 seconds; every subsequent
-request has full data immediately.
-
-Why not a background thread: with gunicorn's worker model, a thread started
-at module import time doesn't reliably share state with the process that
-handles requests. Loading synchronously in the request handler eliminates
-that whole class of problem.
-
-RETRY-ON-FAILURE FIX: the cache is only considered "successfully loaded"
-when agency_names is a non-empty dict (checked via truthiness, not `is not
-None`). A prior version stored {} on failure and checked `is not None`,
-which is true for {} too — so one transient failure permanently blanked
-operator names and headsigns for the rest of the process's life. Failures
-now retry after SCHEDULE_RETRY_BACKOFF_SEC instead of being cached forever.
-
-Render's health check hits /ping, which never touches the schedule, so it
-always returns "pong" in microseconds and never times out.
-
-=== CONCURRENCY / MEMORY ===
-
-get_all_rows_cached(), get_vehicles_cached(), and get_heatmap_points_cached()
-are each guarded by a lock with double-checked locking. Without this, under
-a threaded gunicorn worker (--threads N > 1), several requests can hit a
-stale cache at the exact same instant — each one would then independently
-re-fetch and re-parse the full feed (tens of thousands of trip-update rows,
-~15MB+ per copy), multiplying peak memory by however many threads raced in
-at once. This was the direct cause of an out-of-memory crash after
-threading was enabled without these locks. The lock ensures only the first
-thread to arrive does the actual fetch; everyone else waits briefly and
-reuses its result.
-
-Recommended Render start command (see render.yaml):
-    gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 6 --worker-class gthread --timeout 120
-
---threads 32 (or even 8) is excessive for a 512MB instance even WITH the
-locks restored — 6 is plenty of concurrency for page loads + the 15s
-vehicle poll + occasional heatmap requests without inviting further memory
-pressure from thread stacks and per-thread working memory.
-
-=== HISTORICAL HEATMAP ===
-
-/api/heatmap fetches daily CSVs from the gtfs-r-scrape repo synchronously
-with a 20-second deadline, aggregating into rounded lat/lon grid cells
-(GRID_DECIMALS) rather than keeping every raw point — this bounds output
-size and memory regardless of how many readings a window covers. The
-frontend auto-loads it on page view and every 5 minutes after.
-
-/api/heatmap takes a &metric= of "delay_mean" (or legacy "delay"),
-"delay_total", "frequency", "density", or "speed", and a
-&period= of "all" (default), "am_peak", "midday", "pm_peak", or "evening"
-(see TIME_PERIODS). Fetching and aggregating a window's CSVs into grid
-cells is the expensive part (network + parse), and is identical regardless
-of which metric OR period the caller wants — each CSV row's timestamp
-determines its period once, during that same aggregation pass, so cells
-end up bucketed by period (and duplicated into an "all" bucket) at no extra
-fetch cost. That work is cached per window_hours only
-(get_historical_cells_cached), independent of both metric and period.
-Turning cached cells into a metric's weighted points (compute_metric_points)
-is cheap pure arithmetic done fresh on every request, so switching the
-metric or period dropdown client-side never triggers a re-fetch — it just
-picks a different already-cached bucket of cells.
-
-Per-metric weighting:
-    - delay_mean: mean lateness (seconds late, floored at 0 so early running never
-    cancels out a late reading elsewhere), not raw ping count — a busy
-    interchange with mostly on-time buses should not outrank a quiet
-    corridor where buses are consistently 15 minutes late. See
-    HEATMAP_SEVERITY_CAP_SEC for the value that saturates the gradient.
-  - frequency: share of a cell's readings that were NOT on time under the
-    TfNSW KPI window (ON_TIME_EARLY_SEC..ON_TIME_LATE_SEC) — i.e. 1 minus
-    the on-time KPI for that cell. Unlike the delay metrics this uses the
-    raw signed delay, so running more than 59s early counts against a cell.
-  - speed: mean speed (km/h, from the collector's speed_kmh column),
-    normalised against HEATMAP_SPEED_CAP_KMH. Hotter = faster, not
-    slower — this is a "where do buses actually get to move" view, the
-    mirror image of the delay heatmap rather than a congestion map.
-  - density: raw ping count per cell, normalised against the busiest cell
-    in the window (no confidence scaling — the count itself IS the
-    sample size, unlike delay/speed which are means over however many
-    readings landed in a cell). This is deliberately the simplest of the
-    three: it exists mainly to prove the heatmap rendering pipeline is
-    correct independent of any weighting logic.
-
-Every metric except density also carries a confidence factor —
-min(n_readings / HEATMAP_CONFIDENT_SAMPLES, 1) — returned alongside the
-value rather than multiplied into it. The client renders these metrics as
-an averaged field (FieldLayer): each pixel's colour is the confidence- and
-distance-weighted MEAN of nearby cells, and its opacity is how much data
-backs it. So a cell backed by one noisy reading fades out instead of
-painting a full-strength hotspot, and — unlike the additive heatmap these
-metrics used to share with density — a street with many closely packed
-readings no longer renders darker just for being busy (Elizabeth St at
-~9 km/h used to out-colour the Harbour Bridge at ~42 km/h on speed). A hard minimum-sample cutoff was tried first (for delay) and
-rejected: the scrape cadence in practice is roughly every 2-3 hours (see
-gtfs-r-scrape), so "Last hour" would almost always have exactly one
-reading per cell and a cutoff of 2+ would leave that window essentially
-blank.
-
-=== RENDER SETTINGS ===
-
-  Start Command (single line, no backslashes):
-      gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 6 --worker-class gthread --timeout 120
-
-  Health Check Path: /ping
-
-  IMPORTANT: if you deploy via render.yaml (Blueprint), that file is the
-  source of truth and can silently overwrite anything set manually in the
-  dashboard on the next sync. Keep the Start Command in render.yaml, not
-  just in the dashboard field, or your changes there may not stick.
-
-Setup:
-    pip install flask requests python-dotenv gtfs-realtime-bindings tzdata
-
-.env file:
-    TFNSW_API_KEY=your_api_key_here
-    TFNSW_GTFS_RT_URL=https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses
-"""
+"""Flask dashboard for live and historical TfNSW bus delay data."""
 
 import codecs
 import csv
 import gzip
 import io
 import json
-import struct
 import os
 import shutil
 import statistics
+import struct
 import tempfile
 import threading
 import time
@@ -150,85 +27,34 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template_string, request
 from google.transit import gtfs_realtime_pb2
 
+# Configuration
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 UTC_TZ = ZoneInfo("UTC")
 ANOMALY_ABS_SEC = 3600
-# "On time" window, matching the TfNSW bus on-time running KPI: from 59s
-# early through 5:59 late, inclusive. A bus a full minute early (-60s) or
-# a full 6:00 late (360s) falls outside it, hence -59/359 rather than
-# -60/360. Delay is GTFS-R convention: negative = early, positive = late.
 ON_TIME_EARLY_SEC = -59
 ON_TIME_LATE_SEC = 359
 
 GRID_DECIMALS = 4
-# Daily CSVs are DOWNLOADED this many at a time but PARSED one at a time
-# into a single set of cells (see fetch_historical_cells) — parallel
-# downloads hide GitHub's per-request latency for the 7-day window
-# (~31 files; ~13 MB/day since the collector went 24/7, cached on disk)
-# without each worker holding its own copy of the aggregated cells, which is what kept the old parse-in-workers design at 1.
 HEATMAP_DOWNLOAD_CONCURRENCY = 6
 HEATMAP_DEADLINE_SEC = 20
-# Historical windows offered (hours). A 30-day window (720) was added when
-# the scrape only ran 3-6 times a day and 7 days averaged ~1.3 readings per
-# 10 m cell. Since 12 Oct the collector snapshots every 5 minutes around the
-# clock (~130k rows a day), so 7 days now holds more readings than 30 days
-# used to, while 30 days (~4M rows) is too much to parse on Render's free
-# CPU. The longest window, and custom ranges, are therefore capped at 7 days.
 HEATMAP_WINDOWS = (1, 24, 168)
 HEATMAP_DEFAULT_WINDOW = 168
-# Mean lateness (seconds) at which the heat gradient saturates. Chosen
-# well above ON_TIME_LATE_SEC (359s) so the ramp has room to distinguish
-# "mildly late" from "genuinely stuck" before it maxes out.
 HEATMAP_SEVERITY_CAP_SEC = 600
-# A cell needs this many delay- or speed-bearing readings to be shown at
-# full confidence; fewer readings fade its weight toward 0 (see
-# compute_metric_points) rather than being dropped outright.
 HEATMAP_CONFIDENT_SAMPLES = 3
-# Speed (km/h) at which the speed-heatmap gradient saturates. 80 km/h =
-# the posted limit on the motorway sections buses use (Bradfield Hwy,
-# Warringah Fwy, Eastern Distributor), so the scale separates road classes
-# instead of maxing out on any arterial clearway. Scrape data (7 days,
-# cell means incl. dwell/signal stops): CBD streets ~7-10 km/h, arterials
-# ~18-22, motorway sections ~40-45 (medians ~54, p90 ~66).
 HEATMAP_SPEED_CAP_KMH = 80.0
 VALID_HEATMAP_METRICS = ("delay", "delay_mean", "delay_total",
                          "frequency", "density", "speed")
-# Empirical-Bayes shrinkage for the average-delay and not-on-time maps.
-# The scrape is sparse (7 days ~ 1.3 readings per 10 m cell; 83% of cells
-# hold a single reading), so a lone bus that happened to be 15 min late
-# would paint a full-strength hotspot and a one-reading cell's on-time %
-# is a coin flip (0% or 100%). Every pixel's estimate is therefore treated
-# as if it also held SHRINK_PRIOR_N readings at the network-wide value.
-# Applied per PIXEL by the client (FieldLayer), after pooling nearby cells
-# — not per cell before pooling, which smooths twice and flattened the map
-# to a 1.3-1.9 min band. With pixel-level shrinkage (250 m pooling, ~20
-# readings per pixel at the median) the 7-day map keeps real spread:
-# average delay p5-p95 0.6-2.9 min, not on time 11-50%.
 SHRINK_PRIOR_N = 3
-# Colour-scale caps for those two maps, set from that observed spread
-# (the old 10 min / 100% caps squeezed everything into the pale end).
 DELAY_FIELD_CAP_SEC = 300
 NOT_ON_TIME_CAP = 0.6
 
-# Time-of-day buckets for the historical heatmap (from Liha's changes).
-# Averaged over a full "Last 24 hours" window, a corridor that's terrible
-# for one hour at 17:00 but fine the rest of the day reads as merely
-# lukewarm — the bad hour gets diluted by the many fine ones. Splitting the
-# window into buckets and letting the query isolate just one lets that kind
-# of pattern show up distinctly instead of averaging out. Boundaries are
-# Sydney local time (parse_ts already normalises every timestamp to
-# SYDNEY_TZ) and deliberately coarse — four buckets, not hourly — so each
-# bucket still collects enough readings to clear HEATMAP_CONFIDENT_SAMPLES
-# rather than fragmenting into mostly-empty slices. "evening" wraps past
-# midnight.
+# Historical heatmap periods in Sydney local time.
 TIME_PERIODS = {
-    "am_peak": (6, 10),   # 06:00-10:00
-    "midday": (10, 15),   # 10:00-15:00
-    "pm_peak": (15, 19),  # 15:00-19:00
-    "evening": (19, 6),   # 19:00-06:00, wraps past midnight
+    "am_peak": (6, 10),
+    "midday": (10, 15),
+    "pm_peak": (15, 19),
+    "evening": (19, 6),
 }
-# "all" is the un-bucketed whole-window view — the original behaviour, and
-# still the default.
 VALID_HEATMAP_PERIODS = ("all",) + tuple(TIME_PERIODS.keys())
 _PERIOD_LABELS = {
     "all": "all-day",
@@ -238,50 +64,20 @@ _PERIOD_LABELS = {
     "evening": "evening (19:00-06:00)",
 }
 
-
-def time_of_day_bucket(ts):
-    """Which TIME_PERIODS bucket a Sydney-local timestamp's hour falls
-    into. `evening` wraps past midnight (19:00-23:59 and 00:00-05:59)."""
-    hour = ts.hour
-    for name, (start, end) in TIME_PERIODS.items():
-        if start < end:
-            if start <= hour < end:
-                return name
-        elif hour >= start or hour < end:
-            return name
-    return "evening"  # unreachable given the ranges above; safe fallback
-
-
-def is_on_time(delay_sec):
-    """TfNSW on-time KPI test for a signed delay in seconds."""
-    return ON_TIME_EARLY_SEC <= delay_sec <= ON_TIME_LATE_SEC
-
 PARSE_YIELD_EVERY = 500
 PARSE_YIELD_SEC = 0.001
 
 load_dotenv()
 
-# MEMORY (16 Oct): Render killed the instance for using over 512 MB about
-# three minutes after every restart, although the RSS logged at each
-# milestone stayed near 100 MB. The live trip-update feed is rebuilt every
-# 12 s into tens of thousands of dicts, from up to six gunicorn threads, and
-# glibc gives each thread its own malloc arena that keeps freed memory, so
-# the process grew with every rebuild. Two arenas, plus malloc_trim() after
-# each big rebuild, hand that memory back. Linux/glibc only; a no-op elsewhere.
+# Configure glibc to release freed memory on Linux.
 try:
     import ctypes
     _libc = ctypes.CDLL("libc.so.6")
-    _libc.mallopt(-8, 2)  # M_ARENA_MAX = 2
+    _libc.mallopt(-8, 2)
 except (OSError, AttributeError):
     _libc = None
 
 
-def _trim_memory():
-    if _libc is not None:
-        try:
-            _libc.malloc_trim(0)
-        except Exception:
-            pass
 API_KEY = os.getenv("TFNSW_API_KEY")
 FEED_URL = os.getenv("TFNSW_GTFS_RT_URL", "https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses")
 SCHEDULE_URL = os.getenv("TFNSW_GTFS_SCHEDULE_URL", "https://api.transport.nsw.gov.au/v1/gtfs/schedule/buses")
@@ -289,58 +85,23 @@ VEHICLE_POS_URL = "https://api.transport.nsw.gov.au/v1/gtfs/vehiclepos/buses"
 
 SCRAPE_REPO = "Joey-Hain/gtfs-r-scrape"
 SCRAPE_RAW_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data"
-# data-local/ = same CSV format, written by gtfs-r-scrape's local_collector.py
-# on a home machine (every 15 min) and pushed manually. Kept in a separate
-# folder so it never conflicts with the Action's data/ files; each day is
-# read from both (a missing file is a cheap 404).
 SCRAPE_RAW_BASES = (SCRAPE_RAW_BASE, f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/data-local")
 HEATMAP_WINDOW_CACHE_TTL_SECONDS = 300
-# Long windows barely change minute to minute but are the slowest to build
-# (a month of 15-min local data is ~1.3M rows), so they're kept longer.
 HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS = 1800
 
-# Route-mask geometry: a de-duplicated bus road network within ~12 km of the
-# CBD, built weekly from the TfNSW GTFS shapes.txt by gtfs-r-scrape's
-# build_route_shapes.py (the scrape repo holds the API key as a secret, and
-# building it there keeps a ~100MB+ schedule parse off this 512MB instance).
-# The dashboard fetches it once per page load from /api/route_shapes and
-# uses it to clip the heat layers to corridors — see applyRouteMask() in
-# HEATMAP_SCRIPT.
+# Published data sources in gtfs-r-scrape.
 ROUTE_SHAPES_URL = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/shapes/route_shapes.json"
 ROUTE_SHAPES_CACHE_TTL_SECONDS = 6 * 3600
-# Per-trip lookup behind "click a bus to see its route and upcoming stops"
-# (/api/trip). Built by the same weekly gtfs-r-scrape job as the route mask:
-# trip_id -> shape_id and shape geometry, each split into n_shards small
-# files by zlib.crc32(id) % n_shards, plus stop names/coordinates. Only the
-# shards a click needs are fetched, and a bounded LRU keeps the busiest
-# ones, so the full timetable never has to sit in this 512 MB instance.
-# Upcoming stops and their predicted delays come from the live trip-update
-# feed already cached by get_all_rows_cached().
 TRIP_LOOKUP_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/main/shapes"
 TRIP_LOOKUP_TTL_SECONDS = 6 * 3600
 TRIP_SHARD_CACHE_MAX = 64
 
-# /project page: a Leaflet view locked to the exact real-world box
-# TransportLab's smart-city rig projects onto its physical table model, so
-# it can be checked against the physical model for alignment. Hardcoded
-# from that project's params.json5 (model.corners.ne / model.corners.sw:
-# https://github.com/TransportLab/smart-city/blob/main/params.json5) rather
-# than fetched live; they only change if the physical model is rebuilt or
-# the rig is re-tuned.
-#SMART_CITY_CORNER_NE = (-33.833633, 151.264819)
-#SMART_CITY_CORNER_SW = (-33.896399, 151.142800)
+# Projector bounds and geometry for the TransportLab model.
 SMART_CITY_CORNER_NE = (-33.835, 151.265)
 SMART_CITY_CORNER_SW = (-33.895, 151.145)
-# Projector geometry from the same file. smart-city lays the map out as a
-# full-width box with the model's aspect ratio (model.width / model.height),
-# vertically centred (flexbox, so margin-top: vertical_offset shifts it by
-# half that), then stretches it horizontally with transform: scaleX(
-# horizontal_scale) about its centre — values hand-tuned on the real rig.
-# /project reproduces that layout exactly as its default (uncalibrated)
-# projection, so the model's corners land where the rig expects them.
-SMART_CITY_MODEL_MM = (2400, 1200)            # model.width, model.height
-SMART_CITY_PROJ_VERTICAL_OFFSET_PX = 50       # projector.vertical_offset
-SMART_CITY_PROJ_HORIZONTAL_SCALE = 1.1839999999999904  # projector.horizontal_scale
+SMART_CITY_MODEL_MM = (2400, 1200)
+SMART_CITY_PROJ_VERTICAL_OFFSET_PX = 50
+SMART_CITY_PROJ_HORIZONTAL_SCALE = 1.1839999999999904
 
 COLOR_FILL = "#00B3F0"
 OUTLINE_ON_TIME = "#ffffff"
@@ -353,14 +114,38 @@ SYDNEY_RADIUS_KM = 10
 
 ENABLE_TRIP_HEADSIGNS = os.getenv("ENABLE_TRIP_HEADSIGNS", "1") == "1"
 
-# How long to wait before retrying a FAILED schedule download. Without this,
-# a single transient failure (timeout, temporary OOM, TfNSW hiccup) used to
-# be cached forever as "loaded successfully with zero agencies" — this is
-# the fix for "headsigns and operator codes missing" persisting indefinitely.
 SCHEDULE_RETRY_BACKOFF_SEC = 300
 
 
+# Runtime helpers
+def time_of_day_bucket(ts):
+    """Return the Sydney-local heatmap period for a timestamp."""
+    hour = ts.hour
+    for name, (start, end) in TIME_PERIODS.items():
+        if start < end:
+            if start <= hour < end:
+                return name
+        elif hour >= start or hour < end:
+            return name
+    return "evening"
+
+
+def is_on_time(delay_sec):
+    """Return whether a delay falls within TfNSW's on-time window."""
+    return ON_TIME_EARLY_SEC <= delay_sec <= ON_TIME_LATE_SEC
+
+
+def _trim_memory():
+    """Return freed memory to the operating system when libc supports it."""
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
+
+
 def _rss_mb():
+    """Return process resident memory in megabytes when available."""
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -375,8 +160,7 @@ _last_rss_log = [0.0]
 
 
 def _log_rss_every(tag, period_sec=60):
-    """Log RSS at most once a minute, so a slow climb shows up in Render's
-    logs before an out-of-memory kill rather than only at milestones."""
+    """Log resident memory no more often than the configured interval."""
     now = time.monotonic()
     if now - _last_rss_log[0] >= period_sec:
         _last_rss_log[0] = now
@@ -384,6 +168,7 @@ def _log_rss_every(tag, period_sec=60):
 
 
 def _log_rss(tag):
+    """Write process resident memory to the application log."""
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -396,6 +181,7 @@ def _log_rss(tag):
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
+    """Return the great-circle distance between two coordinates in km."""
     from math import radians, sin, cos, asin, sqrt
     r = 6371.0
     dlat = radians(lat2 - lat1)
@@ -405,6 +191,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def parse_ts(raw):
+    """Parse an ISO timestamp or Unix epoch into the Sydney time zone."""
     if raw is None:
         return None
     s = str(raw).strip()
@@ -426,25 +213,24 @@ def parse_ts(raw):
     return None
 
 
-# Every row of one scrape snapshot shares a timestamp (~400-900 rows each),
-# so parsing each distinct string once saves real time on large files.
+# Reuse parsed timestamps shared by snapshot rows.
 _parse_ts_cached = lru_cache(maxsize=8192)(parse_ts)
 
 app = Flask(__name__)
 
-# Values the shared map script (HEATMAP_SCRIPT, used by both "/" and
-# "/project") needs on every page, so each page's render call doesn't
-# have to remember to pass them.
+# Shared template globals.
 app.jinja_env.globals.update(
     on_time_early_sec=ON_TIME_EARLY_SEC, on_time_late_sec=ON_TIME_LATE_SEC,
     status_late=OUTLINE_LATE, status_early=OUTLINE_EARLY, status_on_time=COLOR_FILL,
 )
 
+# Timetable and live-feed data
 _schedule_lock = threading.Lock()
 _schedule_cache = {"agency_names": None, "trip_headsigns": None, "error": None, "last_attempt": None}
 
 
 def _download_to_path(url, headers, dest_path, timeout=90):
+    """Stream a successful HTTP response to a local file."""
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
@@ -462,6 +248,7 @@ def _download_to_path(url, headers, dest_path, timeout=90):
 
 
 def _parse_csv_member(zf, member, key_col, val_col):
+    """Read two selected columns from a GTFS CSV archive member."""
     result = {}
     if member not in zf.namelist():
         return result
@@ -484,6 +271,7 @@ def _parse_csv_member(zf, member, key_col, val_col):
 
 
 def _do_schedule_download():
+    """Download the timetable archive and extract operator and trip lookups."""
     tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
     try:
         outer_path = os.path.join(tmpdir, "schedule.zip")
@@ -529,21 +317,8 @@ def _do_schedule_download():
 
 
 def get_schedule_lookups():
-    """Return ({agency_id: agency_name}, {trip_id: trip_headsign}, error).
-
-    Downloads and parses the TfNSW schedule bundle on the first call,
-    blocking until done. Subsequent successful calls return the cached
-    dicts immediately. A lock ensures only one download happens even if
-    multiple requests arrive concurrently.
-
-    SUCCESS is determined by truthiness (a non-empty agencies dict), not
-    `is not None` — {} is "not None" but is NOT success, and treating it
-    as success is what previously caused one failed attempt to permanently
-    blank operator names/headsigns. On failure, we retry after
-    SCHEDULE_RETRY_BACKOFF_SEC rather than either hammering the endpoint
-    on every single request or never retrying again.
-    """
-    if _schedule_cache["agency_names"]:  # truthy = non-empty dict = genuine success
+    """Return cached timetable lookups, retrying failed loads after a backoff."""
+    if _schedule_cache["agency_names"]:
         return (_schedule_cache["agency_names"],
                 _schedule_cache["trip_headsigns"],
                 _schedule_cache["error"])
@@ -557,8 +332,6 @@ def get_schedule_lookups():
         now = time.monotonic()
         last_attempt = _schedule_cache["last_attempt"]
         if last_attempt is not None and (now - last_attempt) < SCHEDULE_RETRY_BACKOFF_SEC:
-            # Still within the backoff window after a previous failure —
-            # return the empty state without hammering the endpoint again.
             return {}, {}, _schedule_cache["error"]
 
         print("[schedule] loading — downloading + parsing, this takes ~30s", flush=True)
@@ -582,7 +355,9 @@ def get_schedule_lookups():
         return agencies, trip_headsigns, err
 
 
+# Live-feed parsing
 def fetch_feed():
+    """Fetch and decode the live trip-update feed."""
     r = requests.get(FEED_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=15)
     r.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
@@ -591,6 +366,7 @@ def fetch_feed():
 
 
 def fetch_vehicle_feed():
+    """Fetch and decode the live vehicle-position feed."""
     r = requests.get(VEHICLE_POS_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=15)
     r.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
@@ -599,6 +375,7 @@ def fetch_vehicle_feed():
 
 
 def extract_rows(feed, agency_names):
+    """Convert trip updates into stop-level delay records."""
     pulled_at = datetime.now(tz=SYDNEY_TZ).isoformat()
     rows = []
     for entity in feed.entity:
@@ -628,6 +405,7 @@ def extract_rows(feed, agency_names):
 
 
 def latest_reading_per_trip(rows):
+    """Select the earliest remaining stop update for each trip."""
     latest = {}
     for r in rows:
         existing = latest.get(r["trip_id"])
@@ -637,6 +415,7 @@ def latest_reading_per_trip(rows):
 
 
 def extract_vehicles(feed, agency_names, trip_headsigns=None):
+    """Convert vehicle-position entities into dashboard vehicle records."""
     trip_headsigns = trip_headsigns or {}
     vehicles = []
     for entity in feed.entity:
@@ -664,6 +443,7 @@ def extract_vehicles(feed, agency_names, trip_headsigns=None):
 
 
 def merge_vehicle_delays(vehicles, delay_by_trip):
+    """Attach trip delay data and status colours to vehicle records."""
     for veh in vehicles:
         veh["fill_color"] = COLOR_FILL
         d = delay_by_trip.get(veh["trip_id"])
@@ -690,6 +470,7 @@ def merge_vehicle_delays(vehicles, delay_by_trip):
 
 
 def summarise(rows, key):
+    """Calculate delay and on-time statistics grouped by a row field."""
     grouped = defaultdict(list)
     for r in rows:
         grouped[r[key]].append(r["delay"])
@@ -709,6 +490,7 @@ def summarise(rows, key):
 
 
 def split_route(route_id, agency_names):
+    """Split a route identifier into its route number and operator."""
     if "_" not in route_id:
         return route_id, ""
     agency_id, route_num = route_id.split("_", 1)
@@ -716,38 +498,26 @@ def split_route(route_id, agency_names):
     return route_num, operator
 
 
+# Live-data cache
 CACHE_TTL_SECONDS = 12
 _rows_cache = {"all_rows": None, "agency_names": None, "trip_headsigns": None,
                "agency_error": None, "fetched_at": None}
 _vehicles_cache = {"vehicles": None, "fetched_at": None}
-# Keyed by window_hours only (NOT by metric) — see the module docstring's
-# "HISTORICAL HEATMAP" section for why the fetch/aggregate step is cached
-# independently of which metric the caller asked for.
 _heatmap_cells_cache = {}
 
-# Locks guarding each cache's fetch path. With threaded gunicorn workers,
-# several requests can hit a stale cache at the same instant — without a
-# lock, EACH ONE independently triggers its own full fetch+parse (trip-
-# update rows, vehicle positions, or heatmap CSVs) at the same time,
-# multiplying peak memory by however many threads raced in. This was the
-# direct cause of the out-of-memory crash. Double-checked locking: only
-# the first thread to acquire the lock actually fetches; everyone else
-# re-checks the (now-fresh) cache after acquiring and reuses it.
+# Locks prevent duplicate concurrent cache rebuilds.
 _rows_lock = threading.Lock()
 _vehicles_lock = threading.Lock()
 _heatmap_lock = threading.Lock()
-# Cached as gzipped bytes: it's served verbatim, and pre-compressing once
-# shrinks a few hundred kB of integer JSON to well under a third.
 _route_shapes_cache = {"gz": None, "fetched_at": None}
 _route_shapes_lock = threading.Lock()
-# /api/trip lookups: manifest + stops (refreshed together) and an LRU of
-# fetched shards keyed (kind, shard), kind = "trips" or "geom".
 _trip_meta_cache = {"n_shards": None, "generated": None, "stops": None, "fetched_at": None}
 _trip_shards = OrderedDict()
 _trip_lookup_lock = threading.Lock()
 
 
 def get_all_rows_cached():
+    """Return cached trip-update rows, fetching fresh feeds when stale."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _rows_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -765,10 +535,6 @@ def get_all_rows_cached():
         feed = fetch_feed()
         all_rows = extract_rows(feed, agency_names)
         del feed
-        # (The CSV append of every row to CIVL3704/delay_log.csv that used
-        # to happen here was removed: nothing read it, Render's disk is
-        # wiped on every restart, and it wrote MBs every 12 s.)
-
         _rows_cache.update(all_rows=all_rows, agency_names=agency_names, trip_headsigns=trip_headsigns,
                             agency_error=agency_error, fetched_at=now)
         _trim_memory()
@@ -777,6 +543,7 @@ def get_all_rows_cached():
 
 
 def get_vehicles_cached(agency_names, trip_headsigns):
+    """Return cached vehicle records joined to the current delay feed."""
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _vehicles_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -794,47 +561,28 @@ def get_vehicles_cached(agency_names, trip_headsigns):
         return [dict(v) for v in vehicles]
 
 
-# --- Historical cell storage -------------------------------------------------
-# Column layout of one grid cell's accumulator (see CellGrid):
-#   LAT_SUM/LON_SUM/N_TOTAL  - plotted position (mean vehicle location) and ping
-#                              count; N_TOTAL alone is what density weights by.
-#   LATE_SUM/N_DELAY         - mean lateness: seconds late floored at 0 (early or
-#                              on-time readings add 0, never a negative that would
-#                              mask a late reading elsewhere in the cell).
-#   SPEED_SUM/N_SPEED        - mean speed; a 0 km/h reading is kept (a real stop),
-#                              a missing one is not.
-#   N_OFF                    - readings outside the TfNSW on-time window, for the
-#                              "not on time" (frequency) metric.
-#
-# MEMORY: until 16 Oct each cell kept every raw delay reading (an array) so the
-# frequency metric could count off-time readings later, and cells lived in a
-# dict of Python lists. That was sized for ~200 kB/day of scrape data. Since the
-# collector went 24/7 (12 Oct) a day is ~13 MB / ~130k rows, and building the
-# 24 h + 7 day + 30 day windows peaked at ~570 MB, over Render's 512 MB, so the
-# instance was OOM-killed and restarted (the 503s). Off-time readings are now
-# counted as they arrive, and a finished grid is frozen into 8 flat double
-# arrays (64 bytes per cell), so memory scales with the number of cells, which
-# levels off as the network fills in, not with the number of readings.
+# Historical grid-cell layout, indexed by these eight aggregate columns.
+# Daily data is accumulated once per period and frozen after aggregation.
 LAT_SUM, LON_SUM, N_TOTAL, LATE_SUM, N_DELAY, SPEED_SUM, N_SPEED, N_OFF = range(8)
 _CELL_COLS = 8
 
 
 class CellGrid:
-    """Grid-cell accumulators for one period bucket, as 8 parallel array('d')
-    columns. While building, `index` maps a packed integer cell key to its
-    row; freeze() drops that map once the window is complete, because nothing
-    after aggregation needs to look a cell up by position."""
+    """Accumulate historical metrics in compact parallel arrays."""
 
     __slots__ = ("index", "cols")
 
     def __init__(self):
+        """Initialize empty cell indexes and metric columns."""
         self.index = {}
         self.cols = [array("d") for _ in range(_CELL_COLS)]
 
     def __len__(self):
+        """Return the number of cells in the grid."""
         return len(self.cols[0])
 
     def add(self, key, lat, lon, delay_sec, speed_kmh, off_time):
+        """Add one vehicle reading to its cell's metric totals."""
         i = self.index.get(key)
         cols = self.cols
         if i is None:
@@ -855,7 +603,7 @@ class CellGrid:
             cols[N_SPEED][i] += 1
 
     def add_cells(self, keys, cols):
-        """Sum another grid's cells (keys + 8 columns) into this one."""
+        """Merge pre-aggregated cells into this grid."""
         index, mine = self.index, self.cols
         for j, key in enumerate(keys):
             i = index.get(key)
@@ -868,15 +616,17 @@ class CellGrid:
                     c[i] += src[j]
 
     def freeze(self):
+        """Drop the mutable index after aggregation is complete."""
         self.index = None
         return self
 
     def rows(self):
-        """One tuple per cell, indexed by the column constants above."""
+        """Iterate over cells as tuples of metric columns."""
         return zip(*self.cols)
 
 
 def _new_period_cells():
+    """Create one empty grid for each heatmap time period."""
     return {p: CellGrid() for p in VALID_HEATMAP_PERIODS}
 
 
@@ -884,39 +634,29 @@ _GRID_SCALE = 10 ** GRID_DECIMALS
 
 
 def _cell_key(lat, lon):
-    # One int instead of a (lat, lon) float tuple: a fraction of the memory
-    # per dict entry while the grid is being built. |lon| * 10^4 < 10^7.
+    """Pack rounded coordinates into one integer cell key."""
     return round(lat * _GRID_SCALE) * 10_000_000 + round(lon * _GRID_SCALE)
 
 
-# --- Fetching the daily CSVs --------------------------------------------------
-# REQUESTS / 429s: every rebuild used to re-download every day in the window
-# from both data/ and data-local/ (62 requests for 30 days, ~60 MB now), every
-# 5-30 minutes, from Render's shared outbound IPs, and raw.githubusercontent.com
-# started answering 429 Too Many Requests. Days before yesterday never change
-# once the collector has moved on, so each is downloaded once per instance and
-# kept gzipped on local disk; only today and yesterday are re-fetched. A 404
-# (no data-local file for that day, the usual case) is remembered for a few
-# hours instead of being asked again each rebuild. If a re-fetch of today or
-# yesterday fails, the copy already on disk is used. Set GITHUB_TOKEN (a
-# fine-grained token with no permissions is enough) to send authenticated
-# requests, which GitHub rate-limits per token rather than per shared IP.
+# Raw-CSV heatmap fallback and local cache.
 HEATMAP_DISK_CACHE_DIR = Path(os.getenv(
     "HEATMAP_DISK_CACHE_DIR", os.path.join(tempfile.gettempdir(), "civl3704_days")))
-HEATMAP_MUTABLE_DAYS = 1           # today and yesterday are always re-fetched
-MISSING_FILE_RECHECK_SEC = 6 * 3600         # older days
-MISSING_RECENT_FILE_RECHECK_SEC = 30 * 60   # today/yesterday
+HEATMAP_MUTABLE_DAYS = 1
+MISSING_FILE_RECHECK_SEC = 6 * 3600
+MISSING_RECENT_FILE_RECHECK_SEC = 30 * 60
 RETRYABLE_STATUS = (429, 500, 502, 503, 504)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 RAW_HEADERS = {"Authorization": f"Bearer {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-_missing_files = {}  # cache path -> time.monotonic() the 404 was seen
+_missing_files = {}
 
 
 def _day_cache_path(base, date_str):
+    """Return the local cache path for one source and date."""
     return HEATMAP_DISK_CACHE_DIR / f"{base.rsplit('/', 1)[-1]}_{date_str}.csv.gz"
 
 
 def _retry_after_sec(resp, default=2.0, cap=5.0):
+    """Return a bounded retry delay from an HTTP response."""
     try:
         return min(float(resp.headers.get("Retry-After", default)), cap)
     except (TypeError, ValueError):
@@ -924,9 +664,7 @@ def _retry_after_sec(resp, default=2.0, cap=5.0):
 
 
 def _download_day(date_str, base, mutable):
-    """(date_str, local gzip path or None, error or None). A None path with
-    no error means the file doesn't exist. Network + disk only, so it is safe
-    to run in a thread pool."""
+    """Download one daily CSV to the compressed disk cache when needed."""
     path = _day_cache_path(base, date_str)
     if not mutable and path.exists():
         return date_str, path, None
@@ -960,14 +698,14 @@ def _download_day(date_str, base, mutable):
             if attempt == 0:
                 time.sleep(1)
     if path.exists():
-        # Today's/yesterday's refresh failed: an older copy beats a hole.
         return date_str, path, f"{error} (used the copy from an earlier fetch)"
     if path in _missing_files:
-        return date_str, None, None  # was a 404 last time; still assume missing
+        return date_str, None, None
     return date_str, None, error
 
 
 def _prune_disk_cache(keep_days=None):
+    """Remove cached daily CSVs older than the configured retention period."""
     if keep_days is None:
         keep_days = CUSTOM_WINDOW_LOOKBACK_DAYS + 2
     cutoff = (datetime.now(tz=SYDNEY_TZ).date() - timedelta(days=keep_days)).isoformat()
@@ -980,10 +718,7 @@ def _prune_disk_cache(keep_days=None):
 
 
 def _fetch_one_day_into(date_str, path, cutoff, cells_by_period, end=None, agency_stats=None):
-    """Stream one day's (gzipped, on-disk) CSV into cells_by_period: every
-    row lands in its "all" grid and its time-of-day grid
-    (time_of_day_bucket(ts)) in a single pass. Returns
-    (date_str, rows_seen, points_added, error)."""
+    """Stream one compressed daily CSV into period grids and validation totals."""
     rows_seen = 0
     points_added = 0
     grid_all = cells_by_period["all"]
@@ -1006,7 +741,7 @@ def _fetch_one_day_into(date_str, path, cutoff, cells_by_period, end=None, agenc
             max_idx = max(ts_idx, lat_idx, lon_idx)
             for i, row in enumerate(reader):
                 if i % 2000 == 0:
-                    time.sleep(PARSE_YIELD_SEC)  # let request threads in
+                    time.sleep(PARSE_YIELD_SEC)
                 rows_seen += 1
                 if len(row) <= max_idx:
                     continue
@@ -1035,8 +770,7 @@ def _fetch_one_day_into(date_str, path, cutoff, cells_by_period, end=None, agenc
 
                 if agency_stats is not None and delay_sec is not None and route_idx is not None \
                         and len(row) > route_idx and "_" in row[route_idx]:
-                    # Per-operator on-time tallies for /api/validation, keyed by
-                    # the agency id prefix of route_id ("2436_M30" -> "2436").
+                    # The route ID prefix identifies the operator agency.
                     st = agency_stats[row[route_idx].split("_", 1)[0]]
                     st[0] += 1
                     if delay_sec < ON_TIME_EARLY_SEC:
@@ -1054,21 +788,14 @@ def _fetch_one_day_into(date_str, path, cutoff, cells_by_period, end=None, agenc
             return date_str, rows_seen, points_added, None
     except (OSError, EOFError, csv.Error, UnicodeDecodeError) as e:
         try:
-            path.unlink(missing_ok=True)  # corrupt cache file: re-fetch next time
+            path.unlink(missing_ok=True)
         except OSError:
             pass
         return date_str, rows_seen, points_added, f"{date_str}: {e}"
 
 
 def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
-    """Fetch + aggregate a window's CSVs into grid cells. This is the
-    expensive, metric-independent half of building a historical heatmap —
-    see compute_metric_points() for turning these cells into a specific
-    metric's weighted points.
-
-    Either window_hours (the last N hours) or an explicit [start_dt, end_dt)
-    range (custom dates). Also tallies on-time counts per operator agency id
-    in the same pass, for /api/validation."""
+    """Fetch and aggregate raw daily CSVs for a historical window."""
     start = time.monotonic()
     now = datetime.now(tz=SYDNEY_TZ)
     if start_dt is None:
@@ -1082,18 +809,17 @@ def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
     while d <= last_day:
         dates_needed.append(d)
         d += timedelta(days=1)
-    # agency id -> [n_with_delay, n_early, n_on_time, n_late, late_sum_sec]
+    # [readings, early, on-time, late, total late seconds]
     agency_stats = defaultdict(lambda: [0, 0, 0, 0, 0.0])
     _prune_disk_cache()
 
-    # Downloads (or disk-cache hits) run in parallel; parsing happens here,
-    # one file at a time, into a single set of period grids.
+    # Fetch files concurrently, then aggregate serially into shared grids.
     cells_by_period = _new_period_cells()
     files_fetched = 0
     rows_seen_total = 0
     points_added_total = 0
     errors = []
-    files_lost = 0  # failed to download and no copy on disk
+    files_lost = 0
     deadline_hit = False
 
     workers = max(1, min(HEATMAP_DOWNLOAD_CONCURRENCY, 2 * len(dates_needed)))
@@ -1121,9 +847,7 @@ def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
             rows_seen_total += rows_seen
             points_added_total += points_added
     finally:
-        # Don't block the request on downloads still in flight after a
-        # deadline hit; they finish (or time out) in the background and land
-        # in the disk cache for the next rebuild.
+        # Allow in-flight downloads to populate the cache after timeout.
         pool.shutdown(wait=False, cancel_futures=True)
 
     for grid in cells_by_period.values():
@@ -1153,29 +877,15 @@ def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
     }
 
 
-# --- Pre-aggregated cells (the normal path) ------------------------------------
-# PARSING ON RENDER WAS THE BOTTLENECK: even with the memory fixes, a 7-day
-# window is ~640k CSV rows, and Render's Free instance (a fraction of one CPU)
-# couldn't parse them inside HEATMAP_DEADLINE_SEC, so the map came back
-# partial and the instance stayed busy enough to fail health checks. The
-# gtfs-r-scrape Action now does the aggregation after every data push
-# (build_cells.py, ~8 s on GitHub's runners) and force-pushes the result to
-# its `cells` branch: windows/{1,24,168}.bin.gz for the preset windows (ending
-# at the newest snapshot) and days/YYYY-MM-DD.bin.gz per Sydney day for custom
-# ranges. Here a preset window is one download (conditional, so usually a 304)
-# and a few array.frombytes calls; a custom range merges at most 7 day files.
-# fetch_historical_cells() above is only the fallback for when the `cells`
-# branch doesn't exist yet. File format: see build_cells.py.
+# Pre-aggregated heatmap cells; raw daily CSVs are the fallback.
 CELLS_BASE = f"https://raw.githubusercontent.com/{SCRAPE_REPO}/cells"
 CELLS_MAGIC = b"CELLS1\n"
-CELLS_CHECK_SEC = 300   # how often to ask GitHub whether a cells file changed
-_cells_state = {}       # path -> {"etag": str or None, "checked": monotonic time}
+CELLS_CHECK_SEC = 300
+_cells_state = {}
 
 
 def _fetch_cells_file(path, immutable=False):
-    """(local Path or None, error or None) for one file on the cells branch,
-    re-checked with a conditional GET at most every CELLS_CHECK_SEC (never,
-    for finished days). (None, None) means the file doesn't exist."""
+    """Fetch one pre-aggregated cells file with a local conditional cache."""
     local = HEATMAP_DISK_CACHE_DIR / "cells" / path
     st = _cells_state.get(path)
     now = time.monotonic()
@@ -1221,7 +931,7 @@ def _fetch_cells_file(path, immutable=False):
 
 
 def _read_cells_file(local, keep_keys=False):
-    """(header, {period: (CellGrid, keys or None)}) from a build_cells.py file."""
+    """Decode a compressed pre-aggregated cells file."""
     with gzip.open(local, "rb") as f:
         data = f.read()
     if not data.startswith(CELLS_MAGIC):
@@ -1253,6 +963,7 @@ def _read_cells_file(local, keep_keys=False):
 
 
 def _cells_meta(cells, agency_stats, files, rows, errors, lost, version, data_end=None):
+    """Build the common metadata structure for aggregated cell windows."""
     for p in VALID_HEATMAP_PERIODS:
         cells.setdefault(p, CellGrid().freeze())
     return {
@@ -1271,9 +982,7 @@ def _cells_meta(cells, agency_stats, files, rows, errors, lost, version, data_en
 
 
 def cells_from_prebuilt(window, previous=None):
-    """Window meta (same shape as fetch_historical_cells) from the cells
-    branch, or None if it isn't available so the caller falls back to the
-    raw CSVs. Returns `previous` unchanged when the file hasn't changed."""
+    """Load pre-aggregated window cells or return None for raw-data fallback."""
     start = time.monotonic()
     if not window.is_custom:
         local, err = _fetch_cells_file(f"windows/{window.hours}.bin.gz")
@@ -1337,13 +1046,12 @@ def cells_from_prebuilt(window, previous=None):
 
 
 def compute_metric_points(cells, metric):
+    """Convert aggregated cells into compact points for one metric."""
     return [_compact_point(p) for p in _compute_metric_points(cells, metric)]
 
 
 def _compact_point(p):
-    """Round a point for the wire: 5 dp of lat/lon is ~1 m (cells are 10 m),
-    4 dp of a 0..1 value is far below a colour step, and sample counts are
-    whole numbers. Full float reprs made the 7-day response ~6.5 MB."""
+    """Round a heatmap point to reduce response size."""
     out = [round(p[0], 5), round(p[1], 5), round(p[2], 4)]
     if len(p) > 3:
         out.append(int(p[3]) if p[3] >= 1 else round(p[3], 3))
@@ -1351,23 +1059,9 @@ def _compact_point(p):
 
 
 def _compute_metric_points(cells, metric):
-    """Turn aggregated cells into points for one metric.
-    Pure/cheap — no network — so switching the metric dropdown client-side
-    never re-triggers a CSV fetch (see get_heatmap_points_cached).
-
-    density -> [lat, lon, weight] for the additive heatmap (Leaflet.heat).
-    every other metric -> [lat, lon, value, confidence], value in 0..1
-    (the metric normalised against its cap) and confidence =
-    min(n / HEATMAP_CONFIDENT_SAMPLES, 1). They're kept separate (not
-    multiplied) because the client renders these as an averaged field:
-    confidence weights a cell's say in the local mean and sets opacity,
-    but never changes the colour — see FieldLayer in HEATMAP_SCRIPT."""
+    """Calculate normalized heatmap values and confidence from cell totals."""
     if metric == "density":
-        # Raw ping count per cell, normalised against the busiest cell in
-        # the window. No confidence scaling: the count itself already IS
-        # the sample size, unlike the mean-based delay/speed metrics. This
-        # is the simplest of the three metrics by design — mainly useful
-        # for confirming the heatmap rendering pipeline itself is correct.
+        # Normalize counts by the busiest cell; counts already encode support.
         eligible = [c for c in cells.rows() if c[2] > 0]
         if not eligible:
             return []
@@ -1375,10 +1069,7 @@ def _compute_metric_points(cells, metric):
         return [[c[0] / c[2], c[1] / c[2], c[2] / max_count] for c in eligible]
 
     if metric == "speed":
-        # Weight is mean speed (km/h), normalised against
-        # HEATMAP_SPEED_CAP_KMH — hotter = faster, the mirror image of the
-        # delay metric. Scaled by the same confidence factor as delay so a
-        # single fast/slow ping can't paint a full-strength cell.
+        # Normalize mean speed and reduce confidence for sparse cells.
         points = []
         for c in cells.rows():
             if c[6] <= 0:
@@ -1390,21 +1081,7 @@ def _compute_metric_points(cells, metric):
         return points
 
     if metric == "delay_total":
-        # "Delay burden": total lateness accumulated in a cell (bus-seconds
-        # late, floored at 0 per reading), additive like density — i.e.
-        # where the most bus-minutes of delay pile up across the network.
-        # This is roughly what the original summed delay heatmap showed:
-        # busy corridors (CBD) rank high because many buses each add a
-        # little, which is real total impact, NOT a sign that each bus there
-        # runs later.
-        #
-        # Normalised to the SAME total heat as the density map for this
-        # window (sum of count / max_count), redistributed in proportion to
-        # each cell's share of total lateness. Raw totals grow with the
-        # window (30 days stacks ~15x a day's lateness) and saturated the
-        # map everywhere; this keeps it window-independent, and it reads
-        # directly against Bus density — an area hotter here than on density
-        # carries more than its share of the network's delay.
+        # Scale summed nonnegative lateness to the density layer's total weight.
         eligible = [c for c in cells.rows() if c[2] > 0]
         late_cells = [c for c in eligible if c[4] > 0 and c[3] > 0]
         total_late = sum(c[3] for c in late_cells)
@@ -1415,20 +1092,9 @@ def _compute_metric_points(cells, metric):
         scale = density_heat / total_late
         return [[c[0] / c[2], c[1] / c[2], c[3] * scale] for c in late_cells]
 
-    # Delay metrics use lateness in seconds, floored at 0 so early running
-    # cannot cancel out late running in the same cell.
+    # Delay metrics floor early readings at zero so they cannot offset lateness.
     if metric == "frequency":
-        # Share of this cell's delay readings that were NOT on time under
-        # the TfNSW KPI (59s early .. 5:59 late) — NOT mean lateness. A
-        # corridor where buses are often mildly late (frequent, low
-        # severity) stays cool on delay_mean but registers here; one
-        # extreme outlier among many on-time readings does NOT dominate
-        # the way it can on delay_mean. Same confidence scaling as the
-        # other metrics. (From Liha's changes; widened from "late only" to
-        # "outside the KPI window" so it's exactly 1 - on-time %.)
-        # [lat, lon, rate / NOT_ON_TIME_CAP, n_readings] — weight is the raw
-        # reading count (not capped confidence) because the client pools
-        # these and shrinks per pixel toward metric_prior().
+        # Return the off-time share and count for client-side pooling.
         points = []
         for c in cells.rows():
             if c[4] <= 0:
@@ -1437,25 +1103,13 @@ def _compute_metric_points(cells, metric):
             points.append([c[0] / c[2], c[1] / c[2], (off_time / c[4]) / NOT_ON_TIME_CAP, c[4]])
         return points
 
-    # metric == "delay" or "delay_mean" (default/fallback): mean lateness (seconds late,
-    # floored at 0), normalised against HEATMAP_SEVERITY_CAP_SEC — NOT ping
-    # density. A cell with plenty of on-time traffic should stay cool; a
-    # cell with few but consistently very-late readings should still
-    # register as a hotspot. Scaled by the confidence factor so a cell
-    # backed by only one or two readings can't paint a full-strength
-    # hotspot off a single noisy ping. Cells with zero delay-bearing
-    # readings are dropped — there's nothing to weight.
-    # [lat, lon, mean lateness / DELAY_FIELD_CAP_SEC, n_readings] — same
-    # raw-count weighting + client-side per-pixel shrinkage as "frequency".
-    # Not clamped here: the client clamps AFTER averaging, so one extreme
-    # cell can't be silently capped before it's pooled with its neighbours.
+    # Return mean lateness and sample count for client-side pooling.
     return [[c[0] / c[2], c[1] / c[2], (c[3] / c[4]) / DELAY_FIELD_CAP_SEC, c[4]]
             for c in cells.rows() if c[4] > 0]
 
 
 def metric_prior(cells, metric):
-    """[network value (normalised like the metric's points), SHRINK_PRIOR_N]
-    for the metrics the client shrinks per pixel, else None."""
+    """Return the network-wide metric prior and shrinkage sample count."""
     n = sum(cells.cols[N_DELAY])
     if not n:
         return None
@@ -1475,22 +1129,24 @@ _METRIC_LABELS = {
 
 
 class WindowSpec:
-    """A historical window: the last N hours (key = N), or a custom date
-    range [start_date 00:00, end_date + 1 day 00:00) Sydney time
-    (key = "YYYY-MM-DD..YYYY-MM-DD")."""
+    """Describe a preset or custom historical data window."""
 
     def __init__(self, hours=None, start_date=None, end_date=None):
+        """Create a preset or custom window specification."""
         self.hours, self.start_date, self.end_date = hours, start_date, end_date
 
     @property
     def key(self):
+        """Return the stable cache key for this window."""
         return self.hours if self.hours is not None else f"{self.start_date}..{self.end_date}"
 
     @property
     def is_custom(self):
+        """Return whether this window uses explicit dates."""
         return self.hours is None
 
     def bounds(self):
+        """Return the inclusive start and exclusive end timestamps."""
         if not self.is_custom:
             return None, None
         start = datetime.combine(self.start_date, datetime.min.time(), tzinfo=SYDNEY_TZ)
@@ -1498,6 +1154,7 @@ class WindowSpec:
         return start, end
 
     def ttl(self):
+        """Return the cache lifetime appropriate for this window."""
         if self.is_custom:
             # A range that ended before today only changes if local data is
             # pushed for it; one that includes today keeps refreshing.
@@ -1506,6 +1163,7 @@ class WindowSpec:
         return HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if self.hours >= 168 else HEATMAP_WINDOW_CACHE_TTL_SECONDS
 
     def describe(self):
+        """Return a display label for this window."""
         if self.is_custom:
             return f"{self.start_date:%d %b %Y} to {self.end_date:%d %b %Y}"
         return {1: "last hour", 24: "last 24 hours", 168: "last 7 days"}.get(
@@ -1520,8 +1178,7 @@ CUSTOM_CACHE_MAX_ENTRIES = 4  # bound memory: each cached window holds its cells
 
 
 def parse_window_args(args):
-    """WindowSpec from ?window=1|24|168 or ?window=custom&start=&end=
-    (YYYY-MM-DD, inclusive). Returns (spec, error_message_or_None)."""
+    """Parse heatmap window query parameters and report invalid input."""
     w = args.get("window", str(HEATMAP_DEFAULT_WINDOW))
     if w != "custom":
         try:
@@ -1546,18 +1203,17 @@ def parse_window_args(args):
     return WindowSpec(start_date=start, end_date=end), None
 
 
-# A build that lost files (429/5xx with no disk copy) or hit the deadline is
-# retried after this long instead of being cached for the window's full
-# 5-30 minute TTL. Previously one burst of 429s blanked the map for up to
-# 30 minutes.
+# Retry degraded historical-data builds after a short cooldown.
 HEATMAP_RETRY_AFTER_FAILURE_SEC = 60
 
 
 def _is_fresh(entry, ttl, now):
+    """Return whether a cached entry is within its time-to-live."""
     return (now - entry["fetched_at"]).total_seconds() < entry.get("ttl_override", ttl)
 
 
 def _store_window(key, window, meta):
+    """Store aggregated window metadata and enforce cache limits."""
     if window.is_custom:
         custom_keys = [k for k in _heatmap_cells_cache if isinstance(k, str) and k != key]
         while len(custom_keys) >= CUSTOM_CACHE_MAX_ENTRIES:
@@ -1568,6 +1224,7 @@ def _store_window(key, window, meta):
 
 
 def get_historical_cells_cached(window):
+    """Return cached aggregated cells, rebuilding stale windows as needed."""
     if not isinstance(window, WindowSpec):
         window = WindowSpec(window)
     key, ttl = window.key, window.ttl()
@@ -1576,11 +1233,7 @@ def get_historical_cells_cached(window):
     if cached is not None and _is_fresh(cached, ttl, now):
         return cached
     if cached is not None:
-        # Stale-while-revalidate: if another thread is already rebuilding,
-        # serve the previous build now instead of queueing behind the lock.
-        # Otherwise every open dashboard and the projector page would park
-        # a gunicorn thread here for the whole rebuild (tens of seconds on
-        # Render's free CPU), leaving none for /ping or /api/vehicles.
+        # Serve stale data rather than waiting behind another rebuild.
         if not _heatmap_lock.acquire(blocking=False):
             return cached
         _heatmap_lock.release()
@@ -1594,10 +1247,10 @@ def get_historical_cells_cached(window):
         meta = None
         try:
             meta = cells_from_prebuilt(window, cached)
-        except Exception as e:  # a corrupt or unexpected file must not take the map down
+        except Exception as e:
             print(f"[cells] window={key}: {e!r}; falling back to raw CSVs", flush=True)
         if meta is not None:
-            if meta is cached:  # file unchanged since the last check
+            if meta is cached:
                 cached["fetched_at"] = now
                 cached["ttl_override"] = CELLS_CHECK_SEC
                 return cached
@@ -1607,7 +1260,7 @@ def get_historical_cells_cached(window):
             if meta["files_lost"]:
                 meta["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
                 if cached is not None and cached["files_fetched"] > meta["files_fetched"]:
-                    cached["fetched_at"] = now  # keep showing the last good build
+                    cached["fetched_at"] = now
                     cached["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
                     return cached
             _store_window(key, window, meta)
@@ -1619,8 +1272,7 @@ def get_historical_cells_cached(window):
         if meta["deadline_hit"] or meta["files_lost"]:
             meta["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
             if cached is not None and cached["files_fetched"] > meta["files_fetched"]:
-                # Keep serving the last good build rather than a worse one;
-                # try again in a minute.
+                # Retain the last good build while the retry is pending.
                 cached["fetched_at"] = now
                 cached["ttl_override"] = HEATMAP_RETRY_AFTER_FAILURE_SEC
                 print(f"[heatmap] window={key}: rebuild degraded "
@@ -1632,13 +1284,13 @@ def get_historical_cells_cached(window):
 
 
 def get_heatmap_points_cached(window, metric, period="all"):
+    """Return heatmap points for a window, metric, and period."""
     if metric not in VALID_HEATMAP_METRICS:
         metric = "delay"
     if period not in VALID_HEATMAP_PERIODS:
         period = "all"
 
-    # The window fetch already bucketed cells by period in its single pass;
-    # picking a period here is just a dict lookup, never a fresh fetch.
+    # Period buckets are included in the cached window build.
     meta = get_historical_cells_cached(window)
     cells = meta["cells"].get(period) or {}
 
@@ -1666,6 +1318,7 @@ def get_heatmap_points_cached(window, metric, period="all"):
 
 
 def compute_delay_data(args):
+    """Fetch, filter, and summarize the live trip-update feed."""
     hide_anomalies = args.get("hide_anomalies", "1") == "1"
     sort_key = args.get("sort", "stdev_min")
     ascending = args.get("asc") == "1"
@@ -1680,11 +1333,8 @@ def compute_delay_data(args):
     if q_route:
         rows = [r for r in rows if q_route in r["route_id"].lower()]
     if q_operator:
-        # Exact (case-insensitive) name match: the dropdown lists unique
-        # operator NAMES, and several operator IDs can share one name
-        # (e.g. multiple Transit Systems contracts), so matching by name
-        # groups them; exact rather than substring so one name can't also
-        # catch another that merely contains it.
+        # Match complete names because multiple agency IDs can share one.
+        # Substring matching would also include similarly named operators.
         rows = [r for r in rows if r["operator"].lower() == q_operator]
     if q_stop:
         matching_trip_ids = {r["trip_id"] for r in rows if q_stop in r["stop_id"].lower()}
@@ -1708,6 +1358,7 @@ def compute_delay_data(args):
 
 
 def compute_vehicles(data):
+    """Join live vehicle locations to trip delays and apply map filters."""
     try:
         vehicles = get_vehicles_cached(data["agency_names"], data["trip_headsigns"])
     except requests.RequestException as e:
@@ -1725,31 +1376,12 @@ def compute_vehicles(data):
 
 
 
-# The entire map/heatmap/bus-marker script is shared verbatim between the
-# dashboard ("/") and the projector view ("/project") — see the /project
-# route below for why this is a plain string constant instead of a Jinja
-# include: they need to behave identically, and duplicating this by hand
-# in two template strings is exactly how earlier rounds drifted (a fix
-# applied to one and not the other). Only the single line that creates the
-# map (plain interactive view vs. bounds-locked projector view) differs
-# between the two pages; everything else — METRICS, HEAT_MAX, the heat
-# layer rebuild-on-metric-switch logic, bus markers, popups, polling — is
-# this exact text in both.
+# Dashboard templates
+# Shared map script for the dashboard and projector templates.
 HEATMAP_SCRIPT = """\
-    // Text scale for map popups: the projector page sets PROJECTOR_UI_SCALE
-    // (its CSS doubles the text) so popups get room to grow; 1 elsewhere.
+    // Scale popup text in projector mode.
     const UI_SCALE = (typeof PROJECTOR_UI_SCALE !== 'undefined') ? PROJECTOR_UI_SCALE : 1;
-    // Plainer basemap than stock OSM tiles. Was CartoDB Positron
-    // (basemaps.cartocdn.com) — CARTO started requiring an API key for
-    // that raster endpoint (see docs.carto.com/faqs/carto-basemaps), which
-    // would mean an extra secret to provision on Render for a uni project.
-    // Esri's "Light Gray Canvas" is the same idea (muted grey, no busy POI
-    // icons, heatmap/markers stay the visual focus) but needs no key and
-    // has no request quota — split into a Base layer (the grey fill) and a
-    // Reference layer on top (just roads/place labels, transparent
-    // elsewhere) per Esri's own pairing for this style. If a CARTO look is
-    // ever preferred instead, grab a free key at carto.com/basemaps/apikey
-    // (5M requests/month free) and add `?key=...` to a cartocdn.com URL.
+    // Use a muted basemap so heat layers and vehicles remain prominent.
     L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
       attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ',
       maxZoom: 16,
@@ -1759,17 +1391,7 @@ HEATMAP_SCRIPT = """\
     }).addTo(map);
     const markers = new Map();
 
-    // One metric dropdown drives both heat layers at once. Each metric gets
-    // its own live/historical ramp pair so the two layers stay
-    // distinguishable when both are on.
-    //
-    // Ramps are ColorBrewer sequential schemes: perceptually ordered with
-    // monotonic lightness, either one hue family or analogous neighbours
-    // (YlGnBu, YlOrRd as "semantic heat") — never a rainbow. Their
-    // near-white first stop is trimmed so the low end still reads against
-    // the light-grey basemap, and they're interpolated in OKLab (buildLut)
-    // rather than sRGB, which is what removes the flat, banded "solid
-    // colour" look of the old hand-picked 7-stop gradients.
+    // Color ramps are interpolated in OKLab for consistent perceptual steps.
     const RAMPS = {
       YlOrRd:  ['#ffeda0','#fed976','#feb24c','#fd8d3c','#fc4e2a','#e31a1c','#bd0026','#800026'],
       PuBu:    ['#d0d1e6','#a6bddb','#74a9cf','#3690c0','#0570b0','#045a8d','#023858'],
@@ -1779,12 +1401,7 @@ HEATMAP_SCRIPT = """\
       BuPu:    ['#bfd3e6','#9ebcda','#8c96c6','#8c6bb1','#88419d','#810f7c','#4d004b'],
       Oranges: ['#fdd0a2','#fdae6b','#fd8d3c','#f16913','#d94801','#a63603','#7f2704'],
       Blues:   ['#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b'],
-      // Matplotlib "plasma", reversed and with its pale-yellow end dropped
-      // (too little contrast on the light basemap). Perceptually uniform,
-      // OKLab lightness strictly decreasing 0.79 -> 0.29, but with far more
-      // hue travel than a ColorBrewer ramp — that's what makes CBD
-      // (amber), arterials (orange), ~40 km/h roads (pink) and motorways
-      // (purple) read as clearly different classes on the speed map.
+      // Reversed plasma ramp separates speed classes by hue.
       PlasmaR: ['#fca636','#f2844b','#e16462','#cc4778','#b12a90','#8f0da4','#6a00a8','#41049d','#0d0887'],
     };
     function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
@@ -1808,7 +1425,7 @@ HEATMAP_SCRIPT = """\
               toSrgb(-1.2684380046*l + 2.6097574011*m - 0.3413193965*q),
               toSrgb(-0.0041960863*l - 0.7034186147*m + 1.7076147010*q)];
     }
-    // 256-entry RGB lookup table for a ramp, interpolated in OKLab.
+    // Build a cached 256-color ramp in OKLab.
     const _lutCache = {};
     function buildLut(name) {
       if (_lutCache[name]) return _lutCache[name];
@@ -1820,9 +1437,7 @@ HEATMAP_SCRIPT = """\
       }
       return (_lutCache[name] = lut);
     }
-    // Gradient-stop object ({pos: 'rgb(...)'}) sampled from the OKLab LUT,
-    // for the legend bar and for Leaflet.heat (density), so both match the
-    // field layer's colours exactly.
+    // Sample the color ramp for legends and Leaflet.heat.
     function rampStops(name, n = 11) {
       const lut = buildLut(name), o = {};
       for (let i = 0; i < n; i++) {
@@ -1832,25 +1447,15 @@ HEATMAP_SCRIPT = """\
       return o;
     }
 
-    // Keep these two in sync with their server-side counterparts
-    // (HEATMAP_SEVERITY_CAP_SEC, HEATMAP_SPEED_CAP_KMH) so the live and
-    // historical legends mean the same thing for the same metric.
+    // Keep map scales aligned with server-side metric normalization.
     const SEVERITY_CAP_MIN = 10;  // delay-burden unit (live weight saturates here)
     const DELAY_CAP_MIN = 5;      // average-delay colour scale (DELAY_FIELD_CAP_SEC)
     const SPEED_CAP_KMH = 80;
     const FIELD_RADIUS_M = 160;  // default averaging radius for FieldLayer
 
-    // kind 'field' = averaged value field (FieldLayer) — colour is the
-    // local confidence-weighted MEAN of the metric, opacity is how much
-    // data backs it, so a busy street can't look worse/faster just by
-    // having more readings. kind 'sum' = classic additive heatmap
-    // (Leaflet.heat), which is exactly right for density and only density.
+    // Field layers average value metrics; additive layers represent counts.
     const DELAY_TICKS = ['0', '1', '2', '3', '4', `${DELAY_CAP_MIN}+ min`];
-    // radiusM / fullSupport (field metrics only): delay and not-on-time
-    // pool over a wider radius and need more data before reaching full
-    // opacity, because individual delay readings are noisy and sparse;
-    // speed keeps a tighter radius so adjacent roads of different classes
-    // (motorway vs the street beside it) don't blend.
+    // Value metrics use larger radii and support thresholds than speed.
     const METRICS = {
       delay: {
         label: 'Average delay', kind: 'field', hist: 'YlOrRd', live: 'PuBu',
@@ -1906,14 +1511,7 @@ HEATMAP_SCRIPT = """\
     let markerStyle = 'pill';
 
     const HEAT_RADIUS_M = 220, HEAT_BLUR_M = 200;
-    // Kept small — this is only a floor so a point never shrinks to an
-    // invisible sub-pixel dot at extreme zoom-out, not a target radius.
-    // It used to be 12/10px, which is easily *larger* than the true
-    // ground-accurate radius once you're zoomed out a few levels, so
-    // nearby cells were forced to blend together well before they
-    // geographically should have — a real (if separate from the
-    // maxZoom-damping fix below) cause of "loses specificity when
-    // zoomed out". Lower floor keeps points true-to-scale for longer.
+    // Keep a small pixel floor so heat points remain visible when zoomed out.
     const HEAT_MIN_RADIUS_PX = 4, HEAT_MIN_BLUR_PX = 3;
 
     function metresToPixels(metres, zoom, lat) {
@@ -1921,54 +1519,20 @@ HEATMAP_SCRIPT = """\
       return metres / mpp;
     }
     const markersLayer = L.layerGroup().addTo(map);
-    // Selected bus's route and upcoming stops (see selectTrip below). Own
-    // pane between the heat canvases (overlayPane, z 400) and the bus
-    // markers (markerPane, z 600), so the line sits on top of the heat but
-    // never hides a bus.
+    // Place selected-trip geometry above heat layers and below bus markers.
     map.createPane('tripPane');
     map.getPane('tripPane').style.zIndex = 450;
     const tripRenderer = L.svg({ pane: 'tripPane' });
     const tripLayer = L.layerGroup().addTo(map);
-    // minOpacity nudged up from the original 0.12 — combined with the old
-    // pale gradient stops, low-weight points were nearly invisible against
-    // the map background, which was the other half of "switching metric
-    // doesn't seem to do anything".
     const HEAT_MIN_OPACITY = 0.22;
-    // Leaflet.heat merges nearby points into a shared screen-space grid
-    // cell and SUMS their weights before mapping the total through
-    // options.max (default 1) to pick a gradient colour — so with max:1,
-    // just two or three overlapping vehicles/cells (extremely common
-    // anywhere buses share a corridor) instantly saturate to the topmost
-    // colour, which is what made hot areas render as one flat dark blob
-    // with no visible gradation between "somewhat busy/late" and
-    // "extremely busy/late". Raising max gives the ramp headroom: it now
-    // takes several stacked full-weight points to reach the darkest
-    // colour, so the intermediate stops actually get used.
+    // Provide headroom for overlapping additive points before the ramp saturates.
     const HEAT_MAX = 3.5;
     let currentHeatRadius = HEAT_MIN_RADIUS_PX, currentHeatBlur = HEAT_MIN_BLUR_PX;
 
-    // heatLayer/histHeatLayer are rebuilt from scratch (not mutated via
-    // setOptions) whenever the metric changes — see swapHeatLayer() below.
-    // Relying on setOptions()+redraw() to pick up a new gradient on an
-    // already-initialised Leaflet.heat layer turned out not to reliably
-    // repaint in every case (this was Donald's "switching metric still
-    // doesn't visibly change anything" report even after the setOptions
-    // patch). Constructing a brand-new layer and running it through
-    // Leaflet's normal add/remove lifecycle is the one code path that's
-    // guaranteed to (re)initialise the canvas with the new options, so
-    // metric switches no longer depend on a third-party plugin's internal
-    // caching behaviour at all.
+    // Rebuild heat layers when metrics change.
+
     // ---- Route mask: clip both heat layers to bus corridors ----
-    // The heat layers draw round blobs (HEAT_RADIUS_M) around each cell,
-    // which smears delay across blocks no bus ever drives through. With
-    // the mask on, after Leaflet.heat paints its canvas we stroke the bus
-    // road network (from /api/route_shapes — TfNSW GTFS shapes, built
-    // weekly by gtfs-r-scrape) at ±routeMaskHalfWidthM using the
-    // 'destination-in' composite: heat survives only where a route line
-    // was drawn, so hot areas read as corridors. Line width is set in
-    // real metres per redraw, so the corridor stays the same ground width
-    // at every zoom. If the shapes file isn't available the mask is
-    // simply skipped and the heatmap renders unclipped, as before.
+    // Clip heat layers to route geometry while preserving ground width.
     let routeLines = null;
     let routeMaskHalfWidthM = 25;  // 0 = off
     function decodeRouteLines(lines) {
@@ -2037,23 +1601,8 @@ HEATMAP_SCRIPT = """\
       },
     });
 
-    // ---- Averaged value field (all non-density metrics) ----
-    // Leaflet.heat ADDS overlapping points before colouring, so on a value
-    // metric (speed, delay) a street with many closely spaced readings
-    // stacks up to the darkest colour regardless of the values themselves:
-    // Elizabeth St (mean ~9 km/h, ~200 tightly packed cells) rendered darker
-    // than the Harbour Bridge (~42 km/h, one reading per cell) on the speed
-    // map, and the delay maps had the same bias toward busy streets.
-    //
-    // FieldLayer instead computes, per pixel, a Gaussian-weighted MEAN of
-    // nearby cells (normalised convolution): colour = sum(k*c*v) / sum(k*c),
-    // where v is the cell's normalised value, c its confidence (sample
-    // count / HEATMAP_CONFIDENT_SAMPLES, capped at 1) and k the kernel.
-    // Opacity comes from sum(k*c) — how much data backs that pixel — so
-    // thin evidence fades out instead of being painted at full strength,
-    // but it never changes the colour. Rendered on a coarse grid (~6 cells
-    // per kernel radius) and upscaled with smoothing, so cost stays flat
-    // across zoom levels.
+    // ---- Averaged value field (non-density metrics) ----
+    // FieldLayer uses a confidence-weighted Gaussian mean for color and support for opacity.
     const FieldLayer = L.Layer.extend({
       // fullSupport: summed kernel*confidence at which a pixel reaches
       // maxOpacity. 0.4 ~ one or two readings at the pixel; most cells only
@@ -2190,18 +1739,7 @@ HEATMAP_SCRIPT = """\
       const lat = map.getCenter().lat;
       currentHeatRadius = Math.max(metresToPixels(HEAT_RADIUS_M, zoom, lat), HEAT_MIN_RADIUS_PX);
       currentHeatBlur = Math.max(metresToPixels(HEAT_BLUR_M, zoom, lat), HEAT_MIN_BLUR_PX);
-      // Leaflet.heat also silently scales every point's weight by
-      // 1 / 2^(options.maxZoom - currentZoom) — a "keep the same total
-      // heat energy visible regardless of zoom" trick meant for raw
-      // point-density heatmaps. Our weights are already a meaningful
-      // per-point severity/speed/density value, not a raw count, so that
-      // extra scaling just makes colours drift as you zoom (the exact
-      // "fidelity isn't preserved when zoomed out" symptom) rather than
-      // showing the same data consistently. Pinning maxZoom to the
-      // CURRENT zoom on every change forces that scale factor to
-      // 2^0 = 1 at all times, so intensity/colour no longer depends on
-      // zoom level at all — only radius/blur (real ground distance) does,
-      // which is the only zoom-dependence we actually want.
+      // Pin maxZoom to the current zoom to prevent weight changes while zooming.
       heatLayer.setOptions({ radius: currentHeatRadius, blur: currentHeatBlur, maxZoom: zoom });
       histHeatLayer.setOptions({ radius: currentHeatRadius, blur: currentHeatBlur, maxZoom: zoom });
     }
@@ -2216,11 +1754,7 @@ HEATMAP_SCRIPT = """\
       [HIST_LAYER_NAME]: histHeatLayer
     }, { collapsed:false }).addTo(map);
 
-    // Swap `oldLayer` out for a freshly-built one for `metric`,
-    // carrying over its current data and visibility (checked/unchecked in
-    // the layer control) and keeping the control's own bookkeeping in
-    // sync. Returns the new layer — callers must reassign their
-    // heatLayer/histHeatLayer binding to it.
+    // Replace a heat layer while preserving its data and visibility.
     function swapHeatLayer(oldLayer, metric, which, layerName, currentData) {
       const wasVisible = map.hasLayer(oldLayer);
       const newLayer = buildHeatLayer(metric, which);
@@ -2237,11 +1771,8 @@ HEATMAP_SCRIPT = """\
         .map(k => `${gradient[k]} ${Math.round(k * 100)}%`);
       return `linear-gradient(to right, ${stops.join(', ')})`;
     }
-    // One tidy panel under the layer checkboxes: a Heatmap section (metric,
-    // route clip, history window, time of day, then legend + status) and a
-    // Markers section. Element IDs are unchanged so the handlers below
-    // don't care how the panel is laid out.
-    const PERIODS = [  // Liha's time-of-day buckets — see TIME_PERIODS server-side
+    // Build the map controls and their time-of-day options.
+    const PERIODS = [
       ['all', 'All day'],
       ['am_peak', 'AM peak (06:00\u201310:00)'],
       ['midday', 'Midday (10:00\u201315:00)'],
@@ -2300,10 +1831,7 @@ HEATMAP_SCRIPT = """\
     L.DomEvent.disableScrollPropagation(heatPanel);
     const statusDiv = heatPanel.querySelector('#histWindowStatus');
 
-    // Custom history range: date inputs appear when "Custom dates…" is
-    // picked. Bounds mirror the server's (CUSTOM_WINDOW_LOOKBACK_DAYS /
-    // CUSTOM_WINDOW_MAX_DAYS = 7 days long, starting within the ~62 days
-    // the scraper keeps).
+    // Set custom-date limits to match the server.
     const isoDate = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     const startInput = heatPanel.querySelector('#histStartDate');
     const endInput = heatPanel.querySelector('#histEndDate');
@@ -2391,15 +1919,7 @@ HEATMAP_SCRIPT = """\
       renderVehicles(lastVehicles);
     });
 
-    // Historical fetches can be slow (up to HEATMAP_DEADLINE_SEC on a cold
-    // per-window cache — see server docstring) and switching metric or
-    // window quickly fires overlapping requests. The old guard only
-    // compared the response's metric against currentMetric, so a stale
-    // response from a superseded WINDOW change (metric unchanged) could
-    // still land and silently overwrite newer data — one of the "switching
-    // sometimes doesn't seem to do anything" reports. histRequestSeq
-    // tracks the single most recent request regardless of what changed;
-    // any response that isn't for the latest request is dropped outright.
+    // Ignore responses from superseded heatmap requests.
     let histRequestSeq = 0;
     const heatLoadingBanner = document.createElement('div');
     heatLoadingBanner.id = 'heatLoadingBanner';
@@ -2477,12 +1997,7 @@ HEATMAP_SCRIPT = """\
         if (v.delay_min == null || v.anomaly || v.on_time == null) return null;
         return v.on_time ? 0 : 1;
       }
-      // Delay metrics use each vehicle's own lateness, not one point per
-      // vehicle — otherwise the heat layer just draws the route
-      // network (wherever buses happen to be) rather than where they're
-      // currently running late. Vehicles with no delay reading or a
-      // flagged anomaly don't contribute a heat point (still shown as a
-      // marker), since we can't say whether they're a bottleneck or not.
+      // Exclude missing or anomalous delays from live delay heat.
       if (v.delay_min == null || v.anomaly) return null;
       const cap = metric === 'delay' ? DELAY_CAP_MIN : SEVERITY_CAP_MIN;
       return Math.min(Math.max(v.delay_min, 0) / cap, 1);
@@ -2515,18 +2030,11 @@ HEATMAP_SCRIPT = """\
     applyMetric(DEFAULT_METRIC);
     loadRouteShapes();
 
-    // The on-time outline colour (OUTLINE_ON_TIME, server-side) is white —
-    // fine as a thin ring around a solid blue pill, but used as an entire
-    // glyph's fill on its own it vanishes against a light basemap. Late
-    // (red) and early (green) should still read as red/green on the arrow,
-    // same as the pill's border; only on-time swaps to the pill's own blue
-    // so it stays visible without losing the red/green severity meaning.
+    // Use blue for on-time arrows because white is invisible on the basemap.
     const ON_TIME_OUTLINE_HEX = '#ffffff';
     function makeIcon(routeLabel, bearing, outlineColor) {
       const rot = (bearing != null ? bearing : 0) - 90;
-      // 'arrow' style: same bearing rotation as the pill's own arrow, just
-      // without the label/background chrome — for a lighter-weight view
-      // when the map is busy with vehicles.
+      // Arrow-only markers reduce clutter on busy maps.
       if (markerStyle === 'arrow') {
         const arrowColor = (outlineColor || '').toLowerCase() === ON_TIME_OUTLINE_HEX ? 'var(--fill-blue)' : outlineColor;
         return L.divIcon({ className:'', iconSize:[56,24], iconAnchor:[28,12], popupAnchor:[0,-12],
@@ -2546,14 +2054,8 @@ HEATMAP_SCRIPT = """\
       return `<strong>${rl}</strong><br>${v.route_operator || 'Unknown operator'}<br>Trip ${v.trip_id ?? '?'}<br>${dt}<br>${sk}` + tripSummaryHtml(v);
     }
 
-    // ---- Click a bus: draw its route and upcoming stops ----
-    // /api/trip returns the trip's timetable shape (from gtfs-r-scrape's
-    // weekly lookup) and every stop the live feed still lists for it, each
-    // with its predicted delay. The line is split where the bus is now:
-    // faded dashes behind it, solid ahead. Stops are coloured by the same
-    // TfNSW on-time window as the markers, so you can see whether the
-    // bus's lateness is expected to grow or recover before it terminates.
-    // Re-fetched on every vehicle poll while the popup is open.
+    // ---- Selected-trip route and upcoming stops ----
+    // Refresh trip geometry and predicted stop delays while its popup is open.
     const ON_TIME_EARLY_SEC = {{ on_time_early_sec }}, ON_TIME_LATE_SEC = {{ on_time_late_sec }};
     const STATUS_LATE = '{{ status_late }}', STATUS_EARLY = '{{ status_early }}', STATUS_ON_TIME = '{{ status_on_time }}';
     const ROUTE_AHEAD = '#1f2a44', ROUTE_BEHIND = '#5b6474';
@@ -2643,15 +2145,7 @@ HEATMAP_SCRIPT = """\
       });
     }
 
-    // ---- Keep the bus info popup off the selected route ----
-    // Leaflet always puts a popup directly above its marker, which is
-    // usually right on top of the route line and the next few stops. Once
-    // the popup is open (and again whenever its content, the route or the
-    // view changes) we try eight positions around the bus and keep the one
-    // that covers the least of the route ahead (route behind and stops are
-    // weighted too), stays inside the visible map (the model box in
-    // projector mode) and doesn't sit under the menu. Scored in container
-    // pixels; the menu test maps points through the projector warp.
+    // Place the popup to avoid covering the route, stops, menu, or map edge.
     const POPUP_GAP = 8, MARKER_HW = 28, MARKER_HH = 12;
     // Leaflet geometry: the popup's content box ends 20 px (tip) above
     // the anchor, and the anchor is popupAnchor = 12 px above the marker.
@@ -2805,10 +2299,7 @@ HEATMAP_SCRIPT = """\
         tripInFlight = false;
       }
     }
-    // While a bus is selected, only it stays on the map so its route and
-    // stops read clearly; the rest come back when it's deselected (popup
-    // closed, or the bus leaves the feed). Hidden buses are just taken off
-    // the layer, so they keep updating and reappear at their current spot.
+    // Show only the selected bus until its popup closes or it leaves the feed.
     function applyBusFocus() {
       for (const [k, m] of markers) {
         const show = selectedKey == null || k === selectedKey;
@@ -2879,10 +2370,7 @@ HEATMAP_SCRIPT = """\
       }
       applyBusFocus();  // buses that appeared this poll stay hidden too
     }
-    // Skip a poll while the previous one is still waiting, and give up on
-    // a request after 20 s. Without this, a slow server got a new request
-    // every 15 s on top of the unanswered ones, from every open tab, which
-    // tied up all six server threads and made the slowdown worse.
+    // Avoid overlapping polls and abort requests that exceed 20 seconds.
     let vehiclePollInFlight = false;
     async function pollVehicles() {
       if (vehiclePollInFlight) return;
@@ -2935,9 +2423,7 @@ HEATMAP_SCRIPT = """\
 
 
 def render_map_script(map_init_js):
-    """Prefix HEATMAP_SCRIPT with the one page-specific line that creates
-    the Leaflet map object (everything after it is identical for both
-    pages)."""
+    """Insert page-specific map initialization into the shared map script."""
     return map_init_js + "\n" + HEATMAP_SCRIPT
 
 
@@ -2966,8 +2452,7 @@ PAGE = """
   th a { color:inherit; text-decoration:underline; }
   th a:hover { color:var(--late); }
   th.help { text-decoration:underline dotted; text-underline-offset:2px; cursor:help; }
-  /* Sortable column headers: click the header to sort; the arrow shows
-     the active column and direction, a faint double arrow the others. */
+  /* Sort indicators for sortable table columns. */
   th.sortable { padding:0; }
   th .sort-btn { all:unset; box-sizing:border-box; display:flex; align-items:center; justify-content:flex-end; gap:4px; width:100%; padding:6px 12px; cursor:pointer; white-space:nowrap; }
   th:first-child .sort-btn { justify-content:flex-start; }
@@ -3000,7 +2485,7 @@ PAGE = """
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
-  .leaflet-popup.popup-side .leaflet-popup-tip-container { display:none; }  /* moved off the route: no pointer */
+  .leaflet-popup.popup-side .leaflet-popup-tip-container { display:none; }  /* Hide the pointer when the popup moves. */
   .trip-summary { margin-top:6px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12); }
   .trip-summary .trip-delay { font-weight:600; }
   .trip-muted { color:#666; }
@@ -3258,7 +2743,7 @@ PROJECT_PAGE = """
   .glass-tooltip::before { display:none; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { background:rgba(255,255,255,0.55); -webkit-backdrop-filter:blur(14px) saturate(180%); backdrop-filter:blur(14px) saturate(180%); border:1px solid rgba(255,255,255,0.45); border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.18); color:#111; }
   .leaflet-popup.glass-popup .leaflet-popup-tip { background:rgba(255,255,255,0.55); box-shadow:none; }
-  .leaflet-popup.popup-side .leaflet-popup-tip-container { display:none; }  /* moved off the route: no pointer */
+  .leaflet-popup.popup-side .leaflet-popup-tip-container { display:none; }  /* Hide the pointer when the popup moves. */
   .trip-summary { margin-top:6px; padding-top:6px; border-top:1px solid rgba(0,0,0,0.12); }
   .trip-summary .trip-delay { font-weight:600; }
   .trip-muted { color:#666; }
@@ -3281,18 +2766,17 @@ PROJECT_PAGE = """
   .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
   #heatLoadingBanner { position:fixed; top:10px; left:50%; transform:translateX(-50%); z-index:1050; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
-  /* Calibration: black everywhere outside the four corner crosshairs, the
-     crosshairs themselves (calibration mode only) and the help box. */
+  /* Mask areas outside the calibrated projection corners. */
   #projMask { position:fixed; inset:0; width:100%; height:100%; z-index:850; pointer-events:none; }
   #projControls { position:fixed; top:10px; right:10px; z-index:1100; }
   #projControls .leaflet-control-layers { margin:0; }
   .cal-handle { position:fixed; width:0; height:0; z-index:1200; cursor:move; display:none; }
   body.calibrating .cal-handle { display:block; }
   body.calibrating { user-select:none; -webkit-user-select:none; }
-  body.calibrating #projControls { display:none; }  /* menu would cover the NE crosshair */
+  body.calibrating #projControls { display:none; }  /* Keep the menu clear of corner markers. */
   .cal-handle svg { position:absolute; left:-40px; top:-40px; overflow:visible; }
   .cal-handle .cal-label { position:absolute; font:700 13px/1 -apple-system, Helvetica, Arial, sans-serif; color:#fff; background:#d0021b; padding:3px 6px; border-radius:4px; white-space:nowrap; }
-  /* labels sit on the inward side of each corner so they stay on screen */
+  /* Keep corner labels inside the projected area. */
   .cal-handle.c-nw .cal-label { left:12px; top:12px; }
   .cal-handle.c-ne .cal-label { right:12px; top:12px; }
   .cal-handle.c-se .cal-label { right:12px; bottom:12px; }
@@ -3307,10 +2791,7 @@ PROJECT_PAGE = """
   .heat-panel .hp-hide { display:block; width:100%; margin-top:10px; font:inherit; cursor:pointer; }
   .menu-hint { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; opacity:0; transition:opacity 0.4s; pointer-events:none; }
   .menu-hint.show { opacity:1; }
-  /* Readability on the projected model: every panel and label is twice the
-     dashboard size. The menu is scaled as a block (it lives outside the
-     warped map, so zoom is safe); popups/tooltips inside the map get larger
-     fonts instead, since zoom there would throw off Leaflet's positioning. */
+  /* Enlarge projector text without scaling Leaflet geometry. */
   #projControls { zoom:2; max-height:calc(50vh - 10px); overflow-y:auto; }
   .leaflet-popup-content { font-size:26px; margin:20px 30px 20px 24px; }
   .leaflet-popup.glass-popup .leaflet-popup-content-wrapper { border-radius:20px; }
@@ -3637,8 +3118,9 @@ PROJECT_PAGE = """
 """
 
 
+# Flask views
 def _fmt_pulled(iso):
-    """'2026-10-09T10:44:12.123456+11:00' -> '10:44:12 · Fri 9 Oct' (Sydney, 24 h)."""
+    """Format a feed timestamp in Sydney local time."""
     try:
         t = datetime.fromisoformat(iso).astimezone(SYDNEY_TZ)
     except (TypeError, ValueError):
@@ -3648,6 +3130,7 @@ def _fmt_pulled(iso):
 
 @app.route("/project")
 def project():
+    """Render the projector-locked map view."""
     if not API_KEY:
         return "TFNSW_API_KEY not set in .env", 500
     data = compute_delay_data(request.args)
@@ -3666,16 +3149,15 @@ def project():
     )
 
 
-# Compress large text responses. The dashboard page is ~1.2 MB of HTML and
-# /api/vehicles is polled every 15 s by every open tab; uncompressed, a
-# dashboard or projector left open all day sent gigabytes a day, and Render
-# suspends Free services that use up their monthly outbound bandwidth.
+# Compress large text responses.
+# HTTP response compression
 GZIP_MIN_BYTES = 1024
 _GZIP_TYPES = ("text/html", "application/json", "text/csv", "text/plain", "application/javascript")
 
 
 @app.after_request
 def _gzip_response(resp):
+    """Compress eligible large text responses for HTTP delivery."""
     try:
         if (resp.status_code != 200 or resp.direct_passthrough
                 or "Content-Encoding" in resp.headers
@@ -3688,23 +3170,26 @@ def _gzip_response(resp):
         resp.set_data(gzip.compress(data, 5))
         resp.headers["Content-Encoding"] = "gzip"
         resp.headers["Vary"] = "Accept-Encoding"
-    except Exception as e:  # never let compression break a response
+    except Exception as e:
         print(f"[gzip] skipped: {e}", flush=True)
     return resp
 
 
 @app.route("/ping")
 def ping():
+    """Return the lightweight deployment health-check response."""
     return "pong", 200
 
 
 @app.route("/health")
 def health():
+    """Return the basic application health response."""
     return "ok", 200
 
 
 @app.route("/status")
 def status():
+    """Return schedule, memory, and heatmap-cache diagnostics."""
     heatmap_state = {}
     for wh, entry in _heatmap_cells_cache.items():
         heatmap_state[str(wh)] = {
@@ -3732,6 +3217,7 @@ def status():
 
 @app.route("/")
 def dashboard():
+    """Render the live dashboard and its current tables and map."""
     if not API_KEY:
         return "TFNSW_API_KEY not set in .env", 500
 
@@ -3741,13 +3227,6 @@ def dashboard():
     all_rows = data["all_rows"]
     latest_rows = data["latest_rows"]
     agency_names = data["agency_names"]
-
-    # Operator/route-prefix diagnostics used to be dumped straight into the
-    # page header for every viewer (schedule-loading was flaky enough during
-    # development to want it always visible). That debugging is done now —
-    # the same numbers are still available on demand at /status, so the
-    # header just shows the one thing a viewer actually needs: whether
-    # operator names failed to load at all (agency_error, below).
 
     operators = sorted(summarise(latest_rows, "operator"), key=lambda r: -abs(r["mean_min"]))
     routes = sorted(summarise(latest_rows, "route_id"),
@@ -3780,6 +3259,7 @@ def dashboard():
 
 @app.route("/api/vehicles")
 def api_vehicles():
+    """Return live vehicle positions with current delay data."""
     if not API_KEY:
         return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
     data = compute_delay_data(request.args)
@@ -3788,8 +3268,7 @@ def api_vehicles():
 
 
 def get_route_shapes_gz():
-    """Gzipped route_shapes.json bytes, or None if not built/fetchable yet.
-    Failures aren't cached, so the mask turns on as soon as the file exists."""
+    """Return cached gzipped route shapes or fetch the published geometry."""
     now = time.monotonic()
     if _route_shapes_cache["gz"] and now - _route_shapes_cache["fetched_at"] < ROUTE_SHAPES_CACHE_TTL_SECONDS:
         return _route_shapes_cache["gz"]
@@ -3801,7 +3280,7 @@ def get_route_shapes_gz():
             r = requests.get(ROUTE_SHAPES_URL, timeout=30)
             if r.status_code != 200:
                 print(f"[shapes] GET {ROUTE_SHAPES_URL} -> HTTP {r.status_code}", flush=True)
-                return _route_shapes_cache["gz"]  # keep serving a stale copy if we have one
+                return _route_shapes_cache["gz"]
             json.loads(r.content)  # don't cache a broken file
         except (requests.RequestException, ValueError) as e:
             print(f"[shapes] fetch failed: {e}", flush=True)
@@ -3814,6 +3293,7 @@ def get_route_shapes_gz():
 
 @app.route("/api/route_shapes")
 def api_route_shapes():
+    """Serve the published bus route geometry."""
     gz = get_route_shapes_gz()
     if gz is None:
         return jsonify({"lines": [], "error": "Route shapes not built yet"})
@@ -3828,7 +3308,7 @@ def api_route_shapes():
 
 
 def _fetch_scrape_json(path, timeout=20):
-    """GET a JSON file from gtfs-r-scrape's shapes/ folder; None on any failure."""
+    """Fetch and decode a JSON file from the scraper's shapes directory."""
     url = f"{TRIP_LOOKUP_BASE}/{path}"
     try:
         r = requests.get(url, headers=RAW_HEADERS, timeout=timeout)
@@ -3846,9 +3326,7 @@ def _fetch_scrape_json(path, timeout=20):
 
 
 def get_trip_lookup_meta():
-    """(n_shards, {stop_id: (lat, lon, name)}), or (None, {}) if the lookup
-    hasn't been built yet. A new build (different 'generated' stamp) also
-    drops cached shards, since they may now point at different files."""
+    """Return lookup shard metadata and stop locations."""
     now = time.monotonic()
     c = _trip_meta_cache
     if c["n_shards"] and now - c["fetched_at"] < TRIP_LOOKUP_TTL_SECONDS:
@@ -3872,6 +3350,7 @@ def get_trip_lookup_meta():
 
 
 def _get_trip_shard(kind, key, n_shards):
+    """Return a cached lookup shard, fetching and caching it when absent."""
     k = zlib.crc32(key.encode("utf-8")) % n_shards
     ck = (kind, k)
     now = time.monotonic()
@@ -3882,7 +3361,7 @@ def _get_trip_shard(kind, key, n_shards):
             return hit[1]
     data = _fetch_scrape_json(f"{kind}/{k:03d}.json")
     if data is None:
-        return hit[1] if hit else None  # stale copy if we have one
+        return hit[1] if hit else None
     with _trip_lookup_lock:
         _trip_shards[ck] = (now, data)
         _trip_shards.move_to_end(ck)
@@ -3892,14 +3371,7 @@ def _get_trip_shard(kind, key, n_shards):
 
 
 def compute_trip_detail(trip_id):
-    """Route shape and upcoming stops for one live trip.
-
-    Stops: every stop_time_update the live feed currently has for the trip
-    (TfNSW only lists stops still to come), in stop_sequence order, each
-    with its predicted delay — so the response shows how the bus's current
-    lateness is expected to grow or recover along the rest of the route.
-    Shape: the timetable shape for the trip from gtfs-r-scrape, encoded as
-    in /api/route_shapes; null if the trip isn't in the lookup."""
+    """Build the route and predicted upcoming stops for one live trip."""
     all_rows, agency_names, trip_headsigns, _ = get_all_rows_cached()
     n_shards, stops_lookup = get_trip_lookup_meta()
 
@@ -3923,8 +3395,7 @@ def compute_trip_detail(trip_id):
         trips = _get_trip_shard("trips", trip_id, n_shards)
         shape_id = trips.get(trip_id) if trips is not None else None
         if shape_id is None and trips is not None and "_" in trip_id:
-            # Operators' added/duplicated runs appear in the live feed as
-            # "<timetabled trip>_2" etc. and follow the original's route.
+            # Added service runs reuse their base trip's route.
             base = trip_id.rsplit("_", 1)[0]
             base_trips = _get_trip_shard("trips", base, n_shards)
             shape_id = base_trips.get(base) if base_trips else None
@@ -3954,8 +3425,7 @@ def compute_trip_detail(trip_id):
 
 @app.route("/api/trip/<path:trip_id>")
 def api_trip(trip_id):
-    """Route shape and upcoming stops (with predicted delays) for one live
-    trip — what the map draws when a bus marker is clicked."""
+    """Return route geometry and predicted stops for one trip."""
     if not API_KEY:
         return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
     try:
@@ -3964,17 +3434,14 @@ def api_trip(trip_id):
         return jsonify({"trip_id": trip_id, "shape": None, "stops": [], "error": f"Server error: {e}"}), 200
 
 
-# Built /api/heatmap bodies, gzipped once and reused until the window is
-# rebuilt: key (window, metric, period, build time) -> (etag, gz bytes).
-# Every open dashboard re-polls every 5 minutes, but a window only changes
-# every 5-30 minutes, so most polls are answered 304 Not Modified (no body)
-# and the rest get a pre-compressed body without recomputing anything.
+# Cached compressed heatmap responses keyed by window, metric, period, and build.
 _heatmap_body_cache = OrderedDict()
 _heatmap_body_lock = threading.Lock()
 HEATMAP_BODY_CACHE_MAX = 24
 
 
 def _gzip_json_response(gz, etag=None):
+    """Serve gzipped JSON with optional ETag revalidation."""
     if "gzip" in request.headers.get("Accept-Encoding", ""):
         resp = Response(gz, mimetype="application/json")
         resp.headers["Content-Encoding"] = "gzip"
@@ -3984,13 +3451,13 @@ def _gzip_json_response(gz, etag=None):
     resp.direct_passthrough = False
     if etag:
         resp.headers["ETag"] = f'"{etag}"'
-        # Browser keeps the body and revalidates every time: 304 when unchanged.
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
 @app.route("/api/heatmap")
 def api_heatmap():
+    """Return historical heatmap points for the requested window and metric."""
     try:
         window, werr = parse_window_args(request.args)
         if werr:
@@ -4038,19 +3505,7 @@ def api_heatmap():
 
 @app.route("/api/validation")
 def api_validation():
-    """On-time running by operator from the scraped history, for comparing
-    against TfNSW's published monthly on-time running results.
-
-    ?window=1|24|168 or ?window=custom&start=YYYY-MM-DD&end=YYYY-MM-DD;
-    &format=csv for a spreadsheet-ready table. Operators are grouped by NAME
-    (several agency ids can share one, e.g. multiple Transit Systems
-    contracts), using the timetable's agency.txt.
-
-    Not like-for-like with the published KPI, and the response says so:
-    each reading is one bus at one scrape snapshot (delay at its latest
-    reported stop, mid-trip), whereas the published figures measure
-    timetabled trips at defined points. Mid-trip delay accumulates along a
-    route, so these figures should read somewhat LOWER than published."""
+    """Return historical on-time, early, and late statistics by operator."""
     window, werr = parse_window_args(request.args)
     if werr:
         return jsonify({"error": werr}), 400
@@ -4066,6 +3521,7 @@ def api_validation():
         g["n"] += n; g["early"] += early; g["on_time"] += on; g["late"] += late; g["late_sum"] += late_sum
 
     def finish(g):
+        """Calculate percentages and mean lateness for one operator group."""
         n = g["n"] or 1
         return {"operator": g["operator"], "agency_ids": sorted(g["agency_ids"]), "readings": g["n"],
                 "on_time_pct": round(100 * g["on_time"] / n, 1),
