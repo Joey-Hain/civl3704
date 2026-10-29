@@ -43,9 +43,9 @@ Open [http://localhost:5000](http://localhost:5000) in a browser. The first page
 
 The dashboard automatically refreshes vehicle positions every 15 seconds and the historical heatmap every 5 minutes.
 
-### Raspberry Pi Pico buttons
+### External buttons
 
-The Pico firmware emulates a USB keyboard. Connect the Pico by USB to the computer displaying the dashboard, then copy [`pico_buttons.py`](pico_buttons.py) to the Pico as `main.py`. No serial-port setting or extra app dependency is needed. Keep the dashboard browser window focused while using the buttons.
+The Pico firmware emulates a USB keyboard. Connect the Pico by USB to the computer displaying the dashboard, then copy [`pico_buttons.py`](pico_buttons.py) to the Pico as `main.py`. 
 
 Connect each momentary button between its GPIO pin and GND; the firmware uses internal pull-ups.
 
@@ -54,6 +54,8 @@ Connect each momentary button between its GPIO pin and GND; the firmware uses in
 | GPIO 15 (A) | Cycle live heatmap → historical heatmap → no heatmap |
 | GPIO 14 (B) | Cycle through average delay, delay burden, not on time, speed and bus density |
 | GPIO 13 (C) | Show or hide bus markers |
+
+If no external buttons can be used use the corresponding keyboard keys for the same functionality
 
 ## Visualisations
 
