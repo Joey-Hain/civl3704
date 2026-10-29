@@ -1753,6 +1753,21 @@ HEATMAP_SCRIPT = """\
       [LIVE_LAYER_NAME]: heatLayer,
       [HIST_LAYER_NAME]: histHeatLayer
     }, { collapsed:false }).addTo(map);
+    const mapState = document.createElement('div');
+    mapState.className = 'map-state';
+    const isProjector = typeof PROJECTOR_UI_SCALE !== 'undefined';
+    mapState.style.position = isProjector ? 'fixed' : 'absolute';
+    (isProjector ? document.body : document.getElementById('dashmap')).appendChild(mapState);
+    function updateMapState() {
+      const modes = [];
+      if (map.hasLayer(heatLayer)) modes.push('Live');
+      if (map.hasLayer(histHeatLayer)) modes.push('Historical');
+      mapState.textContent = modes.length
+        ? `${modes.join(' + ')}: ${METRICS[currentMetric].label}`
+        : 'No heatmap';
+    }
+    map.on('overlayadd overlayremove', updateMapState);
+    updateMapState();
 
     // Replace a heat layer while preserving its data and visibility.
     function swapHeatLayer(oldLayer, metric, which, layerName, currentData) {
@@ -2024,6 +2039,7 @@ HEATMAP_SCRIPT = """\
       heatPanel.querySelector('#heatMetricDesc').textContent = cfg.desc || '';
       updateLiveHeatFromVehicles(lastVehicles);
       loadHistoricalHeatmap();
+      updateMapState();
     }
     document.getElementById('heatMetricSelect').addEventListener('change', e => applyMetric(e.target.value));
 
@@ -2463,6 +2479,8 @@ PAGE = """
   th[aria-sort] .sort-btn { color:var(--text); }
   th[aria-sort] .sort-btn .arr { opacity:1; }
   .table-note { color:var(--muted); font-size:0.8rem; margin-top:6px; }
+  .table-toolbar { display:flex; align-items:center; gap:6px; margin:8px 0; color:var(--muted); font-size:0.85rem; }
+  .table-toolbar select { font:inherit; }
   tr:hover { background:#f4f4f4; }
   td.late { color:var(--late); }
   td.early { color:var(--early); }
@@ -2515,6 +2533,8 @@ PAGE = """
   .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
   #heatLoadingBanner { position:absolute; top:10px; left:50%; transform:translateX(-50%); z-index:900; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
+  .map-state { display:none; top:10px; right:10px; z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 12px; border-radius:14px; pointer-events:none; }
+  body.menu-hidden .map-state { display:block; }
   body.menu-hidden #dashmap .leaflet-control-layers { display:none !important; }
   .heat-panel .hp-hide { display:block; width:100%; margin-top:10px; font:inherit; cursor:pointer; }
   .menu-hint { position:absolute; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 13px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; opacity:0; transition:opacity 0.4s; pointer-events:none; }
@@ -2567,7 +2587,15 @@ PAGE = """
   </details>
 
   <h2>By operator</h2>
-  <table class="sortable-table" data-sort-col="2" data-sort-dir="desc">
+  <div class="table-toolbar">
+    <label for="operatorRowLimit">Show top</label>
+    <select id="operatorRowLimit">
+      <option value="5" selected>5</option><option value="10">10</option>
+      <option value="20">20</option><option value="50">50</option><option value="all">All</option>
+    </select>
+    <span>operators</span>
+  </div>
+  <table class="sortable-table" data-label="operators" data-limit-select="operatorRowLimit" data-sort-col="2" data-sort-dir="desc">
     <tr><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Operator</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded."><button type="button" class="sort-btn"><span class="lbl">n</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="num" data-first="desc"><button type="button" class="sort-btn"><span class="lbl">avg delay</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others."><button type="button" class="sort-btn"><span class="lbl">standard deviation (min)</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="asc" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window)."><button type="button" class="sort-btn"><span class="lbl">on time</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Earliest to latest bus. Sorts by the gap between them."><button type="button" class="sort-btn"><span class="lbl">range</span><span class="arr" aria-hidden="true"></span></button></th></tr>
     {% for r in operators %}
     <tr><td>{{ r.operator }}</td><td data-v="{{ r.n }}">{{ r.n }}</td>
@@ -2577,9 +2605,18 @@ PAGE = """
       <td data-v="{{ r.max_min - r.min_min }}">{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
     {% endfor %}
   </table>
+  <div class="table-note" data-table-note hidden></div>
 
   <h2>By route</h2>
-  <table class="sortable-table" data-limit="60" data-sort-col="{{ {'mean_min': 3, 'stdev_min': 4, 'on_time_pct': 5}.get(sort_key, 4) }}" data-sort-dir="{{ 'asc' if ascending else 'desc' }}">
+  <div class="table-toolbar">
+    <label for="routeRowLimit">Show top</label>
+    <select id="routeRowLimit">
+      <option value="5" selected>5</option><option value="10">10</option>
+      <option value="20">20</option><option value="50">50</option><option value="all">All</option>
+    </select>
+    <span>routes</span>
+  </div>
+  <table class="sortable-table" data-label="routes" data-limit-select="routeRowLimit" data-sort-col="{{ {'mean_min': 3, 'stdev_min': 4, 'on_time_pct': 5}.get(sort_key, 4) }}" data-sort-dir="{{ 'asc' if ascending else 'desc' }}">
     <tr><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Route</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Operator</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Distinct buses reporting, using each bus’s latest stop. Anomalous readings (over an hour early or late) are excluded."><button type="button" class="sort-btn"><span class="lbl">n</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="num" data-first="desc"><button type="button" class="sort-btn"><span class="lbl">avg delay</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Standard deviation (SD) of delay in minutes: how much delay varies between buses, not how late they run on average. Low = consistently delayed by about the same amount; high = some buses run much later (or earlier) than others."><button type="button" class="sort-btn"><span class="lbl">standard deviation (min)</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="asc" title="Share of buses between 0:59 early and 5:59 late (TfNSW on-time running KPI window)."><button type="button" class="sort-btn"><span class="lbl">on time</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Earliest to latest bus. Sorts by the gap between them."><button type="button" class="sort-btn"><span class="lbl">range</span><span class="arr" aria-hidden="true"></span></button></th></tr>
     {% for r in routes %}
     <tr><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td data-v="{{ r.n }}">{{ r.n }}</td>
@@ -2589,28 +2626,34 @@ PAGE = """
       <td data-v="{{ r.max_min - r.min_min }}">{{ '%+.1f'|format(r.min_min) }} to {{ '%+.1f'|format(r.max_min) }} min</td></tr>
     {% endfor %}
   </table>
-  {% if routes|length > 60 %}<div class="table-note">Showing the top 60 of {{ routes|length }} routes for the current sort. Click a column heading to sort; click again to reverse.</div>{% endif %}
+  <div class="table-note" data-table-note hidden></div>
 
   <h2>Individual trips &mdash; largest single delays</h2>
-  <table class="sortable-table" data-sort-col="4" data-sort-dir="desc">
+  <div class="table-toolbar">
+    <label for="tripRowLimit">Show top</label>
+    <select id="tripRowLimit">
+      <option value="5" selected>5</option><option value="10">10</option>
+      <option value="20">20</option><option value="50">50</option><option value="all">All</option>
+    </select>
+    <span>trips</span>
+  </div>
+  <table class="sortable-table" data-label="trips" data-limit-select="tripRowLimit" data-sort-col="4" data-sort-dir="desc">
     <tr><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Trip</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Route</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Operator</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable" data-type="text" data-first="asc"><button type="button" class="sort-btn"><span class="lbl">Most recent stop</span><span class="arr" aria-hidden="true"></span></button></th><th class="sortable help" data-type="num" data-first="desc" title="Sorts by size of delay, early or late."><button type="button" class="sort-btn"><span class="lbl">delay</span><span class="arr" aria-hidden="true"></span></button></th></tr>
-    {% for r in worst_trips[:30] %}
+    {% for r in worst_trips %}
     <tr><td>{{ r.trip_id }}</td><td>{{ r.route_num }}</td><td>{{ r.route_operator }}</td><td>{{ r.stop_id }}</td>
       <td data-v="{{ (r.delay|abs) / 60 }}" class="{{ 'late' if r.delay > 0 else 'early' }}">{{ '%+.1f'|format(r.delay / 60) }} min{% if r.anomaly %} <span class="flag">(flagged)</span>{% endif %}</td></tr>
     {% endfor %}
   </table>
+  <div class="table-note" data-table-note hidden></div>
 
   <script>
-  // Click-to-sort column headers (Wikipedia-style). Sorting happens in the
-  // browser, so it doesn't reload the page or reset the map. Numeric cells
-  // carry their raw value in data-v; text cells sort naturally ("M30" < "M50",
-  // "301" < "1000"). data-limit shows only the top N rows after each sort.
+  // Sort rows in the browser and apply each table's row limit.
   (function () {
     const ARROWS = { asc: '▲', desc: '▼', none: '⇅' };
     const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
     document.querySelectorAll('table.sortable-table').forEach(function (table) {
+      const rowLimitSelect = document.getElementById(table.dataset.limitSelect);
       const headers = Array.from(table.rows[0].cells);
-      const limit = parseInt(table.dataset.limit || '0', 10);
       function cellKey(row, i, type) {
         const c = row.cells[i];
         if (type === 'num') {
@@ -2636,6 +2679,8 @@ PAGE = """
         const type = headers[col].dataset.type;
         const body = table.rows[0].parentNode;
         const rows = Array.from(table.rows).slice(1);
+        const selectedLimit = rowLimitSelect.value;
+        const limit = selectedLimit === 'all' ? 0 : parseInt(selectedLimit, 10);
         rows.sort(function (a, b) {
           const ka = cellKey(a, col, type), kb = cellKey(b, col, type);
           const r = type === 'num' ? ka - kb : collator.compare(ka, kb);
@@ -2645,6 +2690,12 @@ PAGE = """
           row.hidden = limit > 0 && i >= limit;
           body.appendChild(row);
         });
+        const note = table.nextElementSibling;
+        if (note && note.hasAttribute('data-table-note')) {
+          const shown = limit > 0 ? Math.min(limit, rows.length) : rows.length;
+          note.hidden = shown === rows.length;
+          note.textContent = `Showing top ${shown} of ${rows.length} ${table.dataset.label}.`;
+        }
         table.dataset.sortCol = col;
         table.dataset.sortDir = dir;
         render(col, dir);
@@ -2661,6 +2712,9 @@ PAGE = """
         });
       });
       sortBy(parseInt(table.dataset.sortCol || '0', 10), table.dataset.sortDir || 'desc');
+      rowLimitSelect.addEventListener('change', function () {
+        sortBy(parseInt(table.dataset.sortCol || '0', 10), table.dataset.sortDir || 'desc');
+      });
     });
   })();
   </script>
@@ -2766,6 +2820,8 @@ PROJECT_PAGE = """
   .heat-legend .heat-legend-bar { height:10px; border-radius:2px; border:1px solid rgba(0,0,0,0.15); }
   .heat-legend .heat-legend-ticks { display:flex; justify-content:space-between; color:#888; margin-top:1px; }
   #heatLoadingBanner { position:fixed; top:10px; left:50%; transform:translateX(-50%); z-index:1050; background:rgba(17,17,17,0.85); color:#fff; font:600 12px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:6px 14px; border-radius:14px; box-shadow:0 2px 8px rgba(0,0,0,0.25); pointer-events:none; }
+  .map-state { display:none; position:fixed; top:10px; right:10px; z-index:1000; background:rgba(17,17,17,0.85); color:#fff; font:600 22px/1.4 -apple-system, Helvetica, Arial, sans-serif; padding:8px 18px; border-radius:24px; pointer-events:none; }
+  body.menu-hidden .map-state { display:block; }
   /* Mask areas outside the calibrated projection corners. */
   #projMask { position:fixed; inset:0; width:100%; height:100%; z-index:850; pointer-events:none; }
   #projControls { position:fixed; top:10px; right:10px; z-index:1100; }
