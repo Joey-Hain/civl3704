@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template_string, request
 from google.transit import gtfs_realtime_pb2
 
+#--------------------------------------------------------
 # Configuration
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 UTC_TZ = ZoneInfo("UTC")
@@ -117,6 +118,8 @@ ENABLE_TRIP_HEADSIGNS = os.getenv("ENABLE_TRIP_HEADSIGNS", "1") == "1"
 SCHEDULE_RETRY_BACKOFF_SEC = 300
 
 
+
+#--------------------------------------------------------------------
 # Runtime helpers
 def time_of_day_bucket(ts):
     """Return the Sydney-local heatmap period for a timestamp."""
