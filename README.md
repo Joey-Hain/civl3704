@@ -58,24 +58,23 @@ Connect each momentary button between its GPIO pin and GND; the firmware uses in
 ## Visualisations
 
 - **Live map:** Each marker represents a currently reporting bus. The label shows its route, and the arrow shows its direction of travel. Marker outlines indicate the bus status: white for on time (0:59 early to 5:59 late, matching the TfNSW on-time KPI), red for late, green for early, and grey when delay data is unavailable or anomalous.
-- **Selected bus:** Clicking a bus draws its route (dashed behind the bus, solid ahead) and the stops it still has to serve. Each stop is coloured by the delay TfNSW currently predicts the bus will have there, using the same on-time window: blue on time, red late, green early, grey no prediction. The popup names the next stop and the last predicted stop, and says how much time the bus is expected to lose or recover by then. Hover a stop for its name and predicted delay. The route and stops refresh with each 15-second update and clear when the popup closes.
 - **Heatmap metric:** The Heatmap section of the map menu offers five metrics. *Average delay* (0–5 min scale) and *Not on time* (share of readings outside the TfNSW on-time window, 0–60% scale) are drawn as an averaged field: colour is the local mean of readings within 250 m, shrunk toward the network average where data is thin so a single late bus can't paint a hotspot, and opacity shows how much data backs it. *Speed* (0–80 km/h; amber = CBD streets, pink = arterials, purple = motorways) is averaged the same way over 160 m. *Delay burden* (total bus-minutes late) and *Bus density* are additive heatmaps, so busy corridors rank high by design. The live layer shows each bus's current value. "About the heatmaps" under the map explains each metric.
-- **Route clipping:** "Route clip" trims both heat layers to within ±15–100 m of the bus road network (TfNSW GTFS route shapes, rebuilt weekly in gtfs-r-scrape), so delay reads along corridors instead of as round blobs. Set it to Off for the unclipped view.
 - **Historical heatmap:** Historical data can be viewed over the last hour, 24 hours or 7 days (the default), or a custom date range of up to 7 days within the last ~60 days, and filtered to a time of day (AM peak 06:00–10:00, midday 10:00–15:00, PM peak 15:00–19:00, evening 19:00–06:00). The map aggregates vehicle readings into geographic cells, so each coloured area represents activity within a small location rather than a single bus.
 - **Projector mode:** `/project` locks the map to the TransportLab model's extent and blacks out everything outside it. "Hide menu" (or the M key, or `?menu=0`) removes the menu so only the map is projected.
+- **Selected bus:** Clicking a bus draws its route (dashed behind the bus, solid ahead) and the stops it still has to serve. Each stop is coloured by the delay TfNSW currently predicts the bus will have there, using the same on-time window: blue on time, red late, green early, grey no prediction. The popup names the next stop and the last predicted stop, and says how much time the bus is expected to lose or recover by then. Hover a stop for its name and predicted delay. The route and stops refresh with each 15-second update and clear when the popup closes.
 - **Operator and route tables:** These show the number of distinct bus readings, average delay, standard deviation of delay, percentage running on time, and the observed delay range. Routes can be sorted by delay, spread, or on-time percentage.
 - **Individual trips table:** This lists the trips with the largest current delays and identifies their route, operator, most recent stop, and delay status.
 
 ## Projector calibration
 
-By default `/project` places the model exactly where TransportLab's smart-city rig does, using the projector settings in its [`params.json5`](https://github.com/TransportLab/smart-city/blob/main/params.json5): the model's 2:1 box spans the full window width, is vertically centred and shifted down by `vertical_offset` (50 px, which moves the box 25 px because of the centring), and is stretched horizontally by `horizontal_scale` (1.184) about the centre. At those settings the stretched box would be wider than a 1920×1080 image, so it is shrunk (same stretch ratio, same centre) until all four corners are on screen: the model spans the full width with black bands above and below. These values are set in `app.py` (`SMART_CITY_*`). Manual calibration is only needed if the projector has moved.
+By default `/project` places the model using the projector settings in its [`params.json5`](https://github.com/TransportLab/smart-city/blob/main/params.json5). Manual Calibration may be required to align the projection and physical model. 
 
 1. Open `/project` on the computer connected to the projector, full screen (F11) at the projector's native resolution.
 2. Press K (or "Calibrate projection" in the menu). A crosshair appears on each corner of the model's area.
 3. Drag each crosshair onto the matching corner of the physical model. Tab selects the next crosshair and the arrow keys nudge it by 1 px (Shift for 10 px). Align to street-level corners rather than building tops, as the buildings stand above the table.
 4. Press K again to finish. The map is warped so the model's corners land on the crosshairs, and nothing is projected outside them.
 
-The calibration is saved in that browser. The calibration box also shows a link containing it; bookmark that link on the projector computer so the calibration can be restored anywhere. R resets it to the smart-city default.
+The calibration is saved in that browser. The calibration box also shows a link containing it; bookmark that link on the projector computer so the calibration can be restored anywhere. R resets it to the default.
 
 ## Data
 
@@ -110,4 +109,3 @@ To run your own copy, create a Render web service from a fork of this repository
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the data pipeline, heatmap aggregation and front end fit together
-- The docstring at the top of `app.py` explains the caching, memory limits and heatmap methodology in detail
