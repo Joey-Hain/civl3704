@@ -55,7 +55,7 @@ Connect each momentary button between its GPIO pin and GND; the firmware uses in
 | GPIO 14 (B) | Cycle through average delay, delay burden, not on time, speed and bus density |
 | GPIO 13 (C) | Show or hide bus markers |
 
-If no external buttons can be used use the corresponding keyboard keys for the same functionality
+If no external buttons are available, use the corresponding keyboard keys for the same functionality
 
 ## Visualisations
 
@@ -63,7 +63,12 @@ If no external buttons can be used use the corresponding keyboard keys for the s
 - **Heatmap metric:** The Heatmap section of the map menu offers five metrics. *Average delay* (0–5 min scale) and *Not on time* (share of readings outside the TfNSW on-time window, 0–60% scale) are drawn as an averaged field: colour is the local mean of readings within 250 m, shrunk toward the network average where data is thin so a single late bus can't paint a hotspot, and opacity shows how much data backs it. *Speed* (0–80 km/h; amber = CBD streets, pink = arterials, purple = motorways) is averaged the same way over 160 m. *Delay burden* (total bus-minutes late) and *Bus density* are additive heatmaps, so busy corridors rank high by design. The live layer shows each bus's current value. "About the heatmaps" under the map explains each metric.
 - **Historical heatmap:** Historical data can be viewed over the last hour, 24 hours or 7 days (the default), or a custom date range of up to 7 days within the last ~60 days, and filtered to a time of day (AM peak 06:00–10:00, midday 10:00–15:00, PM peak 15:00–19:00, evening 19:00–06:00). The map aggregates vehicle readings into geographic cells, so each coloured area represents activity within a small location rather than a single bus.
 - **Projector mode:** `/project` locks the map to the TransportLab model's extent and blacks out everything outside it. "Hide menu" (or the M key, or `?menu=0`) removes the menu so only the map is projected.
-- **Selected bus:** Clicking a bus draws its route (dashed behind the bus, solid ahead) and the stops it still has to serve. Each stop is coloured by the delay TfNSW currently predicts the bus will have there, using the same on-time window: blue on time, red late, green early, grey no prediction. The popup names the next stop and the last predicted stop, and says how much time the bus is expected to lose or recover by then. Hover a stop for its name and predicted delay. The route and stops refresh with each 15-second update and clear when the popup closes.
+- **Selected bus:** Clicking a bus draws its route (dashed behind the bus, solid ahead) and the stops it still has to serve. Each stop is coloured by the delay TfNSW currently predicts the bus will have there, using the same on-time window:
+  - blue on time
+  - red late
+  - green early
+  - grey no prediction.
+  The popup names the next stop and the last predicted stop, and says how much time the bus is expected to lose or recover by then. Hoverover  a stop for its name and predicted delay. The route and stops refresh with each 15-second update and clear when the popup closes.
 - **Operator and route tables:** These show the number of distinct bus readings, average delay, standard deviation of delay, percentage running on time, and the observed delay range. Routes can be sorted by delay, spread, or on-time percentage.
 - **Individual trips table:** This lists the trips with the largest current delays and identifies their route, operator, most recent stop, and delay status.
 
