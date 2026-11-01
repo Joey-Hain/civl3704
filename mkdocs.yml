@@ -1,0 +1,23 @@
+site_name: TfNSW Delay Board
+site_description: Documentation for the CIVL3704 live and historical bus dashboard.
+docs_dir: docs
+site_dir: site
+
+nav:
+  - Overview: index.md
+  - Architecture: ARCHITECTURE.md
+
+plugins:
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [.]
+          options:
+            docstring_style: google
+            members_order: source
+            show_root_heading: true
+            show_source: false
+
+markdown_extensions:
+  - pymdownx.snippets:
+      base_path: [.]

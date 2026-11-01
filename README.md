@@ -111,3 +111,13 @@ To run your own copy, create a Render web service from a fork of this repository
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the data pipeline, heatmap aggregation and front end fit together
+
+Build the MkDocs documentation (including the Python API and Pico firmware):
+
+```bash
+python -m pip install -r docs/requirements.txt
+python -m mkdocs build
+```
+
+Open `site/index.html` to view the generated page, or run `python -m mkdocs serve`
+to preview it locally.

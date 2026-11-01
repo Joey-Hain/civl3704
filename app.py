@@ -1,4 +1,14 @@
-"""Flask dashboard for live and historical TfNSW bus delay data."""
+"""Flask dashboard for live and historical TfNSW bus data.
+
+The module fetches GTFS-Realtime trip updates and vehicle positions, combines
+them with timetable and historical scrape data, and serves the dashboard and
+JSON API endpoints. Configuration is read from environment variables (or a
+local ``.env`` file); in particular, ``TFNSW_API_KEY`` is required for live
+TfNSW data.
+
+Run the development server with ``python app.py``. The Flask application
+object is also exposed as :data:`app` for WSGI servers such as Gunicorn.
+"""
 
 import codecs
 import csv
