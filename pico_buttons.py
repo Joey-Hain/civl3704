@@ -1,3 +1,18 @@
+"""MicroPython firmware for USB buttons that control the delay dashboard.
+
+Copy this file to a Raspberry Pi Pico as ``main.py``. Wire momentary buttons
+between GPIO 15, 14, and 13 respectively and GND; the internal pull-ups keep
+each input high while idle. When the dashboard computer has the USB keyboard
+interface open, a press sends the matching A, B, or C key:
+
+* A cycles the heatmap layer.
+* B cycles the heatmap metric.
+* C toggles bus markers.
+
+This is a continuously running device script, not a host-importable Python
+module: it depends on MicroPython's ``machine`` and ``usb`` modules.
+"""
+
 import time
 from machine import Pin
 import usb.device
@@ -18,7 +33,14 @@ usb.device.get().init(kb, builtin_driver=True)  # keeps the USB serial REPL avai
 
 
 def tap(key):
-    """Send one press and release, so the host never auto-repeats the key."""
+    """Send one USB key press followed by a release.
+
+    The short pause gives the host time to register the press while the
+    explicit release prevents the keyboard from repeating the key.
+
+    Args:
+        key: A ``KeyCode`` value accepted by ``KeyboardInterface.send_keys``.
+    """
     kb.send_keys([key])
     time.sleep_ms(20)
     kb.send_keys([])
