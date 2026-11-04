@@ -10,8 +10,8 @@ BUTTONS = [
     (13, KeyCode.C),
 ]
 
-# Internal pull-ups: pin reads 1 (HIGH) when idle, 0 (LOW) when pressed
-buttons = [(gp, Pin(gp, Pin.IN, Pin.PULL_UP), key) for gp, key in BUTTONS]
+# Internal pull-ups: pin reads 0 when idle, 1 when pressed
+buttons = [(gp, Pin(gp, Pin.IN, Pin.PULL_DOWN), key) for gp, key in BUTTONS]
 
 kb = KeyboardInterface()
 usb.device.get().init(kb, builtin_driver=True)  # keeps the USB serial REPL available
@@ -23,14 +23,13 @@ def tap(key):
     time.sleep_ms(20)
     kb.send_keys([])
 
-
 last = [1] * len(buttons)
 
 while True:
     readings = [pin.value() for gp, pin, key in buttons]
 
     if readings != last:
-        print(" ".join("GP{}={}".format(gp, "HIGH" if v else "LOW")
+        print(" ".join("GP{}={}".format(gp, "LOW" if v else "HIGH")
                        for (gp, pin, key), v in zip(buttons, readings)))
 
         if kb.is_open():
