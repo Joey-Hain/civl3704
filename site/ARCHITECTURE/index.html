@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="light">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="X-UA-Compatible" content="IE=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        
+        
+        
+        <link rel="shortcut icon" href="../img/favicon.ico">
+        <title>Architecture - TfNSW Delay Board</title>
+        <link href="../css/bootstrap.min.css" rel="stylesheet">
+        <link href="../css/fontawesome.min.css" rel="stylesheet">
+        <link href="../css/brands.min.css" rel="stylesheet">
+        <link href="../css/solid.min.css" rel="stylesheet">
+        <link href="../css/v4-font-face.min.css" rel="stylesheet">
+        <link href="../css/base.css" rel="stylesheet">
+        <link id="hljs-light" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" >
+        <link id="hljs-dark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github-dark.min.css" disabled>
+        <link href="../assets/_mkdocstrings.css" rel="stylesheet">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+        <script>hljs.highlightAll();</script> 
+    </head>
+
+    <body>
+        <div class="navbar fixed-top navbar-expand-lg navbar-dark bg-primary">
+            <div class="container">
+                <a class="navbar-brand" href="..">TfNSW Delay Board</a>
+                <!-- Expander button -->
+                <button type="button" class="navbar-toggler" data-bs-toggle="collapse" data-bs-target="#navbar-collapse" aria-controls="navbar-collapse" aria-expanded="false" aria-label="Toggle navigation">
+                    <span class="navbar-toggler-icon"></span>
+                </button>
+
+                <!-- Expanded navigation -->
+                <div id="navbar-collapse" class="navbar-collapse collapse">
+                        <!-- Main navigation -->
+                        <ul class="nav navbar-nav">
+                            <li class="nav-item">
+                                <a href=".." class="nav-link">Overview</a>
+                            </li>
+                            <li class="nav-item">
+                                <a href="./" class="nav-link active" aria-current="page">Architecture</a>
+                            </li>
+                        </ul>
+
+                    <ul class="nav navbar-nav ms-md-auto">
+                            <li class="nav-item">
+                                <a rel="prev" href=".." class="nav-link">
+                                    <i class="fa fa-arrow-left"></i> Previous
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a rel="next" class="nav-link disabled">
+                                    Next <i class="fa fa-arrow-right"></i>
+                                </a>
+                            </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="container">
+            <div class="row">
+                    <div class="col-md-3"><div class="navbar-expand-md bs-sidebar hidden-print affix" role="complementary">
+    <div class="navbar-header">
+        <button type="button" class="navbar-toggler collapsed" data-bs-toggle="collapse" data-bs-target="#toc-collapse" title="Table of Contents">
+            <span class="fa fa-angle-down"></span>
+        </button>
+    </div>
+
+    
+    <div id="toc-collapse" class="navbar-collapse collapse card bg-body-tertiary">
+        <ul class="nav flex-column">
+            
+            <li class="nav-item" data-bs-level="1"><a href="#application-architecture" class="nav-link">Application Architecture</a>
+              <ul class="nav flex-column">
+            <li class="nav-item" data-bs-level="2"><a href="#1-data-layer" class="nav-link">1. Data layer</a>
+              <ul class="nav flex-column">
+              </ul>
+            </li>
+            <li class="nav-item" data-bs-level="2"><a href="#2-processing-layer" class="nav-link">2. Processing layer</a>
+              <ul class="nav flex-column">
+              </ul>
+            </li>
+            <li class="nav-item" data-bs-level="2"><a href="#3-visualisation-layer" class="nav-link">3. Visualisation layer</a>
+              <ul class="nav flex-column">
+              </ul>
+            </li>
+              </ul>
+            </li>
+        </ul>
+    </div>
+</div></div>
+                    <div class="col-md-9" role="main">
+
+<h1 id="application-architecture">Application Architecture</h1>
+<p>The app is organised into three main layers:</p>
+<h2 id="1-data-layer">1. Data layer</h2>
+<ul>
+<li>Loads configuration and API credentials from <code>.env</code>.</li>
+<li>Fetches live trip updates from the TfNSW GTFS-realtime feed.</li>
+<li>Fetches live vehicle positions from the TfNSW vehicle-position feed.</li>
+<li>Downloads static GTFS schedule data for operator names and trip headsigns.</li>
+<li>Caches successfully loaded schedule data for the lifetime of the process and retries failed loads after a backoff period.</li>
+<li>Uses short-lived, lock-protected in-memory caches to reduce repeated API requests and prevent concurrent duplicate fetches.</li>
+<li>Reads the historical heatmap from pre-aggregated grid cells that the <code>gtfs-r-scrape</code> Action builds after every data push (<code>build_cells.py</code>, published to that repository's <code>cells</code> branch): one file per preset window (last 1, 24 and 168 hours of collected data, ending at the newest snapshot) and one per Sydney day, merged on the server for custom ranges of up to seven days. A preset window is a single conditional download (usually HTTP 304) and a few <code>array.frombytes</code> calls, so Render's small free-tier CPU never parses CSVs. Aggregating on GitHub's runners was needed once 5-minute collection made a week ~640k rows, more than the Render instance could parse within the 20-second heatmap deadline. If the <code>cells</code> branch is unavailable the server falls back to downloading and parsing the daily CSVs (<code>data/</code> and <code>data-local/</code>) itself, with a gzipped disk cache of finished days, one retry on HTTP 429/5xx, and an optional <code>GITHUB_TOKEN</code> for authenticated downloads.</li>
+<li>Heatmap responses are rounded, gzipped once per window build and served with an ETag, so a dashboard polling every five minutes gets HTTP 304 with no body until the data changes; other large responses (the page itself, <code>/api/vehicles</code>) are gzipped too.</li>
+<li>For a clicked bus, fetches only the matching shards of gtfs-r-scrape's per-trip lookup (<code>shapes/trips/NNN.json</code> for trip → shape, <code>shapes/geom/NNN.json</code> for the shape, shard = <code>zlib.crc32(id) % 128</code>) plus <code>shapes/stops.json</code> once, held in a bounded LRU cache so the full timetable never loads into the 512 MB instance.</li>
+</ul>
+<h2 id="2-processing-layer">2. Processing layer</h2>
+<ul>
+<li>Parses GTFS-realtime protobuf feeds.</li>
+<li>Extracts trip delays, routes, stops, operators and vehicle locations.</li>
+<li>Identifies anomalous delay readings.</li>
+<li>Selects the latest reading for each trip.</li>
+<li>Calculates delay statistics by operator and route.</li>
+<li>Joins vehicle positions with delays using <code>trip_id</code>.</li>
+<li>Applies route, stop, operator, anomaly and geographic-bound filters.</li>
+<li>Aggregates historical readings into geographic grid cells.</li>
+<li>Calculates historical heatmap values for average delay, delay burden (total lateness), % not on time (TfNSW KPI window, -59s to +5:59), speed and bus density. Average delay and % not on time are sent as raw per-cell values weighted by reading count, plus a network prior (<code>metric_prior</code>) the client uses for per-pixel empirical-Bayes shrinkage (<code>SHRINK_PRIOR_N</code>). Median and SD were tried and removed: at ~1.3 readings per cell they add nothing over the mean.</li>
+<li>Prepares vehicle data for both the dashboard and the <code>/api/vehicles</code> endpoint.</li>
+<li>Builds a selected trip's detail (<code>/api/trip/&lt;trip_id&gt;</code>): every remaining stop-time update for the trip from the cached live feed, in stop order with predicted delays, joined to stop names and locations and to the trip's timetable shape.</li>
+</ul>
+<h2 id="3-visualisation-layer">3. Visualisation layer</h2>
+<ul>
+<li>Flask serves the dashboard, <code>/api/vehicles</code>, <code>/api/heatmap</code> (<code>window=1|24|168</code> or <code>window=custom&amp;start=&amp;end=</code>), <code>/api/validation</code> (on-time running by operator from the scraped history, JSON or <code>&amp;format=csv</code>, for comparison with TfNSW's published results), <code>/api/route_shapes</code>, <code>/api/trip/&lt;trip_id&gt;</code>, <code>/status</code>, <code>/health</code> and <code>/ping</code> endpoints.</li>
+<li>Jinja renders summary tables for operators, routes and individual trips.</li>
+<li>Leaflet displays live vehicle markers on an interactive map.</li>
+<li>Marker outlines show whether a vehicle is on time, late, early or has no delay data.</li>
+<li>Clicking a marker draws that trip's route in its own pane between the heat layers and the markers, split at the vehicle's nearest shape vertex (dashed behind, solid with a white casing ahead), with upcoming stops coloured by predicted delay against the on-time window. The popup summarises the next stop, the last predicted stop and the expected change in delay; it refreshes with each vehicle poll and clears when the popup closes.</li>
+<li>Value metrics (average delay, % not on time, speed) render through a custom <code>FieldLayer</code>: a confidence- and Gaussian-weighted mean per pixel (normalised convolution) with opacity from data support, coloured with perceptually ordered ramps interpolated in OKLab. Density stays on Leaflet.heat, whose additive stacking is correct only for counts.</li>
+<li>Leaflet.heat displays the additive metrics (delay burden, bus density).</li>
+<li>An optional route mask clips both heat layers to the bus road network: <code>gtfs-r-scrape/build_route_shapes.py</code> (weekly GitHub Action) de-duplicates TfNSW GTFS <code>shapes.txt</code> within 12 km of the CBD into <code>shapes/route_shapes.json</code>; the app serves it gzipped from <code>/api/route_shapes</code> and the client strokes it with a <code>destination-in</code> composite after each heat redraw.</li>
+<li>Historical heatmaps support one-hour, 24-hour and seven-day (default) windows, plus custom ranges of up to seven days. The normal path downloads pre-aggregated cell files from the scraper's <code>cells</code> branch; preset windows use a single file, while custom ranges merge daily files. If those files are unavailable, raw daily CSVs are downloaded in parallel and parsed serially into one set of cells. This fallback keeps running sums and counts (including an off-time count for % not on time), not individual readings, and freezes completed windows into flat <code>array('d')</code> columns so memory scales with the number of cells. Time-of-day buckets (AM peak, midday, PM peak, evening) are accumulated in the same pass, and cached windows refresh automatically.</li>
+<li>JavaScript polls vehicle data every 15 seconds without reloading the tables.</li>
+<li>The <code>/project</code> view provides a non-interactive map locked to the TransportLab physical model's geographic bounds ("Projector mode" in the UI).</li>
+<li>Projector geometry: by default the model box is laid out as smart-city's <code>params.json5</code> does (full-width box at the model's 2:1 aspect, <code>vertical_offset</code> 50 px, <code>horizontal_scale</code> 1.184, shrunk uniformly if needed so all four corners stay on screen), computed from unrounded Web Mercator positions and applied through the same warp below.</li>
+<li>Projector calibration: a corner-pin warp (homography applied as a CSS <code>matrix3d</code> to the map) maps the model's four corners onto four draggable crosshairs, with an SVG mask blacking out everything outside them; saved per browser and shareable as a <code>?cal=</code> link.</li>
+<li>HTML, CSS and JavaScript provide the dashboard layout, filters, layer controls, legends, popups and loading/error states.</li>
+<li>The shared map script listens for USB HID keyboard keys A, B and C from <code>pico_buttons.py</code>: A cycles live/historical/no heatmap, B cycles all heatmap metrics, and C toggles bus-marker visibility.</li>
+</ul></div>
+            </div>
+        </div>
+
+        <footer class="col-md-12">
+            <hr>
+            <p>Documentation built with <a href="https://www.mkdocs.org/">MkDocs</a>.</p>
+        </footer>
+        <script src="../js/bootstrap.bundle.min.js"></script>
+        <script>
+            var base_url = "..",
+                shortcuts = {"help": 191, "next": 78, "previous": 80, "search": 83};
+        </script>
+        <script src="../js/base.js"></script>
+
+        <div class="modal" id="mkdocs_keyboard_modal" tabindex="-1" role="dialog" aria-labelledby="keyboardModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h4 class="modal-title" id="keyboardModalLabel">Keyboard Shortcuts</h4>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th style="width: 20%;">Keys</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="help shortcut"><kbd>?</kbd></td>
+                    <td>Open this help</td>
+                  </tr>
+                  <tr>
+                    <td class="next shortcut"><kbd>n</kbd></td>
+                    <td>Next page</td>
+                  </tr>
+                  <tr>
+                    <td class="prev shortcut"><kbd>p</kbd></td>
+                    <td>Previous page</td>
+                  </tr>
+                  <tr>
+                    <td class="search shortcut"><kbd>s</kbd></td>
+                    <td>Search</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="modal-footer">
+            </div>
+        </div>
+    </div>
+</div>
+
+    </body>
+</html>
