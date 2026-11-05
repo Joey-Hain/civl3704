@@ -55,10 +55,12 @@ HTTP endpoints. The reference below is generated from the Python docstrings.
 
 ## Pico button firmware
 
-Copy `pico_buttons.py` from the project root to a Raspberry Pi Pico as
-`main.py`. Wire momentary buttons between GPIO 15, 14, and 13 respectively
-and GND; the internal pull-ups keep each input high while idle. When the
-dashboard computer has the USB keyboard interface open, the buttons send:
+Copy `main.py` from the project root to a Raspberry Pi Pico. The firmware uses
+internal pull-downs, so wire normally-open momentary buttons between GPIO 15,
+14, or 13 and the Pico's 3V3 pin. The firmware sends the key on a
+falling edge, so with this wiring the action occurs when a button is released.
+If the USB keyboard is already open when the Pico starts, the firmware may
+also send each key once during startup. The buttons send:
 
 | Button | Dashboard action |
 |---|---|
@@ -71,7 +73,7 @@ firmware runs continuously on MicroPython and depends on hardware modules, so
 MkDocs includes its source instead of importing it:
 
 ```python
---8<-- "pico_buttons.py"
+--8<-- "main.py"
 ```
 
 ## Further reading

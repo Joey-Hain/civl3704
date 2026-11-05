@@ -10,7 +10,7 @@ BUTTONS = [
     (13, KeyCode.C),
 ]
 
-# Internal pull-ups: pin reads 0 when idle, 1 when pressed
+# Internal pull-downs: pin reads 0 when idle, 1 when pressed
 buttons = [(gp, Pin(gp, Pin.IN, Pin.PULL_DOWN), key) for gp, key in BUTTONS]
 
 kb = KeyboardInterface()

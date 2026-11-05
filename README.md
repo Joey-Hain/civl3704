@@ -28,6 +28,8 @@ python app.py
 
 Open [http://localhost:5000](http://localhost:5000) in a browser. The first page load after starting takes about 30 seconds while the bus timetable is downloaded; after that pages load immediately.
 
+![TfNSW Delay Board dashboard](Screenshot.png)
+
 ## Features
 
 - Live bus delay information, with on time defined by the TfNSW on-time running KPI (no more than 59 seconds early or 5 minutes 59 seconds late)
@@ -44,9 +46,9 @@ The dashboard automatically refreshes vehicle positions every 15 seconds and the
 
 ### External buttons
 
-The Pico firmware emulates a USB keyboard. Connect the Pico by USB to the computer displaying the dashboard, then copy [`pico_buttons.py`](pico_buttons.py) to the Pico as `main.py`. 
+The Pico firmware emulates a USB keyboard. Connect the Pico by USB to the computer displaying the dashboard, then copy [`main.py`](main.py) to the Pico.
 
-Connect each momentary button between its GPIO pin and GND; the firmware uses internal pull-ups.
+The firmware uses internal pull-downs, so connect each normally-open momentary button between its GPIO pin and the Pico's 3V3 pin (not GND). The firmware sends the key on the falling edge, so with this wiring the action occurs when the button is released. If the USB keyboard is already open when the Pico starts, the firmware may also send each key once during startup. If no external buttons are available, press A, B or C on the dashboard computer's keyboard for the same actions.
 
 | Button | Action |
 |---|---|
@@ -54,13 +56,17 @@ Connect each momentary button between its GPIO pin and GND; the firmware uses in
 | GPIO 14 (B) | Cycle through average delay, delay burden, not on time, speed and bus density |
 | GPIO 13 (C) | Show or hide bus markers |
 
-If no external buttons are available, use the corresponding keyboard keys for the same functionality
-
 ## Visualisations
 
 - **Live map:** Each marker represents a currently reporting bus. The label shows its route, and the arrow shows its direction of travel. Marker outlines indicate the bus status: white for on time (0:59 early to 5:59 late, matching the TfNSW on-time KPI), red for late, green for early, and grey when delay data is unavailable or anomalous.
-- **Heatmap metric:** The Heatmap section of the map menu offers five metrics. *Average delay* (0–5 min scale) and *Not on time* (share of readings outside the TfNSW on-time window, 0–60% scale) are drawn as an averaged field: colour is the local mean of readings within 250 m, shrunk toward the network average where data is thin so a single late bus can't paint a hotspot, and opacity shows how much data backs it. *Speed* (0–80 km/h; amber = CBD streets, pink = arterials, purple = motorways) is averaged the same way over 160 m. *Delay burden* (total bus-minutes late) and *Bus density* are additive heatmaps, so busy corridors rank high by design. The live layer shows each bus's current value. "About the heatmaps" under the map explains each metric.
-- **Historical heatmap:** Historical data can be viewed over the last hour, 24 hours or 7 days (the default), or a custom date range of up to 7 days within the last ~60 days, and filtered to a time of day (AM peak 06:00–10:00, midday 10:00–15:00, PM peak 15:00–19:00, evening 19:00–06:00). The map aggregates vehicle readings into geographic cells, so each coloured area represents activity within a small location rather than a single bus.
+- **Heatmap metrics:** The map menu offers five ways to view the live or historical data. The live layer colours each bus by its current value; the historical layer aggregates recorded vehicle readings over the selected time window and time of day. For the averaged metrics below, sparse readings are blended toward the network-wide average, and opacity indicates how much data supports the local estimate.
+  - *Average delay* is the mean positive delay within 250 m; early readings count as zero rather than offsetting late buses. Its colour scale runs from 0 to 5 minutes, with higher values capped at the top of the scale.
+  - *Not on time* is the share of readings within 250 m that fall outside the TfNSW window (more than 59 seconds early or more than 5 minutes 59 seconds late). It therefore includes both early and late buses. Its scale runs from 0 to 60%.
+  - *Speed* is the mean reported bus speed within 160 m, including readings while buses are stopped. Its scale runs from 0 to 80 km/h; colour represents speed, not road type (the historical ramp runs from amber at lower speeds to purple at higher speeds; the live ramp is green-to-blue).
+  - *Delay burden* adds positive delay across historical bus readings in each area. It is scaled so its total map weight matches Bus density: busy corridors may be bright, while an area brighter than its density suggests is contributing a larger share of late readings. On the live layer it highlights buses currently running late.
+  - *Bus density* counts recorded vehicle-position readings in each area. It shows where buses are most frequently observed, not the number of unique buses, passengers, or service quality; historical colours are relative within the selected time window.
+  "About the heatmaps" under the map provides the same metric guide.
+- **Historical heatmap:** Historical data can be viewed over the last hour, 24 hours or 7 days (the default), or a custom date range of up to 7 days within roughly the last two months, and filtered to a time of day (AM peak 06:00–10:00, midday 10:00–15:00, PM peak 15:00–19:00, evening 19:00–06:00). The map aggregates vehicle readings into geographic cells, so each coloured area represents activity within a small location rather than a single bus.
 - **Projector mode:** `/project` locks the map to the TransportLab model's extent and blacks out everything outside it. "Hide menu" (or the M key, or `?menu=0`) removes the menu so only the map is projected.
 - **Selected bus:** Clicking a bus draws its route (dashed behind the bus, solid ahead) and the stops it still has to serve. The popup names the next stop and the last predicted stop, and says how much time the bus is expected to lose or recover by then. Hoverover  a stop for its name and predicted delay. The route and stops refresh with each 15-second update and clear when the popup closes. Each stop is coloured by the delay TfNSW currently predicts the bus will have there, using the same on-time window:
   - blue on time
@@ -125,4 +131,3 @@ python -m mkdocs build
 Microsoft Visual C++ v14.0 or greater is required
 Open `site/index.html` to view the generated page, or run `python -m mkdocs serve`
 to preview it locally.
-

@@ -1914,7 +1914,7 @@ HEATMAP_SCRIPT = """\
       },
       speed: {
         label: 'Speed', kind: 'field', hist: 'PlasmaR', live: 'YlGnBu',
-        desc: 'Average bus speed within 160 m, including time stopped at stops and signals. Amber = CBD streets, pink = arterials, purple = motorways.',
+        desc: 'Average bus speed within 160 m, including readings while stopped. Colour represents speed, not road type: the historical ramp runs from amber at lower speeds to purple at higher speeds; the live ramp is green-to-blue.',
         radiusM: FIELD_RADIUS_M, fullSupport: 0.4,
         liveTitle: 'Live: current speed (km/h)',
         histTitle: 'Historical: average speed (km/h)',
@@ -3018,8 +3018,8 @@ PAGE = """
       <dt>Average delay</dt><dd>How late buses typically run in each area: mean lateness of readings within 250 m, with early running counted as on time (0). Where data is thin, the estimate is pulled toward the network average, so a single late bus can&rsquo;t create a hotspot. Scale 0&ndash;5 min.</dd>
       <dt>Delay burden</dt><dd>Where the most delay accumulates: total bus-minutes late, scaled to the same overall heat as Bus density. Busy corridors rank high even when each bus is only slightly late. An area hotter here than on Bus density carries more than its share of the network&rsquo;s delay.</dd>
       <dt>Not on time</dt><dd>Share of readings within 250 m that fall outside the TfNSW on-time window (0:59 early to 5:59 late), so early running counts as well as late. Thin data is pulled toward the network average. Scale 0&ndash;60%.</dd>
-      <dt>Speed</dt><dd>Average bus speed within 160 m, including time stopped at stops and signals. Amber = CBD streets, pink = arterials, purple = motorways. Scale 0&ndash;80 km/h.</dd>
-      <dt>Bus density</dt><dd>How many bus position readings were recorded in each area: where buses run most, not how well they run.</dd>
+      <dt>Speed</dt><dd>Average reported bus speed within 160 m, including readings while buses are stopped. Colour represents speed, not road type: the historical ramp runs from amber at lower speeds to purple at higher speeds, while the live ramp is green-to-blue. Scale 0&ndash;80 km/h.</dd>
+      <dt>Bus density</dt><dd>Number of recorded vehicle-position readings in each area, not unique buses or passengers. It shows where buses are most frequently observed, not how well they run; colour is relative within the selected window.</dd>
     </dl>
   </details>
 
