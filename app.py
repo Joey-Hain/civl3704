@@ -3083,6 +3083,8 @@ PAGE = """
   </table>
   <div class="table-note" data-table-note hidden></div>
 
+  <footer class="meta" style="margin-top:36px;"><a href="https://joeyhain.org/privacy" target="_blank" rel="noopener">Privacy →</a></footer>
+
   <script>
   // Sort rows in the browser and apply each table's row limit.
   (function () {

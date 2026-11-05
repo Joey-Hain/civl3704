@@ -16,7 +16,6 @@ Create a `.env` file in the project directory:
 
 ```env
 TFNSW_API_KEY=your_api_key_here
-TFNSW_GTFS_RT_URL=https://api.transport.nsw.gov.au/v1/gtfs/realtime/buses
 ```
 
 A TfNSW Open Data API key with access to the bus realtime trip update, vehicle position and timetable feeds is required. Never hardcode the key into a script; read it with `os.getenv("TFNSW_API_KEY")`.
@@ -123,6 +122,7 @@ Build the MkDocs documentation (including the Python API and Pico firmware):
 python -m pip install -r docs/requirements.txt
 python -m mkdocs build
 ```
-
+Microsoft Visual C++ v14.0 or greater is required
 Open `site/index.html` to view the generated page, or run `python -m mkdocs serve`
 to preview it locally.
+
