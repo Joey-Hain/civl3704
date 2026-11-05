@@ -122,6 +122,7 @@ Build the MkDocs documentation (including the Python API and Pico firmware):
 python -m pip install -r docs/requirements.txt
 python -m mkdocs build
 ```
-
+Microsoft Visual C++ v14.0 or greater is required
 Open `site/index.html` to view the generated page, or run `python -m mkdocs serve`
 to preview it locally.
+
