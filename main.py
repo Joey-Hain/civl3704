@@ -16,7 +16,6 @@ buttons = [(gp, Pin(gp, Pin.IN, Pin.PULL_DOWN), key) for gp, key in BUTTONS]
 kb = KeyboardInterface()
 usb.device.get().init(kb, builtin_driver=True)  # keeps the USB serial REPL available
 
-
 def tap(key):
     """Send one press and release, so the host never auto-repeats the key."""
     kb.send_keys([key])

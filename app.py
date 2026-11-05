@@ -132,7 +132,14 @@ SCHEDULE_RETRY_BACKOFF_SEC = 300
 #--------------------------------------------------------------------
 # Runtime helpers
 def time_of_day_bucket(ts):
-    """Return the Sydney-local heatmap period for a timestamp."""
+    """Return the Sydney-local heatmap period for a timestamp.
+
+    Args:
+        ts: Timestamp whose local hour determines the period.
+
+    Returns:
+        The matching heatmap period name.
+    """
     hour = ts.hour
     for name, (start, end) in TIME_PERIODS.items():
         if start < end:
@@ -144,12 +151,23 @@ def time_of_day_bucket(ts):
 
 
 def is_on_time(delay_sec):
-    """Return whether a delay falls within TfNSW's on-time window."""
+    """Return whether a delay falls within TfNSW's on-time window.
+
+    Args:
+        delay_sec: Delay in seconds.
+
+    Returns:
+        True when the delay is within the inclusive on-time limits.
+    """
     return ON_TIME_EARLY_SEC <= delay_sec <= ON_TIME_LATE_SEC
 
 
 def _trim_memory():
-    """Return freed memory to the operating system when libc supports it."""
+    """Return freed memory to the operating system when libc supports it.
+
+    Returns:
+        None.
+    """
     if _libc is not None:
         try:
             _libc.malloc_trim(0)
@@ -158,7 +176,11 @@ def _trim_memory():
 
 
 def _rss_mb():
-    """Return process resident memory in megabytes when available."""
+    """Return process resident memory in megabytes when available.
+
+    Returns:
+        Resident memory in MiB, or None when it cannot be read.
+    """
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -173,7 +195,15 @@ _last_rss_log = [0.0]
 
 
 def _log_rss_every(tag, period_sec=60):
-    """Log resident memory no more often than the configured interval."""
+    """Log resident memory no more often than the configured interval.
+
+    Args:
+        tag: Label included in the memory log entry.
+        period_sec: Minimum seconds between consecutive log entries.
+
+    Returns:
+        None.
+    """
     now = time.monotonic()
     if now - _last_rss_log[0] >= period_sec:
         _last_rss_log[0] = now
@@ -181,7 +211,14 @@ def _log_rss_every(tag, period_sec=60):
 
 
 def _log_rss(tag):
-    """Write process resident memory to the application log."""
+    """Write process resident memory to the application log.
+
+    Args:
+        tag: Label included in the memory log entry.
+
+    Returns:
+        None.
+    """
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -194,7 +231,17 @@ def _log_rss(tag):
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Return the great-circle distance between two coordinates in km."""
+    """Return the great-circle distance between two coordinates in km.
+
+    Args:
+        lat1: Latitude of the first coordinate in degrees.
+        lon1: Longitude of the first coordinate in degrees.
+        lat2: Latitude of the second coordinate in degrees.
+        lon2: Longitude of the second coordinate in degrees.
+
+    Returns:
+        Great-circle distance in kilometres.
+    """
     from math import radians, sin, cos, asin, sqrt
     r = 6371.0
     dlat = radians(lat2 - lat1)
@@ -204,7 +251,14 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def parse_ts(raw):
-    """Parse an ISO timestamp or Unix epoch into the Sydney time zone."""
+    """Parse an ISO timestamp or Unix epoch into the Sydney time zone.
+
+    Args:
+        raw: ISO-formatted timestamp or Unix epoch value.
+
+    Returns:
+        A Sydney-local datetime, or None if the value is empty or invalid.
+    """
     if raw is None:
         return None
     s = str(raw).strip()
@@ -243,7 +297,17 @@ _schedule_cache = {"agency_names": None, "trip_headsigns": None, "error": None, 
 
 
 def _download_to_path(url, headers, dest_path, timeout=90):
-    """Stream a successful HTTP response to a local file."""
+    """Stream a successful HTTP response to a local file.
+
+    Args:
+        url: Resource URL to download.
+        headers: HTTP request headers.
+        dest_path: Destination file path.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Number of bytes written to the destination.
+    """
     total = 0
     with requests.get(url, headers=headers, timeout=timeout, stream=True) as r:
         if r.status_code != 200:
@@ -261,7 +325,17 @@ def _download_to_path(url, headers, dest_path, timeout=90):
 
 
 def _parse_csv_member(zf, member, key_col, val_col):
-    """Read two selected columns from a GTFS CSV archive member."""
+    """Read two selected columns from a GTFS CSV archive member.
+
+    Args:
+        zf: Open ZIP archive containing the member.
+        member: Archive member name to parse.
+        key_col: Column used as each result key.
+        val_col: Column used as each result value.
+
+    Returns:
+        A mapping of non-empty values keyed by the selected key column.
+    """
     result = {}
     if member not in zf.namelist():
         return result
@@ -284,7 +358,14 @@ def _parse_csv_member(zf, member, key_col, val_col):
 
 
 def _do_schedule_download():
-    """Download the timetable archive and extract operator and trip lookups."""
+    """Download the timetable archive and extract operator and trip lookups.
+
+    Returns:
+        A tuple of agency names, trip headsigns, and an optional error value.
+
+    Raises:
+        RuntimeError: If the timetable download fails or contains no agencies.
+    """
     tmpdir = tempfile.mkdtemp(prefix="tfnsw_schedule_")
     try:
         outer_path = os.path.join(tmpdir, "schedule.zip")
@@ -330,7 +411,11 @@ def _do_schedule_download():
 
 
 def get_schedule_lookups():
-    """Return cached timetable lookups, retrying failed loads after a backoff."""
+    """Return cached timetable lookups, retrying failed loads after a backoff.
+
+    Returns:
+        A tuple of agency names, trip headsigns, and an optional error message.
+    """
     if _schedule_cache["agency_names"]:
         return (_schedule_cache["agency_names"],
                 _schedule_cache["trip_headsigns"],
@@ -370,7 +455,11 @@ def get_schedule_lookups():
 
 # Live-feed parsing
 def fetch_feed():
-    """Fetch and decode the live trip-update feed."""
+    """Fetch and decode the live trip-update feed.
+
+    Returns:
+        The decoded GTFS-Realtime trip-update feed.
+    """
     r = requests.get(FEED_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=15)
     r.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
@@ -379,7 +468,11 @@ def fetch_feed():
 
 
 def fetch_vehicle_feed():
-    """Fetch and decode the live vehicle-position feed."""
+    """Fetch and decode the live vehicle-position feed.
+
+    Returns:
+        The decoded GTFS-Realtime vehicle-position feed.
+    """
     r = requests.get(VEHICLE_POS_URL, headers={"Authorization": f"apikey {API_KEY}"}, timeout=15)
     r.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
@@ -388,7 +481,15 @@ def fetch_vehicle_feed():
 
 
 def extract_rows(feed, agency_names):
-    """Convert trip updates into stop-level delay records."""
+    """Convert trip updates into stop-level delay records.
+
+    Args:
+        feed: Decoded GTFS-Realtime trip-update feed.
+        agency_names: Mapping from agency IDs to operator names.
+
+    Returns:
+        A list of delay records for stops with reported arrival or departure delays.
+    """
     pulled_at = datetime.now(tz=SYDNEY_TZ).isoformat()
     rows = []
     for entity in feed.entity:
@@ -418,7 +519,14 @@ def extract_rows(feed, agency_names):
 
 
 def latest_reading_per_trip(rows):
-    """Select the earliest remaining stop update for each trip."""
+    """Select the earliest remaining stop update for each trip.
+
+    Args:
+        rows: Iterable of stop-level delay records.
+
+    Returns:
+        A mapping from trip ID to its record with the lowest stop sequence.
+    """
     latest = {}
     for r in rows:
         existing = latest.get(r["trip_id"])
@@ -428,7 +536,16 @@ def latest_reading_per_trip(rows):
 
 
 def extract_vehicles(feed, agency_names, trip_headsigns=None):
-    """Convert vehicle-position entities into dashboard vehicle records."""
+    """Convert vehicle-position entities into dashboard vehicle records.
+
+    Args:
+        feed: Decoded GTFS-Realtime vehicle-position feed.
+        agency_names: Mapping from agency IDs to operator names.
+        trip_headsigns: Optional mapping from trip IDs to destination text.
+
+    Returns:
+        A list of dashboard records for entities with vehicle positions.
+    """
     trip_headsigns = trip_headsigns or {}
     vehicles = []
     for entity in feed.entity:
@@ -456,7 +573,15 @@ def extract_vehicles(feed, agency_names, trip_headsigns=None):
 
 
 def merge_vehicle_delays(vehicles, delay_by_trip):
-    """Attach trip delay data and status colours to vehicle records."""
+    """Attach trip delay data and status colours to vehicle records.
+
+    Args:
+        vehicles: Mutable vehicle records to update in place.
+        delay_by_trip: Mapping from trip IDs to their latest delay records.
+
+    Returns:
+        None. The vehicle records are modified in place.
+    """
     for veh in vehicles:
         veh["fill_color"] = COLOR_FILL
         d = delay_by_trip.get(veh["trip_id"])
@@ -483,7 +608,15 @@ def merge_vehicle_delays(vehicles, delay_by_trip):
 
 
 def summarise(rows, key):
-    """Calculate delay and on-time statistics grouped by a row field."""
+    """Calculate delay and on-time statistics grouped by a row field.
+
+    Args:
+        rows: Delay records to aggregate.
+        key: Record field used to form groups.
+
+    Returns:
+        A list of per-group counts, delay statistics, and on-time percentages.
+    """
     grouped = defaultdict(list)
     for r in rows:
         grouped[r[key]].append(r["delay"])
@@ -503,7 +636,15 @@ def summarise(rows, key):
 
 
 def split_route(route_id, agency_names):
-    """Split a route identifier into its route number and operator."""
+    """Split a route identifier into its route number and operator.
+
+    Args:
+        route_id: Route identifier, optionally prefixed by an agency ID.
+        agency_names: Mapping from agency IDs to operator names.
+
+    Returns:
+        A tuple containing the route number and operator name.
+    """
     if "_" not in route_id:
         return route_id, ""
     agency_id, route_num = route_id.split("_", 1)
@@ -530,7 +671,12 @@ _trip_lookup_lock = threading.Lock()
 
 
 def get_all_rows_cached():
-    """Return cached trip-update rows, fetching fresh feeds when stale."""
+    """Return cached trip-update rows, fetching fresh feeds when stale.
+
+    Returns:
+        A tuple of delay rows, agency names, trip headsigns, and an optional
+        schedule-loading error message.
+    """
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _rows_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -556,7 +702,15 @@ def get_all_rows_cached():
 
 
 def get_vehicles_cached(agency_names, trip_headsigns):
-    """Return cached vehicle records joined to the current delay feed."""
+    """Return cached vehicle records joined to the current delay feed.
+
+    Args:
+        agency_names: Mapping from agency IDs to operator names.
+        trip_headsigns: Mapping from trip IDs to destination text.
+
+    Returns:
+        A copy of the cached or freshly fetched vehicle records.
+    """
     now = datetime.now(tz=SYDNEY_TZ)
     cached_at = _vehicles_cache["fetched_at"]
     if cached_at is not None and (now - cached_at).total_seconds() < CACHE_TTL_SECONDS:
@@ -586,16 +740,36 @@ class CellGrid:
     __slots__ = ("index", "cols")
 
     def __init__(self):
-        """Initialize empty cell indexes and metric columns."""
+        """Initialize empty cell indexes and metric columns.
+
+        Returns:
+            None.
+        """
         self.index = {}
         self.cols = [array("d") for _ in range(_CELL_COLS)]
 
     def __len__(self):
-        """Return the number of cells in the grid."""
+        """Return the number of cells in the grid.
+
+        Returns:
+            Number of aggregated cells.
+        """
         return len(self.cols[0])
 
     def add(self, key, lat, lon, delay_sec, speed_kmh, off_time):
-        """Add one vehicle reading to its cell's metric totals."""
+        """Add one vehicle reading to its cell's metric totals.
+
+        Args:
+            key: Packed coordinate key identifying the grid cell.
+            lat: Vehicle latitude in degrees.
+            lon: Vehicle longitude in degrees.
+            delay_sec: Delay in seconds, or None when unavailable.
+            speed_kmh: Speed in kilometres per hour, or None when unavailable.
+            off_time: Whether the reading is outside the on-time window.
+
+        Returns:
+            None. The cell's aggregate columns are updated in place.
+        """
         i = self.index.get(key)
         cols = self.cols
         if i is None:
@@ -616,7 +790,15 @@ class CellGrid:
             cols[N_SPEED][i] += 1
 
     def add_cells(self, keys, cols):
-        """Merge pre-aggregated cells into this grid."""
+        """Merge pre-aggregated cells into this grid.
+
+        Args:
+            keys: Packed coordinate keys for the source cells.
+            cols: Parallel source metric columns corresponding to those keys.
+
+        Returns:
+            None. The grid's aggregate columns are updated in place.
+        """
         index, mine = self.index, self.cols
         for j, key in enumerate(keys):
             i = index.get(key)
@@ -629,17 +811,29 @@ class CellGrid:
                     c[i] += src[j]
 
     def freeze(self):
-        """Drop the mutable index after aggregation is complete."""
+        """Drop the mutable index after aggregation is complete.
+
+        Returns:
+            This grid, with its mutable key index released.
+        """
         self.index = None
         return self
 
     def rows(self):
-        """Iterate over cells as tuples of metric columns."""
+        """Iterate over cells as tuples of metric columns.
+
+        Returns:
+            An iterator yielding one tuple of aggregate values per cell.
+        """
         return zip(*self.cols)
 
 
 def _new_period_cells():
-    """Create one empty grid for each heatmap time period."""
+    """Create one empty grid for each heatmap time period.
+
+    Returns:
+        A mapping from each valid period name to an empty cell grid.
+    """
     return {p: CellGrid() for p in VALID_HEATMAP_PERIODS}
 
 
@@ -647,7 +841,15 @@ _GRID_SCALE = 10 ** GRID_DECIMALS
 
 
 def _cell_key(lat, lon):
-    """Pack rounded coordinates into one integer cell key."""
+    """Pack rounded coordinates into one integer cell key.
+
+    Args:
+        lat: Latitude in degrees.
+        lon: Longitude in degrees.
+
+    Returns:
+        Integer key for the rounded coordinate cell.
+    """
     return round(lat * _GRID_SCALE) * 10_000_000 + round(lon * _GRID_SCALE)
 
 
@@ -664,12 +866,29 @@ _missing_files = {}
 
 
 def _day_cache_path(base, date_str):
-    """Return the local cache path for one source and date."""
+    """Return the local cache path for one source and date.
+
+    Args:
+        base: Base URL identifying the daily-data source.
+        date_str: Date string identifying the daily file.
+
+    Returns:
+        Path to the compressed local cache file.
+    """
     return HEATMAP_DISK_CACHE_DIR / f"{base.rsplit('/', 1)[-1]}_{date_str}.csv.gz"
 
 
 def _retry_after_sec(resp, default=2.0, cap=5.0):
-    """Return a bounded retry delay from an HTTP response."""
+    """Return a bounded retry delay from an HTTP response.
+
+    Args:
+        resp: HTTP response whose Retry-After header may set the delay.
+        default: Delay used when the header is absent or invalid.
+        cap: Maximum delay in seconds.
+
+    Returns:
+        Retry delay in seconds, capped at the configured maximum.
+    """
     try:
         return min(float(resp.headers.get("Retry-After", default)), cap)
     except (TypeError, ValueError):
@@ -677,7 +896,16 @@ def _retry_after_sec(resp, default=2.0, cap=5.0):
 
 
 def _download_day(date_str, base, mutable):
-    """Download one daily CSV to the compressed disk cache when needed."""
+    """Download one daily CSV to the compressed disk cache when needed.
+
+    Args:
+        date_str: Date identifying the daily CSV.
+        base: Base URL of the data source.
+        mutable: Whether the source file may still be changing.
+
+    Returns:
+        A tuple of date, cached path or None, and optional error message.
+    """
     path = _day_cache_path(base, date_str)
     if not mutable and path.exists():
         return date_str, path, None
@@ -718,7 +946,15 @@ def _download_day(date_str, base, mutable):
 
 
 def _prune_disk_cache(keep_days=None):
-    """Remove cached daily CSVs older than the configured retention period."""
+    """Remove cached daily CSVs older than the configured retention period.
+
+    Args:
+        keep_days: Number of recent days to retain; defaults to the supported
+            custom-window lookback plus a buffer.
+
+    Returns:
+        None.
+    """
     if keep_days is None:
         keep_days = CUSTOM_WINDOW_LOOKBACK_DAYS + 2
     cutoff = (datetime.now(tz=SYDNEY_TZ).date() - timedelta(days=keep_days)).isoformat()
@@ -731,7 +967,19 @@ def _prune_disk_cache(keep_days=None):
 
 
 def _fetch_one_day_into(date_str, path, cutoff, cells_by_period, end=None, agency_stats=None):
-    """Stream one compressed daily CSV into period grids and validation totals."""
+    """Stream one compressed daily CSV into period grids and validation totals.
+
+    Args:
+        date_str: Date identifying the input file.
+        path: Path to the compressed daily CSV.
+        cutoff: Inclusive earliest timestamp to aggregate.
+        cells_by_period: Mutable grids to receive all-day and period readings.
+        end: Optional exclusive latest timestamp to aggregate.
+        agency_stats: Optional mutable per-agency validation totals.
+
+    Returns:
+        A tuple of date, CSV rows seen, points added, and an optional error.
+    """
     rows_seen = 0
     points_added = 0
     grid_all = cells_by_period["all"]
@@ -808,7 +1056,17 @@ def _fetch_one_day_into(date_str, path, cutoff, cells_by_period, end=None, agenc
 
 
 def fetch_historical_cells(window_hours=None, start_dt=None, end_dt=None):
-    """Fetch and aggregate raw daily CSVs for a historical window."""
+    """Fetch and aggregate raw daily CSVs for a historical window.
+
+    Args:
+        window_hours: Preset lookback duration in hours, used when start_dt is
+            not supplied.
+        start_dt: Optional inclusive start of a custom window.
+        end_dt: Optional exclusive end of a custom window.
+
+    Returns:
+        Aggregated grids and metadata describing the files, rows, and errors.
+    """
     start = time.monotonic()
     now = datetime.now(tz=SYDNEY_TZ)
     if start_dt is None:
@@ -898,7 +1156,15 @@ _cells_state = {}
 
 
 def _fetch_cells_file(path, immutable=False):
-    """Fetch one pre-aggregated cells file with a local conditional cache."""
+    """Fetch one pre-aggregated cells file with a local conditional cache.
+
+    Args:
+        path: Relative path of the published cells file.
+        immutable: Whether a local copy can be reused without revalidation.
+
+    Returns:
+        A tuple of the local path if available and an optional fetch error.
+    """
     local = HEATMAP_DISK_CACHE_DIR / "cells" / path
     st = _cells_state.get(path)
     now = time.monotonic()
@@ -944,7 +1210,15 @@ def _fetch_cells_file(path, immutable=False):
 
 
 def _read_cells_file(local, keep_keys=False):
-    """Decode a compressed pre-aggregated cells file."""
+    """Decode a compressed pre-aggregated cells file.
+
+    Args:
+        local: Path to the compressed cells file.
+        keep_keys: Whether to include each grid's packed cell keys.
+
+    Returns:
+        A tuple of the file header and period grids with optional keys.
+    """
     with gzip.open(local, "rb") as f:
         data = f.read()
     if not data.startswith(CELLS_MAGIC):
@@ -976,7 +1250,21 @@ def _read_cells_file(local, keep_keys=False):
 
 
 def _cells_meta(cells, agency_stats, files, rows, errors, lost, version, data_end=None):
-    """Build the common metadata structure for aggregated cell windows."""
+    """Build the common metadata structure for aggregated cell windows.
+
+    Args:
+        cells: Aggregated grids indexed by heatmap period.
+        agency_stats: Per-agency validation totals.
+        files: Number of source files represented.
+        rows: Number of source rows represented.
+        errors: Fetch or parsing error messages.
+        lost: Number of unavailable source files.
+        version: Identifier for the aggregate data build.
+        data_end: Optional timestamp marking the end of source data.
+
+    Returns:
+        Normalized metadata dictionary for the aggregated window.
+    """
     for p in VALID_HEATMAP_PERIODS:
         cells.setdefault(p, CellGrid().freeze())
     return {
@@ -995,7 +1283,15 @@ def _cells_meta(cells, agency_stats, files, rows, errors, lost, version, data_en
 
 
 def cells_from_prebuilt(window, previous=None):
-    """Load pre-aggregated window cells or return None for raw-data fallback."""
+    """Load pre-aggregated window cells or return None for raw-data fallback.
+
+    Args:
+        window: Preset or custom historical window to load.
+        previous: Optional prior metadata to reuse when its data is unchanged.
+
+    Returns:
+        Aggregated metadata, or None when raw daily data should be used instead.
+    """
     start = time.monotonic()
     if not window.is_custom:
         local, err = _fetch_cells_file(f"windows/{window.hours}.bin.gz")
@@ -1059,12 +1355,27 @@ def cells_from_prebuilt(window, previous=None):
 
 
 def compute_metric_points(cells, metric):
-    """Convert aggregated cells into compact points for one metric."""
+    """Convert aggregated cells into compact points for one metric.
+
+    Args:
+        cells: Grid of aggregated readings.
+        metric: Heatmap metric to calculate.
+
+    Returns:
+        Compact coordinate and metric-value lists for the heatmap.
+    """
     return [_compact_point(p) for p in _compute_metric_points(cells, metric)]
 
 
 def _compact_point(p):
-    """Round a heatmap point to reduce response size."""
+    """Round a heatmap point to reduce response size.
+
+    Args:
+        p: Heatmap point containing coordinates, value, and optional count.
+
+    Returns:
+        Point list with rounded coordinates and metric values.
+    """
     out = [round(p[0], 5), round(p[1], 5), round(p[2], 4)]
     if len(p) > 3:
         out.append(int(p[3]) if p[3] >= 1 else round(p[3], 3))
@@ -1072,7 +1383,16 @@ def _compact_point(p):
 
 
 def _compute_metric_points(cells, metric):
-    """Calculate normalized heatmap values and confidence from cell totals."""
+    """Calculate normalized heatmap values and confidence from cell totals.
+
+    Args:
+        cells: Grid of aggregated readings.
+        metric: Heatmap metric to calculate.
+
+    Returns:
+        Uncompacted point lists containing coordinates, normalized values,
+        and any metric-specific sample counts or confidence values.
+    """
     if metric == "density":
         # Normalize counts by the busiest cell; counts already encode support.
         eligible = [c for c in cells.rows() if c[2] > 0]
@@ -1122,7 +1442,16 @@ def _compute_metric_points(cells, metric):
 
 
 def metric_prior(cells, metric):
-    """Return the network-wide metric prior and shrinkage sample count."""
+    """Return the network-wide metric prior and shrinkage sample count.
+
+    Args:
+        cells: Grid of aggregated readings.
+        metric: Heatmap metric for which to calculate the prior.
+
+    Returns:
+        A two-item list of normalized network prior and sample count, or None
+        when the metric has no applicable prior or data.
+    """
     n = sum(cells.cols[N_DELAY])
     if not n:
         return None
@@ -1145,21 +1474,43 @@ class WindowSpec:
     """Describe a preset or custom historical data window."""
 
     def __init__(self, hours=None, start_date=None, end_date=None):
-        """Create a preset or custom window specification."""
+        """Create a preset or custom window specification.
+
+        Args:
+            hours: Preset lookback duration, or None for a custom date range.
+            start_date: Inclusive start date for a custom window.
+            end_date: Inclusive end date for a custom window.
+
+        Returns:
+            None.
+        """
         self.hours, self.start_date, self.end_date = hours, start_date, end_date
 
     @property
     def key(self):
-        """Return the stable cache key for this window."""
+        """Return the stable cache key for this window.
+
+        Returns:
+            Preset hour count or custom-range date key.
+        """
         return self.hours if self.hours is not None else f"{self.start_date}..{self.end_date}"
 
     @property
     def is_custom(self):
-        """Return whether this window uses explicit dates."""
+        """Return whether this window uses explicit dates.
+
+        Returns:
+            True for a custom date range, otherwise False.
+        """
         return self.hours is None
 
     def bounds(self):
-        """Return the inclusive start and exclusive end timestamps."""
+        """Return the inclusive start and exclusive end timestamps.
+
+        Returns:
+            A pair of Sydney-local boundary datetimes for custom windows, or
+            (None, None) for preset windows.
+        """
         if not self.is_custom:
             return None, None
         start = datetime.combine(self.start_date, datetime.min.time(), tzinfo=SYDNEY_TZ)
@@ -1167,7 +1518,11 @@ class WindowSpec:
         return start, end
 
     def ttl(self):
-        """Return the cache lifetime appropriate for this window."""
+        """Return the cache lifetime appropriate for this window.
+
+        Returns:
+            Cache lifetime in seconds.
+        """
         if self.is_custom:
             # A range that ended before today only changes if local data is
             # pushed for it; one that includes today keeps refreshing.
@@ -1176,7 +1531,11 @@ class WindowSpec:
         return HEATMAP_WINDOW_CACHE_TTL_LONG_SECONDS if self.hours >= 168 else HEATMAP_WINDOW_CACHE_TTL_SECONDS
 
     def describe(self):
-        """Return a display label for this window."""
+        """Return a display label for this window.
+
+        Returns:
+            Human-readable label for the preset or custom date range.
+        """
         if self.is_custom:
             return f"{self.start_date:%d %b %Y} to {self.end_date:%d %b %Y}"
         return {1: "last hour", 24: "last 24 hours", 168: "last 7 days"}.get(
@@ -1191,7 +1550,14 @@ CUSTOM_CACHE_MAX_ENTRIES = 4  # bound memory: each cached window holds its cells
 
 
 def parse_window_args(args):
-    """Parse heatmap window query parameters and report invalid input."""
+    """Parse heatmap window query parameters and report invalid input.
+
+    Args:
+        args: Mapping of request query parameters.
+
+    Returns:
+        A tuple containing a WindowSpec or None and an error message or None.
+    """
     w = args.get("window", str(HEATMAP_DEFAULT_WINDOW))
     if w != "custom":
         try:
@@ -1221,12 +1587,30 @@ HEATMAP_RETRY_AFTER_FAILURE_SEC = 60
 
 
 def _is_fresh(entry, ttl, now):
-    """Return whether a cached entry is within its time-to-live."""
+    """Return whether a cached entry is within its time-to-live.
+
+    Args:
+        entry: Cached metadata containing its fetch timestamp.
+        ttl: Default expiration interval in seconds.
+        now: Current timestamp used for the age calculation.
+
+    Returns:
+        True when the cached entry has not expired.
+    """
     return (now - entry["fetched_at"]).total_seconds() < entry.get("ttl_override", ttl)
 
 
 def _store_window(key, window, meta):
-    """Store aggregated window metadata and enforce cache limits."""
+    """Store aggregated window metadata and enforce cache limits.
+
+    Args:
+        key: Cache key for the window.
+        window: Window specification used to apply custom-cache limits.
+        meta: Aggregated window metadata to cache.
+
+    Returns:
+        None.
+    """
     if window.is_custom:
         custom_keys = [k for k in _heatmap_cells_cache if isinstance(k, str) and k != key]
         while len(custom_keys) >= CUSTOM_CACHE_MAX_ENTRIES:
@@ -1237,7 +1621,14 @@ def _store_window(key, window, meta):
 
 
 def get_historical_cells_cached(window):
-    """Return cached aggregated cells, rebuilding stale windows as needed."""
+    """Return cached aggregated cells, rebuilding stale windows as needed.
+
+    Args:
+        window: WindowSpec or preset lookback duration in hours.
+
+    Returns:
+        Aggregated cell grids and associated window metadata.
+    """
     if not isinstance(window, WindowSpec):
         window = WindowSpec(window)
     key, ttl = window.key, window.ttl()
@@ -1297,7 +1688,17 @@ def get_historical_cells_cached(window):
 
 
 def get_heatmap_points_cached(window, metric, period="all"):
-    """Return heatmap points for a window, metric, and period."""
+    """Return heatmap points for a window, metric, and period.
+
+    Args:
+        window: WindowSpec describing the requested historical range.
+        metric: Heatmap metric name.
+        period: Heatmap time-of-day period name.
+
+    Returns:
+        A tuple of compact points, an optional status note, and an optional
+        metric prior.
+    """
     if metric not in VALID_HEATMAP_METRICS:
         metric = "delay"
     if period not in VALID_HEATMAP_PERIODS:
@@ -1331,7 +1732,16 @@ def get_heatmap_points_cached(window, metric, period="all"):
 
 
 def compute_delay_data(args):
-    """Fetch, filter, and summarize the live trip-update feed."""
+    """Fetch, filter, and summarize the live trip-update feed.
+
+    Args:
+        args: Mapping of dashboard query parameters controlling filters,
+            sorting, anomaly visibility, and map bounds.
+
+    Returns:
+        Dictionary of filtered trip rows, lookup data, filter state, and
+        options used by dashboard views.
+    """
     hide_anomalies = args.get("hide_anomalies", "1") == "1"
     sort_key = args.get("sort", "stdev_min")
     ascending = args.get("asc") == "1"
@@ -1371,7 +1781,14 @@ def compute_delay_data(args):
 
 
 def compute_vehicles(data):
-    """Join live vehicle locations to trip delays and apply map filters."""
+    """Join live vehicle locations to trip delays and apply map filters.
+
+    Args:
+        data: Live delay data and filter state returned by compute_delay_data.
+
+    Returns:
+        A tuple of filtered vehicle records and an optional fetch error message.
+    """
     try:
         vehicles = get_vehicles_cached(data["agency_names"], data["trip_headsigns"])
     except requests.RequestException as e:
@@ -2452,7 +2869,14 @@ HEATMAP_SCRIPT = """\
 
 
 def render_map_script(map_init_js):
-    """Insert page-specific map initialization into the shared map script."""
+    """Insert page-specific map initialization into the shared map script.
+
+    Args:
+        map_init_js: JavaScript that initializes the page-specific map.
+
+    Returns:
+        Combined map initialization and shared map script.
+    """
     return map_init_js + "\n" + HEATMAP_SCRIPT
 
 
@@ -3189,7 +3613,14 @@ PROJECT_PAGE = """
 
 # Flask views
 def _fmt_pulled(iso):
-    """Format a feed timestamp in Sydney local time."""
+    """Format a feed timestamp in Sydney local time.
+
+    Args:
+        iso: ISO-formatted timestamp string.
+
+    Returns:
+        Sydney-local display string, or the original value if it is invalid.
+    """
     try:
         t = datetime.fromisoformat(iso).astimezone(SYDNEY_TZ)
     except (TypeError, ValueError):
@@ -3199,7 +3630,11 @@ def _fmt_pulled(iso):
 
 @app.route("/project")
 def project():
-    """Render the projector-locked map view."""
+    """Render the projector-locked map view.
+
+    Returns:
+        Flask response containing the projector page or a configuration error.
+    """
     if not API_KEY:
         return "TFNSW_API_KEY not set in .env", 500
     data = compute_delay_data(request.args)
@@ -3226,7 +3661,14 @@ _GZIP_TYPES = ("text/html", "application/json", "text/csv", "text/plain", "appli
 
 @app.after_request
 def _gzip_response(resp):
-    """Compress eligible large text responses for HTTP delivery."""
+    """Compress eligible large text responses for HTTP delivery.
+
+    Args:
+        resp: Flask response to conditionally compress.
+
+    Returns:
+        The response, gzip-compressed when the request and response qualify.
+    """
     try:
         if (resp.status_code != 200 or resp.direct_passthrough
                 or "Content-Encoding" in resp.headers
@@ -3246,19 +3688,31 @@ def _gzip_response(resp):
 
 @app.route("/ping")
 def ping():
-    """Return the lightweight deployment health-check response."""
+    """Return the lightweight deployment health-check response.
+
+    Returns:
+        Plain-text pong response and HTTP 200 status.
+    """
     return "pong", 200
 
 
 @app.route("/health")
 def health():
-    """Return the basic application health response."""
+    """Return the basic application health response.
+
+    Returns:
+        Plain-text ok response and HTTP 200 status.
+    """
     return "ok", 200
 
 
 @app.route("/status")
 def status():
-    """Return schedule, memory, and heatmap-cache diagnostics."""
+    """Return schedule, memory, and heatmap-cache diagnostics.
+
+    Returns:
+        Flask JSON response containing current application diagnostics.
+    """
     heatmap_state = {}
     for wh, entry in _heatmap_cells_cache.items():
         heatmap_state[str(wh)] = {
@@ -3286,7 +3740,11 @@ def status():
 
 @app.route("/")
 def dashboard():
-    """Render the live dashboard and its current tables and map."""
+    """Render the live dashboard and its current tables and map.
+
+    Returns:
+        Flask response containing the dashboard or a configuration error.
+    """
     if not API_KEY:
         return "TFNSW_API_KEY not set in .env", 500
 
@@ -3328,7 +3786,11 @@ def dashboard():
 
 @app.route("/api/vehicles")
 def api_vehicles():
-    """Return live vehicle positions with current delay data."""
+    """Return live vehicle positions with current delay data.
+
+    Returns:
+        Flask JSON response containing vehicle records and any fetch error.
+    """
     if not API_KEY:
         return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
     data = compute_delay_data(request.args)
@@ -3337,7 +3799,11 @@ def api_vehicles():
 
 
 def get_route_shapes_gz():
-    """Return cached gzipped route shapes or fetch the published geometry."""
+    """Return cached gzipped route shapes or fetch the published geometry.
+
+    Returns:
+        Gzipped route-shape JSON, or None when no valid geometry is available.
+    """
     now = time.monotonic()
     if _route_shapes_cache["gz"] and now - _route_shapes_cache["fetched_at"] < ROUTE_SHAPES_CACHE_TTL_SECONDS:
         return _route_shapes_cache["gz"]
@@ -3362,7 +3828,11 @@ def get_route_shapes_gz():
 
 @app.route("/api/route_shapes")
 def api_route_shapes():
-    """Serve the published bus route geometry."""
+    """Serve the published bus route geometry.
+
+    Returns:
+        Flask JSON response containing route geometry or an unavailable notice.
+    """
     gz = get_route_shapes_gz()
     if gz is None:
         return jsonify({"lines": [], "error": "Route shapes not built yet"})
@@ -3377,7 +3847,15 @@ def api_route_shapes():
 
 
 def _fetch_scrape_json(path, timeout=20):
-    """Fetch and decode a JSON file from the scraper's shapes directory."""
+    """Fetch and decode a JSON file from the scraper's shapes directory.
+
+    Args:
+        path: Relative path of the JSON file.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Decoded JSON data, or None when fetching or decoding fails.
+    """
     url = f"{TRIP_LOOKUP_BASE}/{path}"
     try:
         r = requests.get(url, headers=RAW_HEADERS, timeout=timeout)
@@ -3395,7 +3873,11 @@ def _fetch_scrape_json(path, timeout=20):
 
 
 def get_trip_lookup_meta():
-    """Return lookup shard metadata and stop locations."""
+    """Return lookup shard metadata and stop locations.
+
+    Returns:
+        A tuple of shard count and stop lookup mapping.
+    """
     now = time.monotonic()
     c = _trip_meta_cache
     if c["n_shards"] and now - c["fetched_at"] < TRIP_LOOKUP_TTL_SECONDS:
@@ -3419,7 +3901,16 @@ def get_trip_lookup_meta():
 
 
 def _get_trip_shard(kind, key, n_shards):
-    """Return a cached lookup shard, fetching and caching it when absent."""
+    """Return a cached lookup shard, fetching and caching it when absent.
+
+    Args:
+        kind: Lookup category, such as trips or geometry.
+        key: Trip or shape identifier used to select a shard.
+        n_shards: Number of shards in the lookup dataset.
+
+    Returns:
+        Decoded shard data, a stale cached shard, or None when unavailable.
+    """
     k = zlib.crc32(key.encode("utf-8")) % n_shards
     ck = (kind, k)
     now = time.monotonic()
@@ -3440,7 +3931,14 @@ def _get_trip_shard(kind, key, n_shards):
 
 
 def compute_trip_detail(trip_id):
-    """Build the route and predicted upcoming stops for one live trip."""
+    """Build the route and predicted upcoming stops for one live trip.
+
+    Args:
+        trip_id: Identifier of the trip to describe.
+
+    Returns:
+        Dictionary containing trip route metadata, shape status, and stop data.
+    """
     all_rows, agency_names, trip_headsigns, _ = get_all_rows_cached()
     n_shards, stops_lookup = get_trip_lookup_meta()
 
@@ -3494,7 +3992,14 @@ def compute_trip_detail(trip_id):
 
 @app.route("/api/trip/<path:trip_id>")
 def api_trip(trip_id):
-    """Return route geometry and predicted stops for one trip."""
+    """Return route geometry and predicted stops for one trip.
+
+    Args:
+        trip_id: Identifier of the trip to describe.
+
+    Returns:
+        Flask JSON response containing trip details or an error description.
+    """
     if not API_KEY:
         return jsonify({"error": "TFNSW_API_KEY not set in .env"}), 500
     try:
@@ -3510,7 +4015,15 @@ HEATMAP_BODY_CACHE_MAX = 24
 
 
 def _gzip_json_response(gz, etag=None):
-    """Serve gzipped JSON with optional ETag revalidation."""
+    """Serve gzipped JSON with optional ETag revalidation.
+
+    Args:
+        gz: Gzipped JSON response body.
+        etag: Optional entity tag for conditional caching.
+
+    Returns:
+        Flask response serving compressed or decompressed JSON as negotiated.
+    """
     if "gzip" in request.headers.get("Accept-Encoding", ""):
         resp = Response(gz, mimetype="application/json")
         resp.headers["Content-Encoding"] = "gzip"
@@ -3526,7 +4039,12 @@ def _gzip_json_response(gz, etag=None):
 
 @app.route("/api/heatmap")
 def api_heatmap():
-    """Return historical heatmap points for the requested window and metric."""
+    """Return historical heatmap points for the requested window and metric.
+
+    Returns:
+        Flask response containing heatmap JSON, optionally gzip-compressed
+        and validated with an ETag.
+    """
     try:
         window, werr = parse_window_args(request.args)
         if werr:
@@ -3574,7 +4092,12 @@ def api_heatmap():
 
 @app.route("/api/validation")
 def api_validation():
-    """Return historical on-time, early, and late statistics by operator."""
+    """Return historical on-time, early, and late statistics by operator.
+
+    Returns:
+        Flask JSON or CSV response containing per-operator and network
+        validation statistics, or an error response for an invalid window.
+    """
     window, werr = parse_window_args(request.args)
     if werr:
         return jsonify({"error": werr}), 400
@@ -3590,7 +4113,14 @@ def api_validation():
         g["n"] += n; g["early"] += early; g["on_time"] += on; g["late"] += late; g["late_sum"] += late_sum
 
     def finish(g):
-        """Calculate percentages and mean lateness for one operator group."""
+        """Calculate percentages and mean lateness for one operator group.
+
+        Args:
+            g: Mutable aggregate counts and delay totals for an operator.
+
+        Returns:
+            Normalized operator statistics with percentages and mean lateness.
+        """
         n = g["n"] or 1
         return {"operator": g["operator"], "agency_ids": sorted(g["agency_ids"]), "readings": g["n"],
                 "on_time_pct": round(100 * g["on_time"] / n, 1),
